@@ -1,0 +1,77 @@
+import { invoke } from "@tauri-apps/api/core";
+import type { JumpAvailability, JumpTarget, SessionRow, SourceHealth } from "../../shared/types/session";
+import { fakeSourceHealth, initialSessions } from "./fakeSessions";
+
+interface JumpResult {
+  sessionId: string;
+  availability: JumpAvailability;
+  target: JumpTarget;
+  message: string;
+}
+
+function hasTauriRuntime() {
+  return "__TAURI_INTERNALS__" in window;
+}
+
+export async function loadSessions(): Promise<SessionRow[]> {
+  if (!hasTauriRuntime()) {
+    return fetchDevJson<SessionRow[]>("/api/sessions", initialSessions);
+  }
+
+  return invoke<SessionRow[]>("list_sessions");
+}
+
+export async function loadSourceHealth(): Promise<SourceHealth> {
+  if (!hasTauriRuntime()) {
+    return fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth);
+  }
+
+  return invoke<SourceHealth>("source_health");
+}
+
+export async function dismissSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
+  if (!hasTauriRuntime()) {
+    return currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, dismissed: true, handled: true } : row,
+    );
+  }
+
+  return invoke<SessionRow[]>("dismiss_session", { sessionId });
+}
+
+export async function restoreSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
+  if (!hasTauriRuntime()) {
+    return currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, dismissed: false, handled: false } : row,
+    );
+  }
+
+  return invoke<SessionRow[]>("restore_session", { sessionId });
+}
+
+export async function jumpToSession(sessionId: string): Promise<JumpResult> {
+  if (!hasTauriRuntime()) {
+    return fetchDevJson<JumpResult>("/api/jump", {
+      sessionId,
+      availability: "unavailable",
+      target: "unknown",
+      message: "Jump-back unavailable: local preview API is not connected.",
+    }, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    });
+  }
+
+  return invoke<JumpResult>("jump_to_session", { sessionId });
+}
+
+async function fetchDevJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {
+  try {
+    const response = await fetch(url, init);
+    if (!response.ok) return fallback;
+    return (await response.json()) as T;
+  } catch {
+    return fallback;
+  }
+}
