@@ -39,6 +39,15 @@ pub fn discover_codex_observations_with_state_db(
         .collect()
 }
 
+pub fn discover_codex_observation_by_id(
+    state_db: &Path,
+    session_id: &str,
+    now: SystemTime,
+) -> Option<SourceObservation> {
+    let thread = discover_thread_from_state_db_by_id(state_db, session_id)?;
+    observation_from_thread(thread, now)
+}
+
 pub fn discover_codex_observations_with_now(
     sessions_root: &Path,
     limit: usize,
@@ -226,18 +235,8 @@ struct ThreadSummary {
 
 fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Vec<ThreadSummary> {
     let query = format!(
-        "select json_object(
-            'id', id,
-            'rollout_path', rollout_path,
-            'updated_at_ms', updated_at_ms,
-            'source', source,
-            'cwd', cwd,
-            'title', title,
-            'archived', archived,
-            'agent_nickname', agent_nickname,
-            'thread_source', thread_source,
-            'preview', preview
-        ) from threads order by coalesce(updated_at_ms, updated_at * 1000) desc limit {};",
+        "{} from threads order by coalesce(updated_at_ms, updated_at * 1000) desc limit {};",
+        thread_summary_json_select(),
         limit
     );
     let Ok(output) = Command::new("sqlite3")
@@ -258,6 +257,48 @@ fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Vec<ThreadSu
         .lines()
         .filter_map(parse_thread_summary_json)
         .collect()
+}
+
+fn discover_thread_from_state_db_by_id(state_db: &Path, session_id: &str) -> Option<ThreadSummary> {
+    let query = format!(
+        "{} from threads where id = '{}' limit 1;",
+        thread_summary_json_select(),
+        sqlite_string_literal(session_id)
+    );
+    let output = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-readonly")
+        .arg(state_db)
+        .arg(query)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(parse_thread_summary_json)
+}
+
+fn thread_summary_json_select() -> &'static str {
+    "select json_object(
+        'id', id,
+        'rollout_path', rollout_path,
+        'updated_at_ms', updated_at_ms,
+        'source', source,
+        'cwd', cwd,
+        'title', title,
+        'archived', archived,
+        'agent_nickname', agent_nickname,
+        'thread_source', thread_source,
+        'preview', preview
+    )"
+}
+
+fn sqlite_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
@@ -487,7 +528,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::codex_source::{
-        discover_codex_observations_with_now, discover_codex_observations_with_state_db,
+        discover_codex_observation_by_id, discover_codex_observations_with_now,
+        discover_codex_observations_with_state_db,
     };
     use crate::domain::session::{JumpTarget, ObservationKind};
 
@@ -699,5 +741,65 @@ mod tests {
         assert_eq!(rows[0].label.as_deref(), Some("排查用车详情地图卡顿"));
         assert_eq!(rows[0].kind, ObservationKind::Running);
         assert_eq!(rows[0].jump_target, JumpTarget::Desktop);
+    }
+
+    #[test]
+    fn looks_up_single_sqlite_thread_by_id_for_fast_jump() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019target",
+            "/tmp/missing-target.jsonl",
+            "/Users/edy/target",
+            "Target thread",
+        );
+        insert_thread(
+            &state_db,
+            "019other",
+            "/tmp/missing-other.jsonl",
+            "/Users/edy/other",
+            "Other thread",
+        );
+
+        let row = discover_codex_observation_by_id(
+            &state_db,
+            "019target",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_470_000),
+        )
+        .expect("target thread");
+
+        assert_eq!(row.session_id, "019target");
+        assert_eq!(row.label.as_deref(), Some("Target thread"));
+        assert_eq!(row.workspace_path.as_deref(), Some("/Users/edy/target"));
+        assert_eq!(row.kind, ObservationKind::Running);
+        assert_eq!(row.jump_target, JumpTarget::Desktop);
+    }
+
+    fn create_threads_table(state_db: &std::path::Path) {
+        std::process::Command::new("sqlite3")
+            .arg(state_db)
+            .arg("create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer, thread_source text, preview text not null default '');")
+            .status()
+            .expect("create threads table");
+    }
+
+    fn insert_thread(
+        state_db: &std::path::Path,
+        id: &str,
+        rollout_path: &str,
+        cwd: &str,
+        title: &str,
+    ) {
+        std::process::Command::new("sqlite3")
+            .arg(state_db)
+            .arg(format!(
+                "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
+                 values ('{}', '{}', 1780452000, 1780453200, 'vscode', 'OpenAI', '{}', '{}', '{{\"type\":\"disabled\"}}', 'never', 1780453200000, 'user', '{}');",
+                id, rollout_path, cwd, title, title
+            ))
+            .status()
+            .expect("insert thread");
     }
 }

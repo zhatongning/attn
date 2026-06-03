@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::classification::classify_observation;
 use crate::domain::confidence::Confidence;
 use crate::domain::dismissability::evaluate_dismissability;
-use crate::codex_source::discover_codex_observations;
+use crate::codex_source::{discover_codex_observation_by_id, discover_codex_observations};
 use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
 use crate::domain::source_health::{SourceCapability, SourceHealth, SourceStatus};
 
@@ -131,9 +131,12 @@ impl InboxStore {
 
     pub fn jump_to_session(&self, session_id: &str) -> JumpResult {
         let row = self
-            .list_sessions()
-            .into_iter()
-            .find(|row| row.session_id == session_id);
+            .fast_session_row_for_jump(session_id)
+            .or_else(|| {
+                self.list_sessions()
+                    .into_iter()
+                    .find(|row| row.session_id == session_id)
+            });
         let availability = row
             .as_ref()
             .map(|row| row.jump_availability)
@@ -175,6 +178,27 @@ impl InboxStore {
             target,
             message,
         }
+    }
+
+    fn fast_session_row_for_jump(&self, session_id: &str) -> Option<SessionRow> {
+        let observation = discover_codex_observation_by_id(
+            &codex_state_db_path(),
+            session_id,
+            std::time::SystemTime::now(),
+        )?;
+        let mut row = classify_observation(observation);
+        row = apply_live_cli_activity_signal(row, live_cli_tty_for_row);
+        let jump_availability = if row.workspace_path.is_some() {
+            if matches!(row.jump_target, JumpTarget::Desktop) {
+                JumpAvailability::Exact
+            } else {
+                JumpAvailability::Approximate
+            }
+        } else {
+            JumpAvailability::Unavailable
+        };
+
+        Some(row.with_jump_availability(jump_availability))
     }
 }
 

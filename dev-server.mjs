@@ -145,7 +145,34 @@ function discoverCodexThreads() {
   const stateDb = codexStateDbPath();
   if (!fs.existsSync(stateDb)) return [];
 
-  const query = `select json_object(
+  const query = `${threadSummaryJsonSelect()} from threads order by coalesce(updated_at_ms, updated_at * 1000) desc limit 80;`;
+  const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDb, query], { encoding: "utf8" });
+  if (result.status !== 0) return [];
+
+  return result.stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => parseThreadRow(line))
+    .filter(Boolean);
+}
+
+function discoverCodexThreadById(sessionId) {
+  const stateDb = codexStateDbPath();
+  if (!fs.existsSync(stateDb)) return null;
+
+  const query = `${threadSummaryJsonSelect()} from threads where id = '${sqliteStringLiteral(sessionId)}' limit 1;`;
+  const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDb, query], { encoding: "utf8" });
+  if (result.status !== 0) return null;
+
+  return result.stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => parseThreadRow(line))
+    .find(Boolean) ?? null;
+}
+
+function threadSummaryJsonSelect() {
+  return `select json_object(
     'id', id,
     'rollout_path', rollout_path,
     'updated_at_ms', updated_at_ms,
@@ -156,15 +183,11 @@ function discoverCodexThreads() {
     'agent_nickname', agent_nickname,
     'thread_source', thread_source,
     'preview', preview
-  ) from threads order by coalesce(updated_at_ms, updated_at * 1000) desc limit 80;`;
-  const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDb, query], { encoding: "utf8" });
-  if (result.status !== 0) return [];
+  )`;
+}
 
-  return result.stdout
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => parseThreadRow(line))
-    .filter(Boolean);
+function sqliteStringLiteral(value) {
+  return String(value).replaceAll("'", "''");
 }
 
 function parseThreadRow(line) {
@@ -327,7 +350,7 @@ function truncate(value, maxLength) {
 }
 
 async function jumpToSession(sessionId) {
-  const row = discoverCodexSessions().find((session) => session.sessionId === sessionId);
+  const row = sessionId ? discoverCodexThreadById(sessionId) ?? discoverCodexSessions().find((session) => session.sessionId === sessionId) : null;
   if (!row || !row.workspacePath) {
     return {
       sessionId: sessionId ?? "",
