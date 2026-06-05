@@ -32,7 +32,7 @@ enum JumpCommandPlan {
         deeplink_url: String,
         activate_bundle_id: String,
     },
-    ITermActivate { tty: String },
+    ITermActivate { tty: String, live_codex: bool },
 }
 
 #[derive(Debug, Default)]
@@ -165,7 +165,7 @@ impl InboxStore {
                     name: "Window jump-back".to_string(),
                     availability: Confidence::Inferred,
                     detail:
-                        "Routes one Jump back action to Codex Desktop or a live iTerm Codex session."
+                        "Routes one Jump back action to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for that workspace."
                             .to_string(),
                 },
             ],
@@ -206,8 +206,24 @@ impl InboxStore {
                 ) => {
                     "Opened Codex Desktop session.".to_string()
                 }
-                (JumpTarget::Cli, Some(JumpCommandPlan::ITermActivate { .. }), Some(Ok(()))) => {
+                (
+                    JumpTarget::Cli,
+                    Some(JumpCommandPlan::ITermActivate {
+                        live_codex: true, ..
+                    }),
+                    Some(Ok(())),
+                ) => {
                     "Focused live iTerm Codex session.".to_string()
+                }
+                (
+                    JumpTarget::Cli,
+                    Some(JumpCommandPlan::ITermActivate {
+                        live_codex: false,
+                        ..
+                    }),
+                    Some(Ok(())),
+                ) => {
+                    "Focused previous iTerm session.".to_string()
                 }
                 (JumpTarget::Cli, Some(JumpCommandPlan::CodexDesktop { .. }), Some(Ok(()))) => {
                     "Opened Codex Desktop session.".to_string()
@@ -381,20 +397,26 @@ fn apply_live_cli_activity_signal(
 }
 
 fn build_jump_command_plan(row: &SessionRow) -> Option<JumpCommandPlan> {
-    let live_tty = match row.jump_target {
-        JumpTarget::Cli => row
-            .workspace_path
-            .as_deref()
-            .and_then(find_live_codex_tty_for_workspace),
-        JumpTarget::Desktop | JumpTarget::Unknown => None,
+    let (live_tty, previous_iterm_tty) = match (row.jump_target, row.workspace_path.as_deref()) {
+        (JumpTarget::Cli, Some(workspace_path)) => {
+            let live_tty = find_live_codex_tty_for_workspace(workspace_path);
+            let previous_iterm_tty = if live_tty.is_none() {
+                find_previous_iterm_tty_for_workspace(workspace_path)
+            } else {
+                None
+            };
+            (live_tty, previous_iterm_tty)
+        }
+        _ => (None, None),
     };
 
-    build_jump_command_plan_with_live_tty(row, live_tty)
+    build_jump_command_plan_with_cli_ttys(row, live_tty, previous_iterm_tty)
 }
 
-fn build_jump_command_plan_with_live_tty(
+fn build_jump_command_plan_with_cli_ttys(
     row: &SessionRow,
     live_tty: Option<String>,
+    previous_iterm_tty: Option<String>,
 ) -> Option<JumpCommandPlan> {
     let workspace_path = row.workspace_path.clone()?;
 
@@ -408,7 +430,16 @@ fn build_jump_command_plan_with_live_tty(
             })
         }
         JumpTarget::Cli => live_tty
-            .map(|tty| JumpCommandPlan::ITermActivate { tty })
+            .map(|tty| JumpCommandPlan::ITermActivate {
+                tty,
+                live_codex: true,
+            })
+            .or_else(|| {
+                previous_iterm_tty.map(|tty| JumpCommandPlan::ITermActivate {
+                    tty,
+                    live_codex: false,
+                })
+            })
             .or_else(|| {
                 Some(JumpCommandPlan::CodexDesktop {
                     thread_id: row.session_id.clone(),
@@ -437,7 +468,7 @@ fn execute_jump_command_plan(plan: JumpCommandPlan) -> Result<(), String> {
                 activate_app,
             )
         }
-        JumpCommandPlan::ITermActivate { tty } => activate_iterm_tty(&tty),
+        JumpCommandPlan::ITermActivate { tty, .. } => activate_iterm_tty(&tty),
     }
 }
 
@@ -474,6 +505,88 @@ fn find_live_codex_tty_for_workspace(workspace_path: &str) -> Option<String> {
     None
 }
 
+fn find_previous_iterm_tty_for_workspace(workspace_path: &str) -> Option<String> {
+    let workspace_shell_ttys = find_shell_ttys_for_workspace(workspace_path);
+    if workspace_shell_ttys.is_empty() {
+        return None;
+    }
+
+    let mut matching_sessions = list_iterm_sessions()
+        .into_iter()
+        .filter(|session| workspace_shell_ttys.contains(&normalize_tty(&session.tty)))
+        .collect::<Vec<_>>();
+
+    matching_sessions.sort_by_key(|session| {
+        if session.name.to_ascii_lowercase().contains("codex") {
+            0
+        } else {
+            1
+        }
+    });
+
+    matching_sessions
+        .into_iter()
+        .next()
+        .map(|session| normalize_tty(&session.tty))
+}
+
+fn find_shell_ttys_for_workspace(workspace_path: &str) -> HashSet<String> {
+    let output = match Command::new("ps")
+        .args(["-axo", "pid=,tty=,comm=,args="])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return HashSet::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(parse_shell_process_line)
+        .filter_map(|(pid, tty)| {
+            process_cwd(pid)
+                .filter(|cwd| cwd == workspace_path)
+                .map(|_| tty.to_string())
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct ITermSession {
+    tty: String,
+    name: String,
+}
+
+fn list_iterm_sessions() -> Vec<ITermSession> {
+    let script = r#"set rows to {}
+tell application id "com.googlecode.iterm2"
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+try
+set end of rows to ((tty of s as text) & tab & (name of s as text))
+end try
+end repeat
+end repeat
+end repeat
+end tell
+set AppleScript's text item delimiters to linefeed
+return rows as text"#;
+    let output = match Command::new("osascript").args(["-e", script]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (tty, name) = line.split_once('\t')?;
+            Some(ITermSession {
+                tty: tty.to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn parse_codex_process_line(line: &str) -> Option<(&str, &str, &str)> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?;
@@ -487,6 +600,31 @@ fn parse_codex_process_line(line: &str) -> Option<(&str, &str, &str)> {
     }
 
     Some((pid, tty, args))
+}
+
+fn parse_shell_process_line(line: &str) -> Option<(&str, &str)> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?;
+    let tty = parts.next()?;
+    let comm = parts.next()?;
+    if !tty.starts_with("ttys") {
+        return None;
+    }
+    let executable = comm
+        .rsplit('/')
+        .next()
+        .unwrap_or(comm)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    if matches!(executable.as_str(), "zsh" | "bash" | "fish") {
+        Some((pid, tty))
+    } else {
+        None
+    }
+}
+
+fn normalize_tty(tty: &str) -> String {
+    tty.strip_prefix("/dev/").unwrap_or(tty).to_string()
 }
 
 fn process_cwd(pid: &str) -> Option<String> {
@@ -742,24 +880,51 @@ mod tests {
             .with_jump_availability(JumpAvailability::Approximate)
             .with_jump_target(JumpTarget::Cli);
 
-        let plan = super::build_jump_command_plan_with_live_tty(&row, Some("ttys008".to_string()));
+        let plan = super::build_jump_command_plan_with_cli_ttys(
+            &row,
+            Some("ttys008".to_string()),
+            None,
+        );
 
         assert_eq!(
             plan,
             Some(super::JumpCommandPlan::ITermActivate {
-                tty: "ttys008".to_string()
+                tty: "ttys008".to_string(),
+                live_codex: true
             })
         );
     }
 
     #[test]
-    fn cli_sessions_without_live_tty_fall_back_to_desktop_deeplink_jump_plan() {
+    fn cli_sessions_without_live_tty_use_previous_iterm_terminal_before_desktop() {
         let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-b".to_string()))
             .with_jump_availability(JumpAvailability::Approximate)
             .with_jump_target(JumpTarget::Cli);
 
-        let plan = super::build_jump_command_plan_with_live_tty(&row, None);
+        let plan = super::build_jump_command_plan_with_cli_ttys(
+            &row,
+            None,
+            Some("ttys002".to_string()),
+        );
+
+        assert_eq!(
+            plan,
+            Some(super::JumpCommandPlan::ITermActivate {
+                tty: "ttys002".to_string(),
+                live_codex: false
+            })
+        );
+    }
+
+    #[test]
+    fn cli_sessions_without_any_terminal_fall_back_to_desktop_deeplink_jump_plan() {
+        let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
+            .with_workspace(Some("/Users/edy/project-b".to_string()))
+            .with_jump_availability(JumpAvailability::Approximate)
+            .with_jump_target(JumpTarget::Cli);
+
+        let plan = super::build_jump_command_plan_with_cli_ttys(&row, None, None);
 
         assert_eq!(
             plan,

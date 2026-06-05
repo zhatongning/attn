@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createCodexSessionsDevSource, discoverCodexSessions } from "./codexSessionsDevSource.mjs";
+import { createCodexSessionsDevSource, discoverCodexSessions, jumpToSession } from "./codexSessionsDevSource.mjs";
 
 const tempDirs = [];
 const earlyTrackingStartMs = Date.parse("2026-06-01T00:00:00.000Z");
@@ -207,6 +207,35 @@ describe("codexSessionsDevSource", () => {
       statusReason: "Read window expired; idle until the next source signal.",
       handled: true,
     });
+  });
+
+  it("jumps CLI sessions back to a previous iTerm tab before falling back to Desktop", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019cli.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019cli","cwd":"/Users/edy/wmhcar","originator":"codex-tui","source":"cli"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    const executed = [];
+    const result = await jumpToSession("019cli", {
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+      previousITermTtyForWorkspace: () => "ttys002",
+      executeJump: async (_row, plan) => executed.push(plan),
+    });
+
+    expect(executed).toEqual([{ kind: "iterm", tty: "ttys002", liveCodex: false }]);
+    expect(result.message).toBe("Focused previous iTerm session.");
   });
 
   it("treats old archived threads without completion evidence as idle instead of requiring attention", () => {

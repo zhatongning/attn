@@ -36,7 +36,7 @@ export function sourceHealth({
         name: "Window jump-back",
         availability: "inferred",
         detail:
-          "Routes Jump back to Codex Desktop or a live iTerm Codex session.",
+          "Routes Jump back to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for that workspace.",
       },
     ],
   };
@@ -104,7 +104,7 @@ export async function jumpToSession(sessionId, options = {}) {
     };
   }
 
-  const plan = buildJumpPlan(row);
+  const plan = buildJumpPlan(row, options);
   await (options.executeJump ?? executeJump)(row, plan);
 
   return {
@@ -122,6 +122,7 @@ export function createCodexSessionsDevSource({
   nowMs = Date.now(),
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
   liveCliTtyForWorkspace = findLiveCodexTtyForWorkspace,
+  previousITermTtyForWorkspace = findPreviousITermTtyForWorkspace,
   executeJump: executeJumpOverride,
 } = {}) {
   const acknowledgedSignals = new Map();
@@ -132,6 +133,7 @@ export function createCodexSessionsDevSource({
     nowMs: typeof nowMs === "function" ? nowMs() : nowMs,
     unreadCompletionTrackingStartMs: trackingStartMs,
     liveCliTtyForWorkspace,
+    previousITermTtyForWorkspace,
   });
 
   return {
@@ -529,16 +531,19 @@ function truncate(value, maxLength) {
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
 }
 
-function buildJumpPlan(row) {
+function buildJumpPlan(row, options = {}) {
   if (row.jumpTarget === "desktop" || row.jumpTarget === "unknown") return { kind: "desktop" };
 
-  const liveTty = findLiveCodexTtyForWorkspace(row.workspacePath);
-  if (liveTty) return { kind: "iterm", tty: liveTty };
+  const liveTty = (options.liveCliTtyForWorkspace ?? findLiveCodexTtyForWorkspace)(row.workspacePath);
+  if (liveTty) return { kind: "iterm", tty: liveTty, liveCodex: true };
+  const previousITermTty = (options.previousITermTtyForWorkspace ?? findPreviousITermTtyForWorkspace)(row.workspacePath);
+  if (previousITermTty) return { kind: "iterm", tty: previousITermTty, liveCodex: false };
   return { kind: "desktop" };
 }
 
 function jumpMessage(plan) {
-  if (plan.kind === "iterm") return "Focused live iTerm Codex session.";
+  if (plan.kind === "iterm" && plan.liveCodex) return "Focused live iTerm Codex session.";
+  if (plan.kind === "iterm") return "Focused previous iTerm session.";
   return "Opened Codex Desktop session.";
 }
 
@@ -566,12 +571,85 @@ function findLiveCodexTtyForWorkspace(workspacePath) {
   return undefined;
 }
 
+function findPreviousITermTtyForWorkspace(workspacePath) {
+  const workspaceShellTtys = findShellTtysForWorkspace(workspacePath);
+  if (workspaceShellTtys.size === 0) return undefined;
+
+  return listITermSessions()
+    .filter((session) => workspaceShellTtys.has(normalizeTty(session.tty)))
+    .sort((a, b) => scoreITermSession(a) - scoreITermSession(b))
+    .map((session) => normalizeTty(session.tty))[0];
+}
+
+function findShellTtysForWorkspace(workspacePath) {
+  let output = "";
+  try {
+    output = execFileSync("ps", ["-axo", "pid=,tty=,comm=,args="], { encoding: "utf8" });
+  } catch {
+    return new Set();
+  }
+
+  const ttys = new Set();
+  for (const line of output.split("\n")) {
+    const shellInfo = parseShellProcessLine(line);
+    if (!shellInfo) continue;
+    const cwd = processCwd(shellInfo.pid);
+    if (cwd === workspacePath) ttys.add(shellInfo.tty);
+  }
+  return ttys;
+}
+
+function listITermSessions() {
+  const script = `set rows to {}
+tell application id "com.googlecode.iterm2"
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+try
+set end of rows to ((tty of s as text) & tab & (name of s as text))
+end try
+end repeat
+end repeat
+end repeat
+end tell
+set AppleScript's text item delimiters to linefeed
+return rows as text`;
+  try {
+    return execFileSync("osascript", ["-e", script], { encoding: "utf8" })
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [tty, name = ""] = line.split("\t");
+        return { tty, name };
+      });
+  } catch {
+    return [];
+  }
+}
+
 function parseCodexProcessLine(line) {
   const match = line.trim().match(/^(\d+)\s+(ttys\d+)\s+\S+\s+(.+)$/);
   if (!match) return undefined;
   const [, pid, tty, args] = match;
   if (!args.includes("codex") || args.includes(" app-server ")) return undefined;
   return { pid, tty };
+}
+
+function parseShellProcessLine(line) {
+  const match = line.trim().match(/^(\d+)\s+(ttys\d+)\s+(\S+)\s+.*$/);
+  if (!match) return undefined;
+  const [, pid, tty, comm] = match;
+  const executable = path.basename(comm).replace(/^-/, "").toLowerCase();
+  if (!["zsh", "bash", "fish"].includes(executable)) return undefined;
+  return { pid, tty };
+}
+
+function normalizeTty(tty) {
+  return tty.startsWith("/dev/") ? tty.slice("/dev/".length) : tty;
+}
+
+function scoreITermSession(session) {
+  return session.name.toLowerCase().includes("codex") ? 0 : 1;
 }
 
 function processCwd(pid) {
