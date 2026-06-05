@@ -30,7 +30,7 @@ describe("buildStatusPanelModel", () => {
     expect(model.visibleRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["unknown", "blocked"],
       ["complete", "inspect"],
-      ["needs-input", "needed"],
+      ["needs-input", "follow-up"],
     ]);
     expect(model.hiddenRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["active", "working"],
@@ -76,7 +76,7 @@ describe("buildStatusPanelModel", () => {
       { ...defaultStatusPanelConfig, language: "zh" },
     );
 
-    expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待检查", "需处理"]);
+    expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待检查", "待跟进"]);
     expect(model.copy.alertsLabel).toBe("需关注");
     expect(model.copy.workingLabel).toBe("进行中");
     expect(model.copy.idleLabel).toBe("空闲");
@@ -137,7 +137,7 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.theme.styleFamily).toBe("atom");
     expect(model.visibleRows[0].statusMarker).toBe("●");
-    expect(model.visibleRows[0].statusLabel).toBe("needed");
+    expect(model.visibleRows[0].statusLabel).toBe("follow-up");
     expect(model.visibleRows[0].statusColor).toBe(atomInterventionTheme.status.needed.color);
   });
 });

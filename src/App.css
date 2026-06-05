@@ -404,6 +404,11 @@ p {
   padding: 0 4px;
 }
 
+.management-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .color-field {
   align-items: center;
   grid-template-columns: minmax(0, 1fr) auto;

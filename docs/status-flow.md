@@ -19,7 +19,7 @@ The implementation currently has three layers. Keeping them separate prevents mo
 | --- | --- | --- |
 | Source observation | `Running`, `Idle`, `Completed`, `CompletedStale`, `WaitingForInput`, `Failed`, `InsufficientEvidence` | Raw or inferred evidence from SQLite, JSONL, and process checks. |
 | Internal row state | `running`, `idle`, `needsAttention`, `dismissable`, `unknown` | Normalized state used by commands and storage. |
-| UI display status | `working`, `idle`, `needed`, `inspect`, `blocked` | Human-facing status shown in the Atom panel. |
+| UI display key | `working`, `idle`, `needed`, `inspect`, `blocked` | Stable key used for sorting and colors. Labels can be localized, for example `needed` displays as `follow-up` or `待跟进`. |
 
 ## Event Sources
 
@@ -45,7 +45,7 @@ The intended model is:
 | --- | --- | --- | --- |
 | `working` | `○ working` | The agent is actively executing work now. | No. Keep visible as quiet context. |
 | `idle` | `○ idle` | No active work is happening and no user action is required. | No. This is quiet baseline state. |
-| `needed` | `● needed` | The session still needs user intervention, but it is no longer in the immediate inspect window. | Yes. |
+| `needed` | `● follow-up` | The session was opened recently and may still need a short follow-up before it settles. | Yes. |
 | `inspect` | `● inspect` | The agent just produced a result that should be checked while context is fresh. | Yes. |
 | `blocked` | `● blocked` | The agent cannot continue because of missing evidence, unavailable source, or an actionable failure signal. | Yes. |
 
@@ -54,8 +54,8 @@ The intended model is:
 `inspect` replaces `review` because the expected action is "check what happened", not necessarily approve or code-review the result.
 `review` carried an acceptance/assessment implication that was broader than this product needs.
 
-`needed` replaces `input` / `respond` for the lower-priority user-intervention state.
-It means "you are needed here" without implying the agent has a response to read or that the only possible action is text input.
+`follow-up` is the display label for the internal `needed` state.
+It means "keep this session in short-term attention after it was opened" without implying the agent has a response to read, that the only possible action is text input, or that the user must personally complete the underlying task.
 
 Chinese labels, if the UI becomes localized:
 
@@ -63,7 +63,7 @@ Chinese labels, if the UI becomes localized:
 | --- | --- | --- |
 | `blocked` | `受阻` | Short and clearly means the agent cannot continue. |
 | `inspect` | `待检查` | Matches the action: open and inspect the result. |
-| `needed` | `需处理` | Covers input, confirmation, inspection, and takeover without over-specifying. |
+| `follow-up` | `待跟进` | Matches the post-read window: the user may need to continue, confirm, or take over soon without implying an urgent blocker. |
 | `working` | `进行中` | Clear active-work state. |
 | `idle` | `空闲` | Quiet no-action state. |
 
@@ -125,7 +125,7 @@ These hooks should become the preferred source for live status transitions once 
 | `Stop` | pending terminal check | A turn ended. Do not classify as `Completed` by itself. |
 
 `Stop` is intentionally not a final state. It can mean success, waiting for input, interruption, tool failure, or a normal turn boundary.
-After `Stop`, the app should consult JSONL and any hook payload to decide whether the row becomes `review`, `input`, `blocked`, or `idle`.
+After `Stop`, the app should consult JSONL and any hook payload to decide whether the row becomes `inspect`, `needed`, `blocked`, or `idle`.
 
 ### Hook Storage
 
@@ -187,11 +187,11 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 
 | User action | Current transition |
 | --- | --- |
-| Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `needed` for 30 minutes. |
+| Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `follow-up` for 30 minutes. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `working` or `idle` | No state transition. |
-| Dismiss a `review` or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
-| Dismiss a `working` or `input` row | It is restored immediately on next list because active/input rows should not stay hidden. |
+| Dismiss an `inspect` or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
+| Dismiss a `working` or `needed` row | It is restored immediately on next list because active/intervention rows should not stay hidden. |
 
 Read acknowledgement is keyed by `sessionId + lastActivityAt` and stores `acknowledgedAt`.
 If the same session gets newer activity, the read acknowledgement no longer applies.
@@ -201,7 +201,7 @@ If the same session gets newer activity, the read acknowledgement no longer appl
 These are the areas that currently feel wrong or need product decisions.
 
 1. Completion attention is read-bounded.
-   A completed result stays `inspect` until opened/read, then becomes `needed` for 30 minutes, then `idle`.
+   A completed result stays `inspect` until opened/read, then shows `follow-up` for 30 minutes, then `idle`.
 
 2. `inspect` still combines successful completion and failure/manual-clear cases.
    These may need separate reasons later, but the shared user action is still "open and inspect."
@@ -223,7 +223,7 @@ These are the areas that currently feel wrong or need product decisions.
 We should decide these before more code changes.
 
 1. When should `task_complete` become visible?
-   Current decision: unread completed results stay `inspect`; reading them starts a 30-minute `needed` window, then they become `idle`.
+   Current decision: unread completed results stay `inspect`; reading them starts a 30-minute `follow-up` window, then they become `idle`.
 
 2. What does `inspect` mean?
    It means a result was produced and should be checked while context is fresh.
@@ -276,7 +276,7 @@ Candidate principles:
 - `idle` means no action required.
 - `inspect` should be scarce. It should represent something the user is likely to care about now.
 - Old completions should automatically become `idle`.
-- `input` and `blocked` are the strongest intervention states.
+- `needed` and `blocked` are the strongest intervention states.
 - Old historical sessions should not crowd the panel.
 
 ## Code Touchpoints

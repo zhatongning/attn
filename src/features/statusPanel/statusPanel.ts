@@ -83,7 +83,7 @@ export const atomInterventionTheme: AtomInterventionTheme = {
       color: defaultStatusPanelConfig.statusColors.inspect,
     },
     needed: {
-      label: "needed",
+      label: "follow-up",
       marker: "●",
       color: defaultStatusPanelConfig.statusColors.needed,
     },
@@ -112,14 +112,14 @@ const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionSta
   en: {
     blocked: "blocked",
     inspect: "inspect",
-    needed: "needed",
+    needed: "follow-up",
     working: "working",
     idle: "idle",
   },
   zh: {
     blocked: "受阻",
     inspect: "待检查",
-    needed: "需处理",
+    needed: "待跟进",
     working: "进行中",
     idle: "空闲",
   },

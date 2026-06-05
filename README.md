@@ -20,10 +20,10 @@ The compact panel maps internal session evidence to intervention statuses:
 | Token | Display status | Meaning |
 | --- | --- | --- |
 | `● blocked` | `blocked` | The agent appears stuck, hit a repeated failure, or needs a decision before it can continue. |
-| `● input` | `input` | The agent is waiting for user input, confirmation, approval, or a choice. |
-| `● review` | `review` | The agent produced a result that should be inspected or accepted. A completed task stays here until you confirm it. |
+| `● inspect` | `inspect` | The agent produced a result that should be checked while context is fresh. |
+| `● follow-up` | `follow-up` | The session was opened recently and may still need a short follow-up before it settles. |
 | `○ working` | `working` | The agent is actively executing work right now and does not need intervention. It stays visible with quiet styling. |
-| `○ idle` | `idle` | The previous intervention or review was confirmed, or an old Desktop thread has no recent activity. It is quiet baseline state. |
+| `○ idle` | `idle` | The previous intervention or inspection was confirmed, or an old Desktop thread has no recent activity. It is quiet baseline state. |
 
 Each row also carries a confidence value:
 
@@ -31,7 +31,7 @@ Each row also carries a confidence value:
 - `inferred`: the app inferred the state from local metadata or process evidence.
 - `unknown` / `unavailable`: source evidence is missing or unavailable.
 
-Dismissed rows stay hidden while they remain reviewed. If the same session becomes `input`, `blocked`, `review`, or actively `working` again, it returns to the panel. Clicking Jump back confirms the current intervention/review signal and moves that row to `idle` until newer source evidence arrives.
+Dismissed rows stay hidden while they remain quiet. If the same session becomes `inspect`, `follow-up`, `blocked`, or actively `working` again, it returns to the panel. Clicking Jump back confirms the current inspect signal and starts the short follow-up window before the row settles back to `idle`.
 
 ## Run
 
@@ -69,6 +69,6 @@ The final `.dmg` packaging step may wait on macOS AppleScript window decoration;
 - Codex desktop only for v1.
 - Claude, phone workflows, scheduled cleanup, and real activity summarization are post-MVP.
 - No raw prompt/output content is stored in this MVP; rows carry metadata and confidence only.
-- Activity state is inferred from SQLite thread metadata first. JSONL task events are supporting evidence: `task_complete` becomes `review`; only user confirmation moves it to `idle`. Live Desktop or CLI activity becomes `working`.
+- Activity state is inferred from SQLite thread metadata first. JSONL task events are supporting evidence: unread `task_complete` becomes `inspect`; opening it starts the short `follow-up` window before it moves to `idle`. Live Desktop or CLI activity becomes `working`.
 - CLI jump-back targets iTerm first by matching live Codex process cwd to tty. If no live Codex process is found, it tries an iTerm tab whose shell cwd is the same workspace before falling back to the exact Codex Desktop thread deeplink.
 - TODO: Add Warp live terminal targeting once its scriptability/API is defined.

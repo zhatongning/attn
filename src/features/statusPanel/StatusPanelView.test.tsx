@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 // @ts-expect-error This test reads local CSS without adding Node types to the app build.
 import { readFileSync } from "node:fs";
@@ -8,12 +8,30 @@ import type { SessionRow } from "../../shared/types/session";
 import { fakeSourceHealth, initialSessions } from "../inbox/fakeSessions";
 import { StatusPanelView } from "./StatusPanelView";
 
+const tauriWindowMock = vi.hoisted(() => ({
+  setSize: vi.fn(async () => undefined),
+}));
+
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: vi.fn(() => ({
+    setSize: tauriWindowMock.setSize,
+  })),
+}));
+
+vi.mock("@tauri-apps/api/dpi", () => ({
+  LogicalSize: class LogicalSize {
+    type = "Logical";
+    constructor(public width: number, public height: number) {}
+  },
+}));
+
 afterEach(() => {
   window.localStorage.clear();
+  tauriWindowMock.setSize.mockClear();
   cleanup();
   vi.unstubAllGlobals();
 });
@@ -151,10 +169,10 @@ describe("StatusPanelView", () => {
     expect(screen.getByLabelText("Visible items")).toBeTruthy();
     expect(screen.getByLabelText("Blocked color")).toBeTruthy();
     expect(screen.getByLabelText("Inspect color")).toBeTruthy();
-    expect(screen.getByLabelText("Needed color")).toBeTruthy();
+    expect(screen.getByLabelText("Follow-up color")).toBeTruthy();
   });
 
-  it("switches status copy to Chinese from management settings", async () => {
+  it("applies management settings only after confirmation", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
     vi.mocked(listen).mockImplementation(async (_event, callback) => {
@@ -168,10 +186,17 @@ describe("StatusPanelView", () => {
     fireEvent.change(await screen.findByLabelText("Language"), { target: { value: "zh" } });
     fireEvent.click(screen.getByText("Back"));
 
+    expect(screen.getByText("1 alerts")).toBeTruthy();
+    expect(screen.getByText("follow-up")).toBeTruthy();
+
+    handler?.({ payload: "management" });
+    fireEvent.change(await screen.findByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Apply settings" }));
+
     expect(screen.getByText("1 需关注")).toBeTruthy();
     expect(screen.getByText("1 进行中")).toBeTruthy();
     expect(screen.getByText("1 空闲")).toBeTruthy();
-    expect(screen.getByText("需处理")).toBeTruthy();
+    expect(screen.getByText("待跟进")).toBeTruthy();
   });
 
   it("persists language settings across panel remounts", async () => {
@@ -185,12 +210,56 @@ describe("StatusPanelView", () => {
     const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
     handler?.({ payload: "management" });
     fireEvent.change(await screen.findByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
     rendered.unmount();
 
     render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
 
     expect(screen.getByText("1 需关注")).toBeTruthy();
-    expect(screen.getByText("需处理")).toBeTruthy();
+    expect(screen.getByText("待跟进")).toBeTruthy();
+  });
+
+  it("shows five rows only after visible-item settings are confirmed", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    const rows: SessionRow[] = Array.from({ length: 5 }, (_, index) => ({
+      ...initialSessions[0],
+      sessionId: `row-${index + 1}`,
+      label: `Visible row ${index + 1}`,
+      state: "running",
+      statusReason: "running signal observed",
+    }));
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") return jsonResponse(rows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expect(screen.getAllByRole("article")).toHaveLength(3);
+
+    handler?.({ payload: "management" });
+    fireEvent.change(await screen.findByLabelText("Visible items"), { target: { value: "5" } });
+    fireEvent.click(screen.getByText("Back"));
+    expect(screen.getAllByRole("article")).toHaveLength(3);
+
+    handler?.({ payload: "management" });
+    fireEvent.change(await screen.findByLabelText("Visible items"), { target: { value: "5" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Apply settings" }));
+    await waitFor(() => {
+      expect(screen.getAllByRole("article")).toHaveLength(5);
+    });
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 336,
+        width: 540,
+      }));
+    });
   });
 
   it("uses small Atom status markers", () => {
@@ -207,7 +276,7 @@ describe("StatusPanelView", () => {
       element.textContent?.replace(/\s+/g, " ").trim(),
     );
 
-    expect(statusTexts).toEqual(["● blocked", "● inspect", "● needed"]);
+    expect(statusTexts).toEqual(["● blocked", "● inspect", "● follow-up"]);
   });
 
   it("keeps an opened intervention row as needed during the read window", async () => {
@@ -249,12 +318,12 @@ describe("StatusPanelView", () => {
 
     render(<StatusPanelView initialRows={[attentionRow]} sourceHealth={fakeSourceHealth} />);
 
-    expect(await screen.findByText("needed")).toBeTruthy();
+    expect(await screen.findByText("follow-up")).toBeTruthy();
 
     fireEvent.click(screen.getByTitle("Jump back"));
 
     expect(await screen.findByTitle("Read recently; keep in needed state until 30 minutes pass.")).toBeTruthy();
-    expect(screen.getByText("needed")).toBeTruthy();
+    expect(screen.getByText("follow-up")).toBeTruthy();
   });
 
   it("keeps transparent window breathing room around the rounded shell", () => {

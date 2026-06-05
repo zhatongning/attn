@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { SessionRow, SourceHealth } from "../../shared/types/session";
 import {
   dismissSession as dismissSessionCommand,
@@ -10,6 +12,11 @@ import {
 import { buildStatusPanelModel, defaultStatusPanelConfig, type StatusPanelConfig } from "./statusPanel";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
+const PANEL_WIDTH = 540;
+const MANAGEMENT_HEIGHT = 420;
+const PANEL_BASE_HEIGHT = 240;
+const PANEL_BASE_VISIBLE_ITEMS = 3;
+const PANEL_EXTRA_ROW_HEIGHT = 48;
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
@@ -20,6 +27,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [rows, setRows] = useState(initialRows);
   const [health, setHealth] = useState(sourceHealth);
   const [config, setConfig] = useState<StatusPanelConfig>(() => loadInitialConfig());
+  const [draftConfig, setDraftConfig] = useState<StatusPanelConfig>(() => config);
+  const configRef = useRef(config);
+  const draftConfigRef = useRef(draftConfig);
   const [view, setView] = useState<"panel" | "management">("panel");
   const [expanded, setExpanded] = useState(false);
   const [commandMessage, setCommandMessage] = useState<string | null>(null);
@@ -47,6 +57,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
     void listen<string>("agent-session-inbox://open-management", (event) => {
       if (event.payload === "management") {
+        updateDraftConfig(configRef.current);
         setView("management");
       }
     }).then((unlisten) => {
@@ -60,8 +71,13 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }, []);
 
   useEffect(() => {
+    configRef.current = config;
     persistConfig(config);
   }, [config]);
+
+  useEffect(() => {
+    void resizePanelWindow(view === "management" ? MANAGEMENT_HEIGHT : panelWindowHeight(config.visibleItemCount));
+  }, [config.visibleItemCount, view]);
 
   async function dismissSession(sessionId: string) {
     try {
@@ -90,8 +106,11 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           <div className="panel-title">
             <span className="panel-prompt">$</span>
             <h1>management</h1>
-          </div>
-        <button type="button" className="icon-button icon-button--back" onClick={() => setView("panel")}>
+        </div>
+        <button type="button" className="icon-button icon-button--back" onClick={() => {
+          updateDraftConfig(configRef.current);
+          setView("panel");
+        }}>
           Back
         </button>
         </header>
@@ -101,9 +120,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             <span>Language</span>
             <select
               aria-label="Language"
-              value={config.language}
+              value={draftConfig.language}
               onChange={(event) =>
-                setConfig((current) => ({ ...current, language: event.target.value as StatusPanelConfig["language"] }))
+                updateDraftConfig((current) => ({ ...current, language: event.target.value as StatusPanelConfig["language"] }))
               }
             >
               <option value="en">English</option>
@@ -115,9 +134,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             <span>Style family</span>
             <select
               aria-label="Style family"
-              value={config.styleFamily}
+              value={draftConfig.styleFamily}
               onChange={(event) =>
-                setConfig((current) => ({ ...current, styleFamily: event.target.value as StatusPanelConfig["styleFamily"] }))
+                updateDraftConfig((current) => ({ ...current, styleFamily: event.target.value as StatusPanelConfig["styleFamily"] }))
               }
             >
               <option value="atom">Atom</option>
@@ -128,9 +147,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             <span>Palette</span>
             <select
               aria-label="Palette"
-              value={config.palette}
+              value={draftConfig.palette}
               onChange={(event) =>
-                setConfig((current) => ({ ...current, palette: event.target.value as StatusPanelConfig["palette"] }))
+                updateDraftConfig((current) => ({ ...current, palette: event.target.value as StatusPanelConfig["palette"] }))
               }
             >
               <option value="oneDark">One Dark</option>
@@ -144,11 +163,11 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
               type="number"
               min={1}
               max={8}
-              value={config.visibleItemCount}
+              value={draftConfig.visibleItemCount}
               onChange={(event) => {
                 const nextCount = Number(event.target.value);
                 if (!Number.isNaN(nextCount)) {
-                  setConfig((current) => ({ ...current, visibleItemCount: nextCount }));
+                  updateDraftConfig((current) => ({ ...current, visibleItemCount: nextCount }));
                 }
               }}
             />
@@ -158,30 +177,36 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             <legend>Status colors</legend>
             <ColorField
               label="Blocked color"
-              value={config.statusColors.blocked}
+              value={draftConfig.statusColors.blocked}
               onChange={(value) => setStatusColor("blocked", value)}
             />
             <ColorField
               label="Inspect color"
-              value={config.statusColors.inspect}
+              value={draftConfig.statusColors.inspect}
               onChange={(value) => setStatusColor("inspect", value)}
             />
             <ColorField
-              label="Needed color"
-              value={config.statusColors.needed}
+              label="Follow-up color"
+              value={draftConfig.statusColors.needed}
               onChange={(value) => setStatusColor("needed", value)}
             />
             <ColorField
               label="Working color"
-              value={config.statusColors.working}
+              value={draftConfig.statusColors.working}
               onChange={(value) => setStatusColor("working", value)}
             />
             <ColorField
               label="Idle color"
-              value={config.statusColors.idle}
+              value={draftConfig.statusColors.idle}
               onChange={(value) => setStatusColor("idle", value)}
             />
           </fieldset>
+
+          <div className="management-actions">
+            <button type="button" onClick={applyDraftConfig}>
+              Apply settings
+            </button>
+          </div>
         </section>
       </main>
     );
@@ -271,13 +296,26 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   );
 
   function setStatusColor(state: keyof StatusPanelConfig["statusColors"], value: string) {
-    setConfig((current) => ({
+    updateDraftConfig((current) => ({
       ...current,
       statusColors: {
         ...current.statusColors,
         [state]: value,
       },
     }));
+  }
+
+  function updateDraftConfig(nextConfig: StatusPanelConfig | ((current: StatusPanelConfig) => StatusPanelConfig)) {
+    const resolvedConfig = typeof nextConfig === "function" ? nextConfig(draftConfigRef.current) : nextConfig;
+    draftConfigRef.current = resolvedConfig;
+    setDraftConfig(resolvedConfig);
+  }
+
+  function applyDraftConfig() {
+    const nextConfig = normalizeConfig(draftConfigRef.current);
+    setConfig(nextConfig);
+    updateDraftConfig(nextConfig);
+    setView("panel");
   }
 
   function hiddenToggleLabel() {
@@ -290,6 +328,19 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }
 
     return `+${model.expandableHiddenCount}`;
+  }
+}
+
+function panelWindowHeight(visibleItemCount: number) {
+  const normalizedCount = Math.min(8, Math.max(1, visibleItemCount));
+  return Math.min(420, PANEL_BASE_HEIGHT + Math.max(0, normalizedCount - PANEL_BASE_VISIBLE_ITEMS) * PANEL_EXTRA_ROW_HEIGHT);
+}
+
+async function resizePanelWindow(height: number) {
+  try {
+    await getCurrentWindow().setSize(new LogicalSize(PANEL_WIDTH, height));
+  } catch {
+    // Browser preview and restricted window capabilities should not block the panel.
   }
 }
 
