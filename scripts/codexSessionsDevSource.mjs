@@ -36,7 +36,7 @@ export function sourceHealth({
         name: "Window jump-back",
         availability: "inferred",
         detail:
-          "Routes Jump back to Codex Desktop, a live iTerm Codex session, or a Terminal resume fallback.",
+          "Routes Jump back to Codex Desktop or a live iTerm Codex session.",
       },
     ],
   };
@@ -534,22 +534,16 @@ function buildJumpPlan(row) {
 
   const liveTty = findLiveCodexTtyForWorkspace(row.workspacePath);
   if (liveTty) return { kind: "iterm", tty: liveTty };
-  return { kind: "terminal-resume" };
+  return { kind: "desktop" };
 }
 
 function jumpMessage(plan) {
   if (plan.kind === "iterm") return "Focused live iTerm Codex session.";
-  if (plan.kind === "terminal-resume") return "Opened Terminal resume command.";
   return "Opened Codex Desktop session.";
 }
 
 async function executeJump(row, plan) {
   if (plan.kind === "iterm") return activateITermTty(plan.tty);
-  if (plan.kind === "terminal-resume") {
-    const command = `${shellQuote(codexCliPath())} resume ${shellQuote(row.sessionId)} --cd ${shellQuote(row.workspacePath)}`;
-    const script = `tell application "Terminal"\nactivate\ndo script ${applescriptStringLiteral(command)}\nend tell`;
-    return runDetached("osascript", ["-e", script]);
-  }
 
   return runDetached("open", [codexThreadDeeplink(row.sessionId)]);
 }
@@ -664,10 +658,6 @@ function codexThreadDeeplink(threadId) {
 function activateITerm() {
   const script = `tell application id ${applescriptStringLiteral("com.googlecode.iterm2")} to activate`;
   return runDetached("osascript", ["-e", script]);
-}
-
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function applescriptStringLiteral(value) {

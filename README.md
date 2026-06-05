@@ -8,7 +8,7 @@ Mac local MVP for keeping active Codex desktop work visible until it is handled.
 - Supports manual dismiss and restore.
 - Preserves low-confidence and unknown rows instead of auto-clearing them.
 - Exposes Tauri commands for list, dismiss, restore, source health, and jump-back result reporting.
-- Routes jump-back to Codex Desktop, a live iTerm Codex session when a matching process is found, or a Terminal resume fallback.
+- Routes jump-back to Codex Desktop, or to a live iTerm Codex session when a matching process is found.
 - Reads local Codex threads from `~/.codex/state_5.sqlite`, uses JSONL files under `~/.codex/sessions` as event evidence, and refreshes the inbox every 5 seconds.
 - Shows settings from the macOS app menu. The panel itself does not render a settings button.
 - Floats above other windows and is configured to appear on all macOS Spaces.
@@ -70,5 +70,5 @@ The final `.dmg` packaging step may wait on macOS AppleScript window decoration;
 - Claude, phone workflows, scheduled cleanup, and real activity summarization are post-MVP.
 - No raw prompt/output content is stored in this MVP; rows carry metadata and confidence only.
 - Activity state is inferred from SQLite thread metadata first. JSONL task events are supporting evidence: `task_complete` becomes `review`; only user confirmation moves it to `idle`. Live Desktop or CLI activity becomes `working`.
-- CLI jump-back currently targets iTerm first by matching live Codex process cwd to tty.
+- CLI jump-back targets iTerm first by matching live Codex process cwd to tty, then falls back to the exact Codex Desktop thread deeplink.
 - TODO: Add Warp live terminal targeting once its scriptability/API is defined.

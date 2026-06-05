@@ -33,7 +33,6 @@ enum JumpCommandPlan {
         activate_bundle_id: String,
     },
     ITermActivate { tty: String },
-    TerminalResume { session_id: String, workspace_path: String },
 }
 
 #[derive(Debug, Default)]
@@ -166,7 +165,7 @@ impl InboxStore {
                     name: "Window jump-back".to_string(),
                     availability: Confidence::Inferred,
                     detail:
-                        "Routes one Jump back action to Codex Desktop, a live iTerm Codex session, or Terminal resume fallback."
+                        "Routes one Jump back action to Codex Desktop or a live iTerm Codex session."
                             .to_string(),
                 },
             ],
@@ -210,8 +209,8 @@ impl InboxStore {
                 (JumpTarget::Cli, Some(JumpCommandPlan::ITermActivate { .. }), Some(Ok(()))) => {
                     "Focused live iTerm Codex session.".to_string()
                 }
-                (JumpTarget::Cli, Some(JumpCommandPlan::TerminalResume { .. }), Some(Ok(()))) => {
-                    "Opened Terminal resume command.".to_string()
+                (JumpTarget::Cli, Some(JumpCommandPlan::CodexDesktop { .. }), Some(Ok(()))) => {
+                    "Opened Codex Desktop session.".to_string()
                 }
                 (_, _, Some(Err(error))) => format!("Jump-back failed: {error}"),
                 _ => "Jump-back unavailable: missing reliable target signal.".to_string(),
@@ -411,9 +410,11 @@ fn build_jump_command_plan_with_live_tty(
         JumpTarget::Cli => live_tty
             .map(|tty| JumpCommandPlan::ITermActivate { tty })
             .or_else(|| {
-                Some(JumpCommandPlan::TerminalResume {
-                    session_id: row.session_id.clone(),
+                Some(JumpCommandPlan::CodexDesktop {
+                    thread_id: row.session_id.clone(),
+                    deeplink_url: codex_thread_deeplink(&row.session_id),
                     workspace_path,
+                    activate_bundle_id: codex_bundle_id().to_string(),
                 })
             }),
     }
@@ -437,33 +438,6 @@ fn execute_jump_command_plan(plan: JumpCommandPlan) -> Result<(), String> {
             )
         }
         JumpCommandPlan::ITermActivate { tty } => activate_iterm_tty(&tty),
-        JumpCommandPlan::TerminalResume {
-            session_id,
-            workspace_path,
-        } => {
-            let command = format!(
-                "{} resume {} --cd {}",
-                shell_quote(&codex_cli_path().display().to_string()),
-                shell_quote(&session_id),
-                shell_quote(&workspace_path)
-            );
-            let script = format!(
-                "tell application \"Terminal\"\nactivate\ndo script {quoted_command}\nend tell",
-                quoted_command = applescript_string_literal(&command)
-            );
-
-            Command::new("osascript")
-                .args(["-e", &script])
-                .status()
-                .map_err(|error| format!("failed to open Terminal: {error}"))
-                .and_then(|status| {
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!("Terminal launcher exited with {status}"))
-                    }
-                })
-        }
     }
 }
 
@@ -648,10 +622,6 @@ fn run_command_with_timeout(
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn applescript_string_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -783,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_sessions_without_live_tty_fall_back_to_terminal_resume_jump_plan() {
+    fn cli_sessions_without_live_tty_fall_back_to_desktop_deeplink_jump_plan() {
         let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-b".to_string()))
             .with_jump_availability(JumpAvailability::Approximate)
@@ -793,9 +763,11 @@ mod tests {
 
         assert_eq!(
             plan,
-            Some(super::JumpCommandPlan::TerminalResume {
-                session_id: "s2".to_string(),
-                workspace_path: "/Users/edy/project-b".to_string()
+            Some(super::JumpCommandPlan::CodexDesktop {
+                thread_id: "s2".to_string(),
+                workspace_path: "/Users/edy/project-b".to_string(),
+                deeplink_url: "codex://threads/s2".to_string(),
+                activate_bundle_id: "com.openai.codex".to_string()
             })
         );
     }
