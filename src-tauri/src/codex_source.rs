@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 
+const UNREAD_COMPLETION_TRACKING_START: &str = "2026-06-05T08:00:00.000Z";
+
 #[derive(Debug, Clone)]
 struct SessionFileSummary {
     path: PathBuf,
@@ -100,7 +102,7 @@ fn parse_session_file(
     let mut session_name = None;
     let mut jump_target = JumpTarget::Unknown;
     let mut latest_timestamp = None;
-    let mut is_complete = false;
+    let mut last_activity_kind = ObservationKind::InsufficientEvidence;
     let mut last_agent_message = None;
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
@@ -141,7 +143,9 @@ fn parse_session_file(
                     .and_then(Value::as_str);
 
                 if event_type == Some("task_complete") {
-                    is_complete = true;
+                    last_activity_kind = ObservationKind::Completed;
+                } else if matches!(event_type, Some("user_message" | "agent_message")) {
+                    last_activity_kind = ObservationKind::Running;
                 }
 
                 if let Some(message) = value
@@ -167,14 +171,28 @@ fn parse_session_file(
         return Ok(None);
     };
 
-    let kind = if is_complete {
-        ObservationKind::Completed
-    } else if latest_timestamp
+    let is_recent = latest_timestamp
         .as_deref()
         .and_then(parse_utc_timestamp)
         .and_then(|last_activity| now.duration_since(last_activity).ok())
-        .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60))
-    {
+        .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
+    let is_tracked_unread_completion = latest_timestamp
+        .as_deref()
+        .zip(parse_utc_timestamp(UNREAD_COMPLETION_TRACKING_START))
+        .and_then(|(last_activity_at, tracking_start)| {
+            parse_utc_timestamp(last_activity_at)
+                .map(|last_activity| last_activity.duration_since(tracking_start).is_ok())
+        })
+        .unwrap_or(false);
+    let kind = if matches!(last_activity_kind, ObservationKind::Completed) {
+        if is_tracked_unread_completion {
+            ObservationKind::CompletedImmediate
+        } else {
+            ObservationKind::CompletedStale
+        }
+    } else if matches!(last_activity_kind, ObservationKind::Running) && is_recent {
+        ObservationKind::Running
+    } else if is_recent {
         ObservationKind::Running
     } else {
         ObservationKind::InsufficientEvidence
@@ -350,18 +368,32 @@ fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<Sou
         .as_ref()
         .and_then(|observation| observation.last_activity_at.clone())
         .or_else(|| thread.updated_at_ms.and_then(timestamp_ms_to_iso_utc));
-    let kind = if thread.archived {
-        jsonl_observation
-            .as_ref()
-            .map(|observation| observation.kind)
-            .unwrap_or(ObservationKind::Completed)
-    } else if matches!(jump_target, JumpTarget::Desktop) {
+    let has_recent_activity = last_activity_at
+        .as_deref()
+        .and_then(parse_utc_timestamp)
+        .and_then(|last_activity| now.duration_since(last_activity).ok())
+        .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
+    let jsonl_kind = jsonl_observation.as_ref().map(|observation| observation.kind);
+    let thread_completion_kind = completion_kind_from_last_activity_at(last_activity_at.as_deref(), now);
+    let kind = if matches!(
+        jsonl_kind,
+        Some(
+            ObservationKind::Completed
+                | ObservationKind::CompletedImmediate
+                | ObservationKind::CompletedStale
+                | ObservationKind::Failed
+                | ObservationKind::WaitingForInput
+        )
+    ) {
+        jsonl_kind.expect("matched jsonl terminal or input state")
+    } else if thread.archived {
+        thread_completion_kind
+    } else if matches!(jump_target, JumpTarget::Desktop) && has_recent_activity {
         ObservationKind::Running
+    } else if matches!(jump_target, JumpTarget::Desktop) {
+        ObservationKind::Idle
     } else {
-        jsonl_observation
-            .as_ref()
-            .map(|observation| observation.kind)
-            .unwrap_or(ObservationKind::InsufficientEvidence)
+        jsonl_kind.unwrap_or(ObservationKind::InsufficientEvidence)
     };
     let project_name = Path::new(&thread.cwd)
         .file_name()
@@ -400,6 +432,20 @@ fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<Sou
 
     observation.evidence_summary = evidence_summary;
     Some(observation)
+}
+
+fn completion_kind_from_last_activity_at(last_activity_at: Option<&str>, now: SystemTime) -> ObservationKind {
+    let completion_age = last_activity_at
+        .and_then(parse_utc_timestamp)
+        .and_then(|last_activity| now.duration_since(last_activity).ok());
+
+    if completion_age.is_some_and(|age| age <= Duration::from_secs(5 * 60)) {
+        ObservationKind::CompletedImmediate
+    } else if completion_age.is_some_and(|age| age <= Duration::from_secs(30 * 60)) {
+        ObservationKind::Completed
+    } else {
+        ObservationKind::CompletedStale
+    }
 }
 
 fn jump_target_from_thread_source(thread: &ThreadSummary) -> JumpTarget {
@@ -652,14 +698,14 @@ mod tests {
     #[test]
     fn marks_task_complete_sessions_as_completed() {
         let temp = tempdir().expect("temp dir");
-        let session_dir = temp.path().join("2026/06/03");
+        let session_dir = temp.path().join("2026/06/05");
         fs::create_dir_all(&session_dir).expect("session dir");
         fs::write(
-            session_dir.join("rollout-2026-06-03T11-00-00-019done.jsonl"),
-            r#"{"timestamp":"2026-06-03T03:00:00.000Z","type":"session_meta","payload":{"id":"019done","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
+            session_dir.join("rollout-2026-06-05T16-00-00-019done.jsonl"),
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019done","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
                 .to_string()
                 + "\n"
-                + r#"{"timestamp":"2026-06-03T03:20:00.000Z","type":"event_msg","payload":{"type":"task_complete","completed_at":1780456800}}"#
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
                 + "\n",
         )
         .expect("session file");
@@ -667,14 +713,95 @@ mod tests {
         let rows = discover_codex_observations_with_now(
             temp.path(),
             20,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_470_000),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_650_980),
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, ObservationKind::Completed);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
         assert_eq!(
             rows[0].last_activity_at.as_deref(),
-            Some("2026-06-03T03:20:00.000Z")
+            Some("2026-06-05T08:20:00.000Z")
+        );
+    }
+
+    #[test]
+    fn keeps_unread_task_complete_after_inspect_window_as_immediate_completion() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-05T16-00-00-019done-needed.jsonl"),
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019done-needed","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_652_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
+    }
+
+    #[test]
+    fn treats_task_complete_before_tracking_baseline_as_stale_completed() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/03");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-03T11-00-00-019done-old.jsonl"),
+            r#"{"timestamp":"2026-06-03T03:00:00.000Z","type":"session_meta","payload":{"id":"019done-old","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_466_400),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedStale);
+    }
+
+    #[test]
+    fn newer_user_message_after_task_complete_reopens_session_as_running() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-03T11-00-00-019continued.jsonl"),
+            r#"{"timestamp":"2026-06-03T03:00:00.000Z","type":"session_meta","payload":{"id":"019continued","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:30:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"continue\n"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_457_700),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-03T03:30:00.000Z")
         );
     }
 
@@ -702,18 +829,18 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_threads_are_primary_and_task_complete_does_not_clear_desktop_thread() {
+    fn sqlite_threads_use_jsonl_task_complete_as_completion_signal() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let session_dir = temp.path().join("2026/06/03");
         fs::create_dir_all(&session_dir).expect("session dir");
-        let rollout_path = session_dir.join("rollout-2026-06-03T10-00-00-019desktop.jsonl");
+        let rollout_path = session_dir.join("rollout-2026-06-05T16-00-00-019desktop.jsonl");
         fs::write(
             &rollout_path,
-            r#"{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019desktop","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}"#
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019desktop","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}"#
                 .to_string()
                 + "\n"
-                + r#"{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
                 + "\n",
         )
         .expect("session file");
@@ -723,7 +850,7 @@ mod tests {
             .arg(format!(
                 "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer, thread_source text, preview text not null default '');
                  insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
-                 values ('019desktop', '{}', 1780452000, 1780453200, 'vscode', 'OpenAI', '/Users/edy/wmhcar', '排查用车详情地图卡顿', '{{\"type\":\"disabled\"}}', 'never', 1780453200000, 'user', '排查用车详情地图卡顿');",
+                 values ('019desktop', '{}', 1780646400, 1780647600, 'vscode', 'OpenAI', '/Users/edy/wmhcar', '排查用车详情地图卡顿', '{{\"type\":\"disabled\"}}', 'never', 1780647600000, 'user', '排查用车详情地图卡顿');",
                 rollout_path.display()
             ))
             .status()
@@ -733,14 +860,92 @@ mod tests {
             &state_db,
             temp.path(),
             20,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_470_000),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_652_000),
         );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "019desktop");
         assert_eq!(rows[0].label.as_deref(), Some("排查用车详情地图卡顿"));
-        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
         assert_eq!(rows[0].jump_target, JumpTarget::Desktop);
+    }
+
+    #[test]
+    fn stale_unarchived_desktop_threads_are_idle_not_running() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/03");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-03T02-00-00-019stale.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019stale","cwd":"/Users/edy/wmmeal","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n",
+        )
+        .expect("session file");
+
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(format!(
+                "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer, thread_source text, preview text not null default '');
+                 insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
+                 values ('019stale', '{}', 1780452000, 1780452000, 'vscode', 'OpenAI', '/Users/edy/wmmeal', 'update the dep @hosemall/mall-component@2.7.44', '{{\"type\":\"disabled\"}}', 'never', 1780452000000, 'user', 'update the dep @hosemall/mall-component@2.7.44');",
+                rollout_path.display()
+            ))
+            .status()
+            .expect("create state db");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_466_400),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Idle);
+    }
+
+    #[test]
+    fn old_archived_threads_without_completion_evidence_are_idle() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/05/26");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-05-26T15-00-00-019archived-old.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-05-26T07:00:00.000Z","type":"session_meta","payload":{"id":"019archived-old","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-05-26T07:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"构建发版分支\n"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-05-26T07:20:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(format!(
+                "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer, thread_source text, preview text not null default '');
+                 insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview, archived)
+                 values ('019archived-old', '{}', 1779778800, 1779778800, 'vscode', 'OpenAI', '/Users/edy/wmhcar', '构建发版分支', '{{\"type\":\"disabled\"}}', 'never', 1779778800000, 'user', '构建发版分支', 1);",
+                rollout_path.display()
+            ))
+            .status()
+            .expect("create state db");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_646_400),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedStale);
     }
 
     #[test]
@@ -754,6 +959,7 @@ mod tests {
             "/tmp/missing-target.jsonl",
             "/Users/edy/target",
             "Target thread",
+            1_780_469_000_000,
         );
         insert_thread(
             &state_db,
@@ -761,6 +967,7 @@ mod tests {
             "/tmp/missing-other.jsonl",
             "/Users/edy/other",
             "Other thread",
+            1_780_453_200_000,
         );
 
         let row = discover_codex_observation_by_id(
@@ -791,13 +998,14 @@ mod tests {
         rollout_path: &str,
         cwd: &str,
         title: &str,
+        updated_at_ms: i64,
     ) {
         std::process::Command::new("sqlite3")
             .arg(state_db)
             .arg(format!(
                 "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
-                 values ('{}', '{}', 1780452000, 1780453200, 'vscode', 'OpenAI', '{}', '{}', '{{\"type\":\"disabled\"}}', 'never', 1780453200000, 'user', '{}');",
-                id, rollout_path, cwd, title, title
+                 values ('{}', '{}', 1780452000, 1780453200, 'vscode', 'OpenAI', '{}', '{}', '{{\"type\":\"disabled\"}}', 'never', {}, 'user', '{}');",
+                id, rollout_path, cwd, title, updated_at_ms, title
             ))
             .status()
             .expect("insert thread");

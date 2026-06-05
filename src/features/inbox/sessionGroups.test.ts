@@ -20,12 +20,14 @@ describe("groupSessions", () => {
       baseRow,
       { ...baseRow, sessionId: "s2", state: "unknown" },
       { ...baseRow, sessionId: "s3", state: "dismissable" },
-      { ...baseRow, sessionId: "s4", state: "running", dismissed: true },
+      { ...baseRow, sessionId: "s4", state: "idle" },
+      { ...baseRow, sessionId: "s5", state: "running", dismissed: true },
     ]);
 
     expect(groups.needsAttention).toHaveLength(1);
     expect(groups.unknown).toHaveLength(1);
     expect(groups.dismissable).toHaveLength(1);
+    expect(groups.idle).toHaveLength(1);
     expect(groups.running).toHaveLength(0);
   });
 });

@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,14 +39,59 @@ enum JumpCommandPlan {
 #[derive(Debug, Default)]
 pub struct InboxStore {
     dismissed_session_ids: Mutex<HashSet<String>>,
+    acknowledged_signals: Mutex<HashSet<AcknowledgedSignal>>,
+}
+
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+struct AcknowledgedSignal {
+    session_id: String,
+    last_activity_at: Option<String>,
+    #[serde(default)]
+    acknowledged_at_ms: Option<u64>,
+}
+
+impl PartialEq for AcknowledgedSignal {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && self.last_activity_at == other.last_activity_at
+    }
+}
+
+impl Hash for AcknowledgedSignal {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.session_id.hash(state);
+        self.last_activity_at.hash(state);
+    }
+}
+
+impl AcknowledgedSignal {
+    fn from_row(row: &SessionRow) -> Self {
+        Self {
+            session_id: row.session_id.clone(),
+            last_activity_at: row.last_activity_at.clone(),
+            acknowledged_at_ms: None,
+        }
+    }
+
+    fn from_row_at(row: &SessionRow, acknowledged_at_ms: u64) -> Self {
+        Self {
+            session_id: row.session_id.clone(),
+            last_activity_at: row.last_activity_at.clone(),
+            acknowledged_at_ms: Some(acknowledged_at_ms),
+        }
+    }
 }
 
 impl InboxStore {
     pub fn list_sessions(&self) -> Vec<SessionRow> {
+        self.refresh_persisted_acknowledged_signals();
         let dismissed_session_ids = self
             .dismissed_session_ids
             .lock()
             .expect("dismissed session store lock poisoned");
+        let acknowledged_signals = self
+            .acknowledged_signals
+            .lock()
+            .expect("acknowledged signal store lock poisoned");
 
         discover_codex_observations(&codex_sessions_root(), 80)
             .into_iter()
@@ -65,11 +112,8 @@ impl InboxStore {
                     .with_dismissability_reason(Some(dismissability.reason))
                     .with_jump_availability(jump_availability);
 
-                if dismissed_session_ids.contains(&row.session_id) {
-                    row.mark_dismissed()
-                } else {
-                    row
-                }
+                row = apply_acknowledged_session_state(row, &acknowledged_signals, current_time_millis());
+                apply_dismissed_session_state(row, &dismissed_session_ids)
             })
             .collect()
     }
@@ -149,6 +193,11 @@ impl InboxStore {
             .as_ref()
             .and_then(build_jump_command_plan);
         let execution = plan.clone().map(execute_jump_command_plan);
+        if matches!(execution, Some(Ok(()))) {
+            if let Some(row) = row.as_ref() {
+                self.acknowledge_session_signal(row);
+            }
+        }
         let message = match availability {
             JumpAvailability::Exact | JumpAvailability::Approximate => match (target, plan, execution) {
                 (
@@ -180,6 +229,15 @@ impl InboxStore {
         }
     }
 
+    fn acknowledge_session_signal(&self, row: &SessionRow) {
+        let mut acknowledged_signals = self
+            .acknowledged_signals
+            .lock()
+            .expect("acknowledged signal store lock poisoned");
+        acknowledged_signals.replace(AcknowledgedSignal::from_row_at(row, current_time_millis()));
+        let _ = save_acknowledged_signals(&acknowledged_signals_path(), &acknowledged_signals);
+    }
+
     fn fast_session_row_for_jump(&self, session_id: &str) -> Option<SessionRow> {
         let observation = discover_codex_observation_by_id(
             &codex_state_db_path(),
@@ -199,6 +257,100 @@ impl InboxStore {
         };
 
         Some(row.with_jump_availability(jump_availability))
+    }
+
+    fn refresh_persisted_acknowledged_signals(&self) {
+        let loaded = load_acknowledged_signals(&acknowledged_signals_path());
+        if loaded.is_empty() {
+            return;
+        }
+
+        let mut acknowledged_signals = self
+            .acknowledged_signals
+            .lock()
+            .expect("acknowledged signal store lock poisoned");
+        acknowledged_signals.extend(loaded);
+    }
+}
+
+fn load_acknowledged_signals(path: &std::path::Path) -> HashSet<AcknowledgedSignal> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_acknowledged_signals(
+    path: &std::path::Path,
+    signals: &HashSet<AcknowledgedSignal>,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = serde_json::to_string_pretty(signals)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(path, content)
+}
+
+fn apply_acknowledged_session_state(
+    row: SessionRow,
+    acknowledged_signals: &HashSet<AcknowledgedSignal>,
+    now_ms: u64,
+) -> SessionRow {
+    let Some(signal) = acknowledged_signals.get(&AcknowledgedSignal::from_row(&row)) else {
+        return row;
+    };
+
+    if matches!(row.state, SessionState::Running | SessionState::Idle) {
+        return row;
+    }
+
+    let Some(acknowledged_at_ms) = signal.acknowledged_at_ms else {
+        return SessionRow {
+            state: SessionState::Idle,
+            confidence: Confidence::Inferred,
+            status_reason: "User confirmed via Jump back; idle until the next source signal.".to_string(),
+            handled: true,
+            dismissed: false,
+            ..row
+        };
+    };
+
+    if now_ms.saturating_sub(acknowledged_at_ms) <= 30 * 60 * 1000 {
+        return SessionRow {
+            state: SessionState::NeedsAttention,
+            confidence: Confidence::Exact,
+            status_reason: "Read recently; keep in needed state until 30 minutes pass.".to_string(),
+            handled: true,
+            dismissed: false,
+            ..row
+        };
+    }
+
+    SessionRow {
+        state: SessionState::Idle,
+        confidence: Confidence::Inferred,
+        status_reason: "Read window expired; idle until the next source signal.".to_string(),
+        handled: true,
+        dismissed: false,
+        ..row
+    }
+}
+
+fn apply_dismissed_session_state(
+    row: SessionRow,
+    dismissed_session_ids: &HashSet<String>,
+) -> SessionRow {
+    if !dismissed_session_ids.contains(&row.session_id) {
+        return row;
+    }
+
+    if matches!(row.state, SessionState::Running | SessionState::NeedsAttention) {
+        row.mark_restored()
+    } else {
+        row.mark_dismissed()
     }
 }
 
@@ -275,10 +427,14 @@ fn execute_jump_command_plan(plan: JumpCommandPlan) -> Result<(), String> {
             deeplink_url,
             activate_bundle_id,
         } => {
-            open_codex_thread_deeplink(&deeplink_url)
-                .or_else(|_| open_codex_workspace(&workspace_path))?;
-
-            activate_app(&activate_bundle_id)
+            execute_codex_desktop_jump(
+                &deeplink_url,
+                &workspace_path,
+                &activate_bundle_id,
+                open_codex_thread_deeplink,
+                open_codex_workspace,
+                activate_app,
+            )
         }
         JumpCommandPlan::ITermActivate { tty } => activate_iterm_tty(&tty),
         JumpCommandPlan::TerminalResume {
@@ -309,6 +465,17 @@ fn execute_jump_command_plan(plan: JumpCommandPlan) -> Result<(), String> {
                 })
         }
     }
+}
+
+fn execute_codex_desktop_jump(
+    deeplink_url: &str,
+    _workspace_path: &str,
+    _activate_bundle_id: &str,
+    open_deeplink: impl FnOnce(&str) -> Result<(), String>,
+    _open_workspace: impl FnOnce(&str) -> Result<(), String>,
+    _activate: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    open_deeplink(deeplink_url)
 }
 
 fn find_live_codex_tty_for_workspace(workspace_path: &str) -> Option<String> {
@@ -505,8 +672,27 @@ fn codex_state_db_path() -> PathBuf {
         .join("state_5.sqlite")
 }
 
+fn acknowledged_signals_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+        .join("agent-session-inbox")
+        .join("acknowledged-signals.json")
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::fs;
+
     use crate::domain::confidence::Confidence;
     use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
     use crate::inbox_store::InboxStore;
@@ -525,7 +711,12 @@ mod tests {
     fn dismiss_and_restore_round_trips_row_state() {
         let store = InboxStore::default();
 
-        let Some(session_id) = store.list_sessions().first().map(|row| row.session_id.clone()) else {
+        let Some(session_id) = store
+            .list_sessions()
+            .into_iter()
+            .find(|row| !matches!(row.state, SessionState::Running | SessionState::NeedsAttention))
+            .map(|row| row.session_id)
+        else {
             return;
         };
 
@@ -630,6 +821,61 @@ mod tests {
     }
 
     #[test]
+    fn desktop_deeplink_success_does_not_run_extra_activation() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = super::execute_codex_desktop_jump(
+            "codex://threads/s1",
+            "/Users/edy/project-a",
+            "com.openai.codex",
+            |url| {
+                calls.borrow_mut().push(format!("deeplink:{url}"));
+                Ok(())
+            },
+            |workspace| {
+                calls.borrow_mut().push(format!("workspace:{workspace}"));
+                Ok(())
+            },
+            |bundle_id| {
+                calls.borrow_mut().push(format!("activate:{bundle_id}"));
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.borrow(), vec!["deeplink:codex://threads/s1"]);
+    }
+
+    #[test]
+    fn desktop_deeplink_failure_does_not_open_workspace_fallback() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = super::execute_codex_desktop_jump(
+            "codex://threads/s1",
+            "/Users/edy/project-a",
+            "com.openai.codex",
+            |url| {
+                calls.borrow_mut().push(format!("deeplink:{url}"));
+                Err("deeplink failed".to_string())
+            },
+            |workspace| {
+                calls.borrow_mut().push(format!("workspace:{workspace}"));
+                Ok(())
+            },
+            |bundle_id| {
+                calls.borrow_mut().push(format!("activate:{bundle_id}"));
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("deeplink failed".to_string()));
+        assert_eq!(
+            *calls.borrow(),
+            vec!["deeplink:codex://threads/s1"]
+        );
+    }
+
+    #[test]
     fn unknown_cli_rows_with_live_process_signal_are_promoted_to_running() {
         let row = SessionRow::new("s4", "CLI row", SessionState::Unknown, Confidence::Unknown)
             .with_workspace(Some("/Users/edy/project-d".to_string()))
@@ -641,5 +887,109 @@ mod tests {
         assert_eq!(row.state, SessionState::Running);
         assert_eq!(row.confidence, Confidence::Inferred);
         assert!(row.status_reason.contains("Live Codex CLI process"));
+    }
+
+    #[test]
+    fn dismissed_inspect_rows_stay_hidden_until_they_run_again() {
+        let dismissed_session_ids = HashSet::from(["s5".to_string()]);
+        let inspect_row =
+            SessionRow::new("s5", "Inspect row", SessionState::Inspect, Confidence::Exact);
+        let running_row =
+            SessionRow::new("s5", "Running row", SessionState::Running, Confidence::Exact);
+        let attention_row =
+            SessionRow::new("s5", "Input row", SessionState::NeedsAttention, Confidence::Exact);
+
+        let inspect_row = super::apply_dismissed_session_state(inspect_row, &dismissed_session_ids);
+        let running_row = super::apply_dismissed_session_state(running_row, &dismissed_session_ids);
+        let attention_row = super::apply_dismissed_session_state(attention_row, &dismissed_session_ids);
+
+        assert!(inspect_row.dismissed);
+        assert!(!running_row.dismissed);
+        assert!(!attention_row.dismissed);
+    }
+
+    #[test]
+    fn current_completed_threads_are_quiet_rows() {
+        let store = InboxStore::default();
+        let Some(row) = store
+            .list_sessions()
+            .into_iter()
+            .find(|row| row.workspace_path.as_deref() == Some("/Users/edy/sofdev/agent-session-inbox"))
+        else {
+            return;
+        };
+
+        match row.state {
+            SessionState::Idle => {
+                assert_eq!(row.confidence, Confidence::Inferred);
+                assert!(row.status_reason.contains("completed task observed"));
+            }
+            SessionState::Running => {
+                assert!(matches!(row.confidence, Confidence::Exact | Confidence::Inferred));
+                assert!(
+                    row.status_reason.contains("running signal observed")
+                        || row.status_reason.contains("Live Codex CLI process")
+                );
+            }
+            _ => panic!("current project row should be active or idle"),
+        }
+    }
+
+    #[test]
+    fn acknowledged_rows_become_needed_for_thirty_minutes_then_idle() {
+        let row = SessionRow::new("s6", "Needs input", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:00:00.000Z");
+        let acknowledged_at_ms = 1_780_000_000_000;
+        let acknowledged = HashSet::from([super::AcknowledgedSignal::from_row_at(&row, acknowledged_at_ms)]);
+
+        let confirmed_row = super::apply_acknowledged_session_state(
+            row,
+            &acknowledged,
+            acknowledged_at_ms + 29 * 60 * 1000,
+        );
+
+        assert_eq!(confirmed_row.state, SessionState::NeedsAttention);
+        assert_eq!(confirmed_row.confidence, Confidence::Exact);
+        assert!(confirmed_row.handled);
+        assert!(!confirmed_row.dismissed);
+        assert!(confirmed_row.status_reason.contains("Read recently"));
+
+        let row = SessionRow::new("s6", "Needs input", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:00:00.000Z");
+        let expired_row = super::apply_acknowledged_session_state(
+            row,
+            &acknowledged,
+            acknowledged_at_ms + 31 * 60 * 1000,
+        );
+
+        assert_eq!(expired_row.state, SessionState::Idle);
+        assert_eq!(expired_row.confidence, Confidence::Inferred);
+        assert!(expired_row.handled);
+        assert!(expired_row.status_reason.contains("Read window expired"));
+
+        let changed_row = SessionRow::new("s6", "Needs input", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:01:00.000Z");
+        let changed_row = super::apply_acknowledged_session_state(changed_row, &acknowledged, acknowledged_at_ms);
+
+        assert_eq!(changed_row.state, SessionState::Inspect);
+        assert!(!changed_row.handled);
+    }
+
+    #[test]
+    fn acknowledged_signals_round_trip_to_disk() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("acknowledged-signals.json");
+        let signal = super::AcknowledgedSignal {
+            session_id: "s7".to_string(),
+            last_activity_at: Some("2026-06-05T07:22:45.199Z".to_string()),
+            acknowledged_at_ms: Some(1_780_647_765_000),
+        };
+        let signals = HashSet::from([signal.clone()]);
+
+        super::save_acknowledged_signals(&path, &signals).expect("save signals");
+        let loaded = super::load_acknowledged_signals(&path);
+
+        assert_eq!(loaded, signals);
+        assert!(fs::read_to_string(path).expect("signal file").contains("2026-06-05T07:22:45.199Z"));
     }
 }

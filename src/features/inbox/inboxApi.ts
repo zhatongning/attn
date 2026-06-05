@@ -18,7 +18,9 @@ export async function loadSessions(): Promise<SessionRow[]> {
     return fetchDevJson<SessionRow[]>("/api/sessions", initialSessions);
   }
 
-  return invoke<SessionRow[]>("list_sessions");
+  return invoke<SessionRow[]>("list_sessions").catch(() =>
+    fetchDevJson<SessionRow[]>("/api/sessions", initialSessions),
+  );
 }
 
 export async function loadSourceHealth(): Promise<SourceHealth> {
@@ -26,7 +28,9 @@ export async function loadSourceHealth(): Promise<SourceHealth> {
     return fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth);
   }
 
-  return invoke<SourceHealth>("source_health");
+  return invoke<SourceHealth>("source_health").catch(() =>
+    fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth),
+  );
 }
 
 export async function dismissSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
@@ -36,7 +40,11 @@ export async function dismissSession(sessionId: string, currentRows: SessionRow[
     );
   }
 
-  return invoke<SessionRow[]>("dismiss_session", { sessionId });
+  return invoke<SessionRow[]>("dismiss_session", { sessionId }).catch(() =>
+    currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, dismissed: true, handled: true } : row,
+    ),
+  );
 }
 
 export async function restoreSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
@@ -46,7 +54,11 @@ export async function restoreSession(sessionId: string, currentRows: SessionRow[
     );
   }
 
-  return invoke<SessionRow[]>("restore_session", { sessionId });
+  return invoke<SessionRow[]>("restore_session", { sessionId }).catch(() =>
+    currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, dismissed: false, handled: false } : row,
+    ),
+  );
 }
 
 export async function jumpToSession(sessionId: string): Promise<JumpResult> {
@@ -63,7 +75,18 @@ export async function jumpToSession(sessionId: string): Promise<JumpResult> {
     });
   }
 
-  return invoke<JumpResult>("jump_to_session", { sessionId });
+  return invoke<JumpResult>("jump_to_session", { sessionId }).catch(() =>
+    fetchDevJson<JumpResult>("/api/jump", {
+      sessionId,
+      availability: "unavailable",
+      target: "unknown",
+      message: "Jump-back unavailable: local preview API is not connected.",
+    }, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    }),
+  );
 }
 
 async function fetchDevJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {

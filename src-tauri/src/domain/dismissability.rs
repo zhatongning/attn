@@ -18,10 +18,12 @@ pub fn evaluate_dismissability(row: &SessionRow) -> Dismissability {
         };
     }
 
-    if matches!(row.state, SessionState::Dismissable) && matches!(row.confidence, Confidence::Exact | Confidence::Inferred) {
+    if matches!(row.state, SessionState::Inspect | SessionState::Dismissable)
+        && matches!(row.confidence, Confidence::Exact | Confidence::Inferred)
+    {
         return Dismissability {
             is_dismissable: true,
-            reason: "completed low-risk row can be manually dismissed".to_string(),
+            reason: "inspect row can be manually dismissed".to_string(),
         };
     }
 
@@ -38,14 +40,14 @@ mod tests {
     use crate::domain::session::{SessionRow, SessionState};
 
     #[test]
-    fn marks_completed_exact_rows_dismissable_with_reason() {
-        let row = SessionRow::new("s1", "Completed task", SessionState::Dismissable, Confidence::Exact)
+    fn marks_inspect_exact_rows_dismissable_with_reason() {
+        let row = SessionRow::new("s1", "Failed task", SessionState::Inspect, Confidence::Exact)
             .with_last_activity("2026-06-02T10:00:00Z");
 
         let result = evaluate_dismissability(&row);
 
         assert!(result.is_dismissable);
-        assert!(result.reason.contains("completed"));
+        assert!(result.reason.contains("inspect"));
     }
 
     #[test]

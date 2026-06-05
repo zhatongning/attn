@@ -1,0 +1,275 @@
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+// @ts-expect-error This test reads local CSS without adding Node types to the app build.
+import { readFileSync } from "node:fs";
+// @ts-expect-error This test reads local CSS without adding Node types to the app build.
+import { join } from "node:path";
+import type { SessionRow } from "../../shared/types/session";
+import { fakeSourceHealth, initialSessions } from "../inbox/fakeSessions";
+import { StatusPanelView } from "./StatusPanelView";
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => vi.fn()),
+}));
+
+afterEach(() => {
+  window.localStorage.clear();
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("StatusPanelView", () => {
+  it("renders an Atom intervention watchlist with a hidden quiet count", () => {
+    render(
+      <StatusPanelView
+        initialRows={[
+          ...initialSessions,
+          {
+            ...initialSessions[0],
+            sessionId: "extra-working",
+            label: "Extra working session",
+            state: "running",
+            statusReason: "running signal observed",
+          },
+        ]}
+        sourceHealth={fakeSourceHealth}
+      />,
+    );
+
+    const panel = screen.getByRole("main");
+    const statusRows = within(panel).getAllByRole("article");
+
+    expect(screen.getByText("codex attention")).toBeTruthy();
+    expect(statusRows).toHaveLength(3);
+    expect(screen.getByText(/quiet/)).toBeTruthy();
+  });
+
+  it("does not expand hidden quiet rows into the attention panel", () => {
+    render(
+      <StatusPanelView
+        initialRows={[
+          {
+            ...initialSessions[0],
+            sessionId: "review-1",
+            label: "Review one",
+            state: "dismissable",
+            statusReason: "completed task ready to inspect; confirm to mark idle",
+          },
+          {
+            ...initialSessions[0],
+            sessionId: "review-2",
+            label: "Review two",
+            state: "dismissable",
+            statusReason: "completed task ready to inspect; confirm to mark idle",
+          },
+          {
+            ...initialSessions[0],
+            sessionId: "review-3",
+            label: "Review three",
+            state: "dismissable",
+            statusReason: "completed task ready to inspect; confirm to mark idle",
+          },
+          {
+            ...initialSessions[0],
+            sessionId: "extra-idle",
+            label: "Quiet historical session",
+            state: "idle",
+            statusReason: "completed task is no longer recent; idle until the next source signal",
+          },
+        ]}
+        sourceHealth={fakeSourceHealth}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/\+\d+ quiet/));
+
+    expect(screen.queryByText("Quiet historical session")).toBeNull();
+    expect(screen.getAllByRole("article")).toHaveLength(3);
+  });
+
+  it("keeps configurable options off the status panel", () => {
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.queryByLabelText("Visible items")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Manage settings" })).toBeNull();
+  });
+
+  it("keeps long real session titles inside the status rows", () => {
+    render(
+      <StatusPanelView
+        initialRows={[
+          {
+            ...initialSessions[0],
+            label:
+              "收到一个工单反馈用车详情页面太卡，主要是地图没法进行缩放展示。这里有一段非常长的真实标题",
+          },
+        ]}
+        sourceHealth={fakeSourceHealth}
+      />,
+    );
+
+    expect(screen.getByText("收到一个工单反馈用车详情页面太卡，主要是地图没法进行缩放展示。这里有一段非常长的真实标题")).toBeTruthy();
+  });
+
+  it("uses workspace context instead of diagnostic reason as the row subtitle", () => {
+    render(
+      <StatusPanelView
+        initialRows={[
+          {
+            ...initialSessions[0],
+            label: "Investigate local session",
+            projectName: "agent-session-inbox",
+            workspacePath: "/Users/edy/sofdev/agent-session-inbox",
+            state: "running",
+            confidence: "exact",
+            statusReason: "running signal observed",
+          },
+        ]}
+        sourceHealth={fakeSourceHealth}
+      />,
+    );
+
+    expect(screen.getByText("agent-session-inbox")).toBeTruthy();
+    expect(screen.queryByText("running signal observed")).toBeNull();
+  });
+
+  it("opens management from a native menu event", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByText("management")).toBeTruthy();
+    expect(screen.getByLabelText("Style family")).toBeTruthy();
+    expect(screen.getByLabelText("Palette")).toBeTruthy();
+    expect(screen.getByLabelText("Visible items")).toBeTruthy();
+    expect(screen.getByLabelText("Blocked color")).toBeTruthy();
+    expect(screen.getByLabelText("Inspect color")).toBeTruthy();
+    expect(screen.getByLabelText("Needed color")).toBeTruthy();
+  });
+
+  it("switches status copy to Chinese from management settings", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    fireEvent.change(await screen.findByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(screen.getByText("Back"));
+
+    expect(screen.getByText("1 需关注")).toBeTruthy();
+    expect(screen.getByText("1 进行中")).toBeTruthy();
+    expect(screen.getByText("1 空闲")).toBeTruthy();
+    expect(screen.getByText("需处理")).toBeTruthy();
+  });
+
+  it("persists language settings across panel remounts", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+    fireEvent.change(await screen.findByLabelText("Language"), { target: { value: "zh" } });
+    rendered.unmount();
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.getByText("1 需关注")).toBeTruthy();
+    expect(screen.getByText("需处理")).toBeTruthy();
+  });
+
+  it("uses small Atom status markers", () => {
+    const rows: SessionRow[] = [
+      { ...initialSessions[0], sessionId: "blocked", state: "unknown", statusReason: "source status unavailable" },
+      { ...initialSessions[0], sessionId: "needed", state: "needsAttention", statusReason: "waiting for user input" },
+      { ...initialSessions[0], sessionId: "inspect", state: "inspect", statusReason: "ready to inspect" },
+      { ...initialSessions[0], sessionId: "working", state: "running", statusReason: "running signal observed" },
+      { ...initialSessions[0], sessionId: "idle", state: "idle", statusReason: "completed task observed; idle until the next source signal" },
+    ];
+    const { container } = render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+
+    const statusTexts = Array.from(container.querySelectorAll(".status-code")).map((element) =>
+      element.textContent?.replace(/\s+/g, " ").trim(),
+    );
+
+    expect(statusTexts).toEqual(["● blocked", "● inspect", "● needed"]);
+  });
+
+  it("keeps an opened intervention row as needed during the read window", async () => {
+    const attentionRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "needs-input",
+      state: "needsAttention",
+      confidence: "exact",
+      statusReason: "waiting for user input",
+    };
+    const confirmedRow: SessionRow = {
+      ...attentionRow,
+      state: "needsAttention",
+      confidence: "exact",
+      statusReason: "Read recently; keep in needed state until 30 minutes pass.",
+      handled: true,
+      dismissed: false,
+    };
+    let jumped = false;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/jump") {
+        jumped = true;
+        return jsonResponse({
+          sessionId: attentionRow.sessionId,
+          availability: "exact",
+          target: "desktop",
+          message: "Opened Codex Desktop session.",
+        });
+      }
+      if (pathname === "/api/sessions") {
+        return jsonResponse(jumped ? [confirmedRow] : [attentionRow]);
+      }
+      if (pathname === "/api/source-health") {
+        return jsonResponse(fakeSourceHealth);
+      }
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={[attentionRow]} sourceHealth={fakeSourceHealth} />);
+
+    expect(await screen.findByText("needed")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("Jump back"));
+
+    expect(await screen.findByTitle("Read recently; keep in needed state until 30 minutes pass.")).toBeTruthy();
+    expect(screen.getByText("needed")).toBeTruthy();
+  });
+
+  it("keeps transparent window breathing room around the rounded shell", () => {
+    // @ts-expect-error This test runs in Node and does not need app-level Node globals.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+
+    expect(css).toContain("padding: 6px;");
+    expect(css).toContain("width: min(100vw - 12px, 540px);");
+    expect(css).toContain("max-height: calc(100vh - 12px);");
+  });
+});
+
+function jsonResponse(payload: unknown, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}

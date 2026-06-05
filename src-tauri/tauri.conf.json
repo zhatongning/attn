@@ -10,11 +10,23 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "agent-session-inbox",
-        "width": 800,
-        "height": 600
+        "title": "Codex Status",
+        "width": 540,
+        "height": 240,
+        "minWidth": 360,
+        "minHeight": 176,
+        "maxWidth": 620,
+        "maxHeight": 420,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "center": true
       }
     ],
     "security": {

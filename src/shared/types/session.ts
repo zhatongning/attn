@@ -1,5 +1,5 @@
 export type Confidence = "exact" | "inferred" | "unknown" | "unavailable";
-export type SessionState = "needsAttention" | "running" | "unknown" | "dismissable";
+export type SessionState = "needsAttention" | "inspect" | "running" | "idle" | "unknown" | "dismissable";
 export type JumpAvailability = "exact" | "approximate" | "unavailable";
 export type JumpTarget = "desktop" | "cli" | "unknown";
 

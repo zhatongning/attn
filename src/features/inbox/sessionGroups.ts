@@ -2,7 +2,9 @@ import type { SessionRow, SessionState } from "../../shared/types/session";
 
 export const groupLabels: Record<SessionState, string> = {
   needsAttention: "Needs attention",
+  inspect: "Ready to inspect",
   running: "Running",
+  idle: "Idle",
   unknown: "Unknown",
   dismissable: "Ready to clear",
 };
@@ -17,7 +19,9 @@ export function groupSessions(rows: SessionRow[]) {
       },
       {
         needsAttention: [],
+        inspect: [],
         running: [],
+        idle: [],
         unknown: [],
         dismissable: [],
       },

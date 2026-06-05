@@ -13,15 +13,35 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
             Confidence::Exact,
             "running signal observed".to_string(),
         ),
+        ObservationKind::Idle => (
+            SessionState::Idle,
+            Confidence::Inferred,
+            "no recent activity observed; idle until the next source signal".to_string(),
+        ),
         ObservationKind::WaitingForInput => (
             SessionState::NeedsAttention,
             Confidence::Exact,
             "waiting for user input".to_string(),
         ),
-        ObservationKind::Completed | ObservationKind::Failed => (
-            SessionState::Dismissable,
+        ObservationKind::CompletedImmediate => (
+            SessionState::Inspect,
             Confidence::Exact,
-            "completed or failed task can be manually reviewed and cleared".to_string(),
+            "completed task ready to inspect; open it to mark read".to_string(),
+        ),
+        ObservationKind::Completed => (
+            SessionState::NeedsAttention,
+            Confidence::Exact,
+            "completed task still needs your attention".to_string(),
+        ),
+        ObservationKind::CompletedStale => (
+            SessionState::Idle,
+            Confidence::Inferred,
+            "completed task is no longer recent; idle until the next source signal".to_string(),
+        ),
+        ObservationKind::Failed => (
+            SessionState::Inspect,
+            Confidence::Exact,
+            "failed task can be manually reviewed and cleared".to_string(),
         ),
         ObservationKind::InsufficientEvidence => (
             SessionState::Unknown,
@@ -59,6 +79,17 @@ mod tests {
     }
 
     #[test]
+    fn classifies_idle_observation_as_idle() {
+        let observation = SourceObservation::new("s5", ObservationKind::Idle);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.state, SessionState::Idle);
+        assert_eq!(row.confidence, Confidence::Inferred);
+        assert!(row.status_reason.contains("no recent activity"));
+    }
+
+    #[test]
     fn classifies_missing_evidence_as_unknown_and_keeps_reason() {
         let observation = SourceObservation::new("s2", ObservationKind::InsufficientEvidence);
 
@@ -67,5 +98,49 @@ mod tests {
         assert_eq!(row.state, SessionState::Unknown);
         assert_eq!(row.confidence, Confidence::Unknown);
         assert!(row.status_reason.contains("missing"));
+    }
+
+    #[test]
+    fn classifies_immediate_completed_observation_as_inspect() {
+        let observation = SourceObservation::new("s3", ObservationKind::CompletedImmediate);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.state, SessionState::Inspect);
+        assert_eq!(row.confidence, Confidence::Exact);
+        assert!(row.status_reason.contains("completed"));
+    }
+
+    #[test]
+    fn classifies_completed_observation_as_needing_attention() {
+        let observation = SourceObservation::new("s7", ObservationKind::Completed);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.state, SessionState::NeedsAttention);
+        assert_eq!(row.confidence, Confidence::Exact);
+        assert!(row.status_reason.contains("needs your attention"));
+    }
+
+    #[test]
+    fn classifies_stale_completed_observation_as_idle() {
+        let observation = SourceObservation::new("s6", ObservationKind::CompletedStale);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.state, SessionState::Idle);
+        assert_eq!(row.confidence, Confidence::Inferred);
+        assert!(row.status_reason.contains("no longer recent"));
+    }
+
+    #[test]
+    fn classifies_failed_observation_as_inspect() {
+        let observation = SourceObservation::new("s4", ObservationKind::Failed);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.state, SessionState::Inspect);
+        assert_eq!(row.confidence, Confidence::Exact);
+        assert!(row.status_reason.contains("failed"));
     }
 }

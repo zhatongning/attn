@@ -6,8 +6,11 @@ use super::confidence::Confidence;
 #[serde(rename_all = "camelCase")]
 pub enum ObservationKind {
     Running,
+    Idle,
     WaitingForInput,
+    CompletedImmediate,
     Completed,
+    CompletedStale,
     Failed,
     InsufficientEvidence,
 }
@@ -16,7 +19,9 @@ pub enum ObservationKind {
 #[serde(rename_all = "camelCase")]
 pub enum SessionState {
     NeedsAttention,
+    Inspect,
     Running,
+    Idle,
     Unknown,
     Dismissable,
 }
