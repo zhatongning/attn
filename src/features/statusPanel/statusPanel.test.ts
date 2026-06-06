@@ -114,7 +114,7 @@ describe("buildStatusPanelModel", () => {
     expect(model.interventionCount).toBe(0);
   });
 
-  it("sorts blocked, inspect, needed, working, then idle", () => {
+  it("keeps working rows visible but moves idle rows into quiet count", () => {
     const model = buildStatusPanelModel([
       row("idle", "idle", "completed task observed; idle until the next source signal"),
       row("working", "running", "running signal observed"),
@@ -128,8 +128,11 @@ describe("buildStatusPanelModel", () => {
       "inspect",
       "needed",
       "working",
-      "idle",
     ]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
+    expect(model.idleCount).toBe(1);
+    expect(model.quietHiddenCount).toBe(1);
+    expect(model.hiddenCount).toBe(1);
   });
 
   it("uses the Atom intervention theme", () => {

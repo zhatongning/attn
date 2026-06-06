@@ -44,7 +44,7 @@ The intended model is:
 | Display status | Marker | Meaning | Should user act? |
 | --- | --- | --- | --- |
 | `working` | `○ working` | The agent is actively executing work now. | No. Keep visible as quiet context. |
-| `idle` | `○ idle` | No active work is happening and no user action is required. | No. This is quiet baseline state. |
+| `idle` | `○ idle` | No active work is happening and no user action is required. | No. Count it as quiet context, but do not spend a card on it by default. |
 | `needed` | `● follow-up` | The session was opened recently and may still need a short follow-up before it settles. | Yes. |
 | `inspect` | `● inspect` | The agent just produced a result that should be checked while context is fresh. | Yes. |
 | `blocked` | `● blocked` | The agent cannot continue because of missing evidence, unavailable source, or an actionable failure signal. | Yes. |
@@ -231,15 +231,15 @@ We should decide these before more code changes.
    It means a result was produced and should be checked while context is fresh.
 
 3. What should be visible by default?
-   Proposed priority:
+   Current decision:
    - `blocked`
    - `inspect`
    - `needed`
    - current `working`
-   - recent `idle`
+   - `idle` only contributes to the quiet count and does not occupy a card
 
 4. Should quiet states be visible at all?
-   Current behavior keeps `working` and `idle` visible. A stricter intervention watchlist may show `working` only for current live work and hide most `idle`.
+   Current behavior keeps `working` visible because live work is important context, but moves `idle` into the quiet count because it does not require action.
 
 5. What is the retention rule for completed sessions?
    Current decision: completions older than 30 minutes become `idle`.

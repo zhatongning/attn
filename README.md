@@ -23,7 +23,7 @@ The compact panel maps internal session evidence to intervention statuses:
 | `● inspect` | `inspect` | The agent produced a result that should be checked while context is fresh. |
 | `● follow-up` | `follow-up` | The session was opened recently and may still need a short follow-up before it settles. |
 | `○ working` | `working` | The agent is actively executing work right now and does not need intervention. It stays visible with quiet styling. |
-| `○ idle` | `idle` | The previous intervention or inspection was confirmed, or an old Desktop thread has no recent activity. It is quiet baseline state. |
+| `○ idle` | `idle` | The previous intervention or inspection was confirmed, or an old Desktop thread has no recent activity. It is quiet baseline state and contributes to the quiet count instead of occupying a card by default. |
 
 Each row also carries a confidence value:
 

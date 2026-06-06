@@ -154,19 +154,24 @@ export function buildStatusPanelModel(
     .filter(shouldIncludeInWatchlist)
     .map((row) => toPanelRow(row, theme))
     .sort(comparePanelRows);
-  const visibleRows = panelRows.slice(0, config.visibleItemCount);
-  const hiddenRows = panelRows.slice(config.visibleItemCount);
+  const cardRows = panelRows.filter((row) => row.displayStatus !== "idle");
+  const quietRows = panelRows.filter((row) => row.statusTone === "quiet");
+  const visibleRows = cardRows.slice(0, config.visibleItemCount);
+  const hiddenRows = cardRows.slice(config.visibleItemCount);
   const expandableHiddenRows = hiddenRows.filter((row) => row.statusTone === "alert");
+  const hiddenCount = hiddenRows.length + panelRows.filter((row) => row.displayStatus === "idle").length;
+  const quietHiddenCount = hiddenRows.filter((row) => row.statusTone === "quiet").length
+    + panelRows.filter((row) => row.displayStatus === "idle").length;
 
   return {
     visibleRows,
     hiddenRows,
     expandableHiddenRows,
-    hiddenCount: hiddenRows.length,
-    quietHiddenCount: hiddenRows.filter((row) => row.statusTone === "quiet").length,
+    hiddenCount,
+    quietHiddenCount,
     expandableHiddenCount: expandableHiddenRows.length,
     interventionCount: panelRows.filter((row) => row.statusTone === "alert").length,
-    workingCount: panelRows.filter((row) => row.displayStatus === "working").length,
+    workingCount: quietRows.filter((row) => row.displayStatus === "working").length,
     idleCount: panelRows.filter((row) => row.displayStatus === "idle").length,
     theme,
     copy: panelCopy[config.language],
