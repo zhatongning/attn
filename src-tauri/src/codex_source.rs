@@ -808,11 +808,12 @@ fn parse_utc_timestamp(value: &str) -> Option<SystemTime> {
     let mut time_parts = time.split(':');
     let hour = time_parts.next()?.parse::<u32>().ok()?;
     let minute = time_parts.next()?.parse::<u32>().ok()?;
-    let second = time_parts
-        .next()?
-        .split('.')
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())?;
+    let second_with_fraction = time_parts.next()?;
+    let (second_value, fractional_value) = second_with_fraction
+        .split_once('.')
+        .unwrap_or((second_with_fraction, ""));
+    let second = second_value.parse::<u32>().ok()?;
+    let milliseconds = parse_milliseconds(fractional_value)?;
 
     let days = days_from_civil(year, month, day)?;
     let seconds = days
@@ -825,7 +826,31 @@ fn parse_utc_timestamp(value: &str) -> Option<SystemTime> {
         return None;
     }
 
-    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64))
+    Some(
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(seconds as u64)
+            + Duration::from_millis(milliseconds),
+    )
+}
+
+fn parse_milliseconds(value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return Some(0);
+    }
+
+    let mut digits = String::new();
+    for ch in value.chars().take(3) {
+        if !ch.is_ascii_digit() {
+            return None;
+        }
+        digits.push(ch);
+    }
+
+    while digits.len() < 3 {
+        digits.push('0');
+    }
+
+    digits.parse::<u64>().ok()
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
@@ -1186,6 +1211,48 @@ mod tests {
         assert_eq!(
             rows[0].last_activity_at.as_deref(),
             Some("2026-06-05T08:30:00.000Z")
+        );
+    }
+
+    #[test]
+    fn sqlite_thread_update_at_same_millisecond_as_task_complete_stays_unread() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/06");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path =
+            session_dir.join("rollout-2026-06-06T12-24-30-019same-ms.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019same-ms","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:24:30.041Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019same-ms",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/wmhcar",
+            "限制步行导航2KM显示",
+            1_780_719_870_041,
+        );
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_722_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-06T04:24:30.041Z")
         );
     }
 
