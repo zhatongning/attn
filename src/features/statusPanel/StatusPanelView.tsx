@@ -11,10 +11,11 @@ import {
 } from "../inbox/inboxApi";
 import { buildStatusPanelModel, defaultStatusPanelConfig, type StatusPanelConfig } from "./statusPanel";
 
-const STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
-const PANEL_WIDTH = 540;
+const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
+const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
+const PANEL_WIDTH = 560;
 const MANAGEMENT_HEIGHT = 420;
-const PANEL_BASE_HEIGHT = 240;
+const PANEL_BASE_HEIGHT = 252;
 const PANEL_BASE_VISIBLE_ITEMS = 3;
 const PANEL_EXTRA_ROW_HEIGHT = 48;
 
@@ -34,8 +35,11 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [expanded, setExpanded] = useState(false);
   const [commandMessage, setCommandMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss">>({});
+  const [attentionCues, setAttentionCues] = useState<Record<string, boolean>>({});
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
+  const previousDisplayStatusRef = useRef<Record<string, string>>({});
 
   async function refreshPanel() {
     try {
@@ -79,23 +83,79 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     void resizePanelWindow(view === "management" ? MANAGEMENT_HEIGHT : panelWindowHeight(config.visibleItemCount));
   }, [config.visibleItemCount, view]);
 
+  useEffect(() => {
+    const previousDisplayStatuses = previousDisplayStatusRef.current;
+    const nextDisplayStatuses = Object.fromEntries(
+      [...model.visibleRows, ...model.hiddenRows].map((row) => [row.sessionId, row.displayStatus]),
+    );
+    const newlyInspectSessionIds = [...model.visibleRows, ...model.hiddenRows]
+      .filter((row) => previousDisplayStatuses[row.sessionId] === "working" && row.displayStatus === "inspect")
+      .map((row) => row.sessionId);
+
+    previousDisplayStatusRef.current = nextDisplayStatuses;
+
+    if (newlyInspectSessionIds.length === 0) {
+      return;
+    }
+
+    setAttentionCues((current) => {
+      const next = { ...current };
+      newlyInspectSessionIds.forEach((sessionId) => {
+        next[sessionId] = true;
+      });
+      return next;
+    });
+
+    const timers = newlyInspectSessionIds.map((sessionId) =>
+      window.setTimeout(() => {
+        setAttentionCues((current) => {
+          const next = { ...current };
+          delete next[sessionId];
+          return next;
+        });
+      }, 1800),
+    );
+
+    return () => {
+      timers.forEach(window.clearTimeout);
+    };
+  }, [model.visibleRows, model.hiddenRows]);
+
   async function dismissSession(sessionId: string) {
+    const previousRows = rows;
+    setPendingAction(sessionId, "dismiss");
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        row.sessionId === sessionId ? { ...row, dismissed: true, handled: true } : row,
+      ),
+    );
+    setErrorMessage(null);
+
     try {
-      const updatedRows = await dismissSessionCommand(sessionId, rows);
+      const updatedRows = await dismissSessionCommand(sessionId, previousRows);
       setRows(updatedRows);
       setCommandMessage("dismissed");
     } catch (error) {
+      setRows(previousRows);
       setErrorMessage(error instanceof Error ? error.message : "Dismiss command failed.");
+    } finally {
+      clearPendingAction(sessionId);
     }
   }
 
   async function jumpToSession(sessionId: string) {
+    setPendingAction(sessionId, "jump");
+    setCommandMessage("opening session");
+    setErrorMessage(null);
+
     try {
       const result = await jumpToSessionCommand(sessionId);
       setCommandMessage(result.message);
       await refreshPanel();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Jump command failed.");
+    } finally {
+      clearPendingAction(sessionId);
     }
   }
 
@@ -217,7 +277,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
       <header className="panel-header">
         <div className="panel-title">
           <span className="panel-prompt">$</span>
-          <h1>codex attention</h1>
+          <h1>attn</h1>
         </div>
         <div className="panel-counters" aria-label="Session counters">
           <span>{model.interventionCount} {model.copy.alertsLabel}</span>
@@ -234,34 +294,14 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           <p className="empty-panel">no active Codex sessions</p>
         ) : (
           displayedRows.map((row) => (
-            <article
-              className={`status-row status-row--${row.displayStatus} status-row--${row.statusTone}`}
+            <StatusRow
               key={row.sessionId}
-            >
-              <span
-                className="status-code"
-                style={{ "--status-color": row.statusColor } as React.CSSProperties}
-              >
-                <span aria-hidden="true">{row.statusMarker}</span>
-                {" "}
-                {row.statusLabel}
-              </span>
-              <div className="status-content">
-                <h2>{row.label}</h2>
-                <p title={row.interventionReason}>
-                  {rowSubtitle(row)}
-                  <span>{row.confidence}</span>
-                </p>
-              </div>
-              <div className="status-actions">
-                <button type="button" title="Jump back" onClick={() => jumpToSession(row.sessionId)}>
-                  {"->"}
-                </button>
-                <button type="button" title="Dismiss" onClick={() => dismissSession(row.sessionId)}>
-                  x
-                </button>
-              </div>
-            </article>
+              row={row}
+              pendingAction={pendingActions[row.sessionId]}
+              attentionCue={attentionCues[row.sessionId] === true}
+              onJump={jumpToSession}
+              onDismiss={dismissSession}
+            />
           ))
         )}
       </section>
@@ -294,6 +334,18 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
       )}
     </main>
   );
+
+  function setPendingAction(sessionId: string, action: "jump" | "dismiss") {
+    setPendingActions((current) => ({ ...current, [sessionId]: action }));
+  }
+
+  function clearPendingAction(sessionId: string) {
+    setPendingActions((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }
 
   function setStatusColor(state: keyof StatusPanelConfig["statusColors"], value: string) {
     updateDraftConfig((current) => ({
@@ -331,6 +383,95 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }
 }
 
+interface StatusRowProps {
+  row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number];
+  pendingAction?: "jump" | "dismiss";
+  attentionCue?: boolean;
+  onJump: (sessionId: string) => void;
+  onDismiss: (sessionId: string) => void;
+}
+
+function StatusRow({ row, pendingAction, attentionCue = false, onJump, onDismiss }: StatusRowProps) {
+  const jumpTitle = pendingAction === "jump" ? "Opening session" : "Jump back";
+  const dismissTitle = pendingAction === "dismiss" ? "Dismissing session" : "Dismiss";
+  const rowClassName = [
+    "status-row",
+    `status-row--${row.displayStatus}`,
+    `status-row--${row.statusTone}`,
+    attentionCue ? "status-row--attention-cue" : "",
+  ].filter(Boolean).join(" ");
+
+  return (
+    <article
+      className={rowClassName}
+      data-action-pending={pendingAction ?? undefined}
+      data-testid={`status-row-${row.sessionId}`}
+    >
+      <span
+        className="status-code"
+        style={{ "--status-color": row.statusColor } as React.CSSProperties}
+      >
+        <span aria-hidden="true">{row.statusMarker}</span>
+        {" "}
+        {row.statusLabel}
+      </span>
+      <div className="status-content">
+        <h2>{row.label}</h2>
+        <p title={row.interventionReason}>
+          {rowSubtitle(row)}
+          <span>{row.confidence}</span>
+        </p>
+      </div>
+      <div className="status-actions">
+        <button
+          type="button"
+          className="status-action status-action--jump"
+          title={jumpTitle}
+          disabled={pendingAction === "jump"}
+          onClick={() => onJump(row.sessionId)}
+        >
+          {pendingAction === "jump" ? <PendingIcon /> : <JumpIcon />}
+        </button>
+        <button
+          type="button"
+          className="status-action status-action--dismiss"
+          title={dismissTitle}
+          disabled={pendingAction === "dismiss"}
+          onClick={() => onDismiss(row.sessionId)}
+        >
+          {pendingAction === "dismiss" ? <PendingIcon /> : <DismissIcon />}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function JumpIcon() {
+  return (
+    <svg aria-hidden="true" className="status-action-icon" viewBox="0 0 16 16">
+      <path d="M3 8h8" />
+      <path d="M8 5l3 3-3 3" />
+    </svg>
+  );
+}
+
+function DismissIcon() {
+  return (
+    <svg aria-hidden="true" className="status-action-icon" viewBox="0 0 16 16">
+      <path d="M5 5l6 6" />
+      <path d="M11 5l-6 6" />
+    </svg>
+  );
+}
+
+function PendingIcon() {
+  return (
+    <svg aria-hidden="true" className="status-action-icon status-action-icon--pending" viewBox="0 0 16 16">
+      <path d="M8 3a5 5 0 1 1-3.5 8.6" />
+    </svg>
+  );
+}
+
 function panelWindowHeight(visibleItemCount: number) {
   const normalizedCount = Math.min(8, Math.max(1, visibleItemCount));
   return Math.min(420, PANEL_BASE_HEIGHT + Math.max(0, normalizedCount - PANEL_BASE_VISIBLE_ITEMS) * PANEL_EXTRA_ROW_HEIGHT);
@@ -348,7 +489,8 @@ function loadInitialConfig(): StatusPanelConfig {
   if (typeof window === "undefined") return defaultStatusPanelConfig;
 
   try {
-    const storedConfig = window.localStorage.getItem(STATUS_PANEL_CONFIG_STORAGE_KEY);
+    const storedConfig = window.localStorage.getItem(STATUS_PANEL_CONFIG_STORAGE_KEY)
+      ?? window.localStorage.getItem(LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY);
     if (!storedConfig) return defaultStatusPanelConfig;
 
     return normalizeConfig(JSON.parse(storedConfig));
@@ -360,6 +502,7 @@ function loadInitialConfig(): StatusPanelConfig {
 function persistConfig(config: StatusPanelConfig) {
   try {
     window.localStorage.setItem(STATUS_PANEL_CONFIG_STORAGE_KEY, JSON.stringify(config));
+    window.localStorage.removeItem(LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY);
   } catch {
     // The panel should stay usable even when storage is unavailable.
   }

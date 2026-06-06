@@ -1,6 +1,6 @@
-# Agent Session Inbox
+# Attn
 
-Mac local MVP for keeping active Codex desktop work visible until it is handled.
+Mac local attention panel for agent sessions that need intervention.
 
 ## Current MVP
 
@@ -59,7 +59,7 @@ npm run test:rust
 `npm run tauri build -- --debug` builds the debug binary and `.app`. On this machine the `.app` is produced at:
 
 ```text
-src-tauri/target/debug/bundle/macos/agent-session-inbox.app
+src-tauri/target/debug/bundle/macos/Attn.app
 ```
 
 The final `.dmg` packaging step may wait on macOS AppleScript window decoration; the `.app` build is sufficient for MVP validation.

@@ -96,7 +96,10 @@ p {
   background: #21252b;
   border: 1px solid #3b4048;
   border-radius: 6px;
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.36);
+  box-shadow:
+    0 0 0 1px rgba(24, 26, 31, 0.72),
+    0 8px 18px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(171, 178, 191, 0.08);
   display: grid;
   gap: 6px;
   grid-template-rows: 30px minmax(0, auto) 24px;
@@ -211,6 +214,63 @@ p {
   background: #202832;
 }
 
+.status-row--attention-cue {
+  animation: inspect-attention-cue 1800ms ease-out both;
+  position: relative;
+}
+
+.status-row--attention-cue::after {
+  animation: inspect-attention-sweep 1800ms ease-out both;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--status-color) 20%, transparent),
+    transparent
+  );
+  border-radius: inherit;
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+}
+
+@keyframes inspect-attention-cue {
+  0% {
+    border-color: color-mix(in srgb, var(--status-color) 70%, #d7dae0);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--status-color) 38%, transparent),
+      0 0 18px color-mix(in srgb, var(--status-color) 22%, transparent);
+  }
+
+  45% {
+    border-color: color-mix(in srgb, var(--status-color) 50%, #3b4048);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--status-color) 24%, transparent),
+      0 0 10px color-mix(in srgb, var(--status-color) 14%, transparent);
+  }
+
+  100% {
+    border-color: var(--row-border-color);
+    box-shadow: none;
+  }
+}
+
+@keyframes inspect-attention-sweep {
+  0% {
+    opacity: 0;
+    transform: translateX(-38%);
+  }
+
+  18% {
+    opacity: 0.5;
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateX(38%);
+  }
+}
+
 .status-row--working {
   --status-color: #98c379;
   --row-border-color: #334334;
@@ -285,18 +345,54 @@ p {
   min-width: 56px;
 }
 
-.status-actions button {
-  background: transparent;
+.status-action {
+  background:
+    linear-gradient(180deg, rgba(171, 178, 191, 0.08), rgba(171, 178, 191, 0.02)),
+    #252931;
   border-color: #3b4048;
   color: #7f848e;
   height: 24px;
   min-width: 24px;
-  padding: 0 6px;
+  padding: 0;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease,
+    transform 80ms ease;
 }
 
-.status-actions button:hover {
+.status-action:hover {
   background: #2c313a;
   color: #d7dae0;
+}
+
+.status-action:active {
+  transform: translateY(1px);
+}
+
+.status-action:disabled {
+  opacity: 0.78;
+}
+
+.status-action-icon {
+  display: block;
+  height: 15px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+  width: 15px;
+}
+
+.status-action-icon--pending {
+  animation: action-spin 900ms linear infinite;
+}
+
+@keyframes action-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .panel-footer {

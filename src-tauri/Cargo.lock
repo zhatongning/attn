@@ -9,32 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agent-session-inbox"
-version = "0.1.0"
-dependencies = [
- "idna",
- "indexmap 2.7.1",
- "security-framework",
- "security-framework-sys",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-codegen",
- "tauri-macros",
- "tauri-plugin",
- "tauri-plugin-opener",
- "tauri-runtime",
- "tauri-runtime-wry",
- "tauri-utils",
- "tempfile",
- "time",
- "unicode-segmentation",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -243,6 +217,32 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "attn"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "indexmap 2.7.1",
+ "security-framework",
+ "security-framework-sys",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-codegen",
+ "tauri-macros",
+ "tauri-plugin",
+ "tauri-plugin-opener",
+ "tauri-runtime",
+ "tauri-runtime-wry",
+ "tauri-utils",
+ "tempfile",
+ "time",
+ "unicode-segmentation",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "autocfg"

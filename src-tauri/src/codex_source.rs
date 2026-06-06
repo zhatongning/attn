@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -8,11 +9,18 @@ use serde_json::Value;
 use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 
 const UNREAD_COMPLETION_TRACKING_START: &str = "2026-06-05T08:00:00.000Z";
+const SESSION_TAIL_READ_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug, Clone)]
 struct SessionFileSummary {
     path: PathBuf,
     modified_at: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSessionObservation {
+    observation: SourceObservation,
+    task_completed_at: Option<SystemTime>,
 }
 
 pub fn discover_codex_observations(sessions_root: &Path, limit: usize) -> Vec<SourceObservation> {
@@ -95,17 +103,62 @@ fn parse_session_file(
     path: &Path,
     now: SystemTime,
 ) -> Result<Option<SourceObservation>, std::io::Error> {
+    parse_session_file_detailed(path, now).map(|parsed| parsed.map(|parsed| parsed.observation))
+}
+
+fn parse_session_file_detailed(
+    path: &Path,
+    now: SystemTime,
+) -> Result<Option<ParsedSessionObservation>, std::io::Error> {
     let content = fs::read_to_string(path)?;
+    parse_session_content(path, &content, now)
+}
+
+fn parse_session_file_tail_detailed(
+    path: &Path,
+    now: SystemTime,
+) -> Result<Option<ParsedSessionObservation>, std::io::Error> {
+    let content = read_file_tail(path, SESSION_TAIL_READ_BYTES)?;
+    parse_session_content(path, &content, now)
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let start = file_len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+
+    if start > 0 {
+        if let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=first_line_end);
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn parse_session_content(
+    path: &Path,
+    content: &str,
+    now: SystemTime,
+) -> Result<Option<ParsedSessionObservation>, std::io::Error> {
     let mut session_id = None;
     let mut cwd = None;
     let mut agent_name = None;
     let mut session_name = None;
     let mut jump_target = JumpTarget::Unknown;
     let mut latest_timestamp = None;
+    let mut task_completed_at = None;
     let mut last_activity_kind = ObservationKind::InsufficientEvidence;
     let mut last_agent_message = None;
 
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+    for line in content
+        .lines()
+        .filter(|line| should_parse_session_status_line(line))
+    {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -144,6 +197,11 @@ fn parse_session_file(
 
                 if event_type == Some("task_complete") {
                     last_activity_kind = ObservationKind::Completed;
+                    task_completed_at = value
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(parse_utc_timestamp)
+                        .or(task_completed_at);
                 } else if matches!(event_type, Some("user_message" | "agent_message")) {
                     last_activity_kind = ObservationKind::Running;
                 }
@@ -234,7 +292,19 @@ fn parse_session_file(
 
     observation.evidence_summary = evidence_summary;
 
-    Ok(Some(observation))
+    Ok(Some(ParsedSessionObservation {
+        observation,
+        task_completed_at,
+    }))
+}
+
+fn should_parse_session_status_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty()
+        && (line.contains("\"type\":\"session_meta\"")
+            || line.contains("\"type\": \"session_meta\"")
+            || line.contains("\"type\":\"event_msg\"")
+            || line.contains("\"type\": \"event_msg\""))
 }
 
 #[derive(Debug, Clone)]
@@ -359,14 +429,32 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
 }
 
 fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<SourceObservation> {
-    let jsonl_observation = parse_session_file(&thread.rollout_path, now).ok().flatten();
+    let parsed_jsonl = parse_session_file_tail_detailed(&thread.rollout_path, now).ok().flatten();
+    let jsonl_observation = parsed_jsonl.as_ref().map(|parsed| &parsed.observation);
     let jump_target = jsonl_observation
         .as_ref()
         .map(|observation| observation.jump_target)
         .unwrap_or_else(|| jump_target_from_thread_source(&thread));
+    let thread_updated_at = thread
+        .updated_at_ms
+        .and_then(|updated_at_ms| u64::try_from(updated_at_ms).ok())
+        .map(|updated_at_ms| SystemTime::UNIX_EPOCH + Duration::from_millis(updated_at_ms));
+    let thread_updated_after_task_complete = thread_updated_at
+        .zip(parsed_jsonl.as_ref().and_then(|parsed| parsed.task_completed_at))
+        .is_some_and(|(thread_updated_at, task_completed_at)| {
+            thread_updated_at
+                .duration_since(task_completed_at)
+                .is_ok_and(|age| age > Duration::ZERO)
+        });
     let last_activity_at = jsonl_observation
         .as_ref()
-        .and_then(|observation| observation.last_activity_at.clone())
+        .and_then(|observation| {
+            if thread_updated_after_task_complete {
+                None
+            } else {
+                observation.last_activity_at.clone()
+            }
+        })
         .or_else(|| thread.updated_at_ms.and_then(timestamp_ms_to_iso_utc));
     let has_recent_activity = last_activity_at
         .as_deref()
@@ -375,7 +463,9 @@ fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<Sou
         .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
     let jsonl_kind = jsonl_observation.as_ref().map(|observation| observation.kind);
     let thread_completion_kind = completion_kind_from_last_activity_at(last_activity_at.as_deref(), now);
-    let kind = if matches!(
+    let kind = if thread_updated_after_task_complete && matches!(jsonl_kind, Some(ObservationKind::CompletedImmediate)) {
+        thread_completion_kind
+    } else if matches!(
         jsonl_kind,
         Some(
             ObservationKind::Completed
@@ -871,6 +961,47 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_thread_update_after_task_complete_marks_completion_as_read() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T16-00-00-019read.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019read","cwd":"/Users/edy/agent-session-inbox","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019read",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/agent-session-inbox",
+            "按照迁移过来的文档继续吧",
+            1_780_648_200_000,
+        );
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Completed);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:30:00.000Z")
+        );
+    }
+
+    #[test]
     fn stale_unarchived_desktop_threads_are_idle_not_running() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
@@ -946,6 +1077,58 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, ObservationKind::CompletedStale);
+    }
+
+    #[test]
+    fn tail_parser_reads_recent_completion_without_full_rollout_metadata() {
+        let temp = tempdir().expect("temp dir");
+        let rollout_path = temp.path().join("rollout-2026-06-05T16-00-00-019tail.jsonl");
+        let mut content = String::from(
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019tail","cwd":"/Users/edy/large","originator":"Codex Desktop"}}"#,
+        );
+        content.push('\n');
+        for index in 0..10_000 {
+            content.push_str(&format!(
+                r#"{{"timestamp":"2026-06-05T08:10:00.000Z","type":"response_item","payload":{{"index":{index},"message":"large historical payload with event_msg-like user text"}}}}"#
+            ));
+            content.push('\n');
+        }
+        content.push_str(
+            r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        );
+        content.push('\n');
+        fs::write(&rollout_path, content).expect("session file");
+
+        let parsed = super::parse_session_file_tail_detailed(
+            &rollout_path,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        )
+        .expect("tail parse")
+        .expect("tail observation");
+
+        assert_eq!(parsed.observation.session_id, "019tail");
+        assert_eq!(parsed.observation.kind, ObservationKind::CompletedImmediate);
+        assert_eq!(
+            parsed.observation.last_activity_at.as_deref(),
+            Some("2026-06-05T08:20:00.000Z")
+        );
+        assert!(parsed.task_completed_at.is_some());
+    }
+
+    #[test]
+    fn status_line_filter_skips_large_response_items() {
+        assert!(super::should_parse_session_status_line(
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{}}"#
+        ));
+        assert!(super::should_parse_session_status_line(
+            r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+        ));
+        assert!(!super::should_parse_session_status_line(
+            r#"{"timestamp":"2026-06-05T08:10:00.000Z","type":"response_item","payload":{"message":"large historical payload with event_msg-like user text"}}"#
+        ));
+        assert!(!super::should_parse_session_status_line(
+            r#"{"timestamp":"2026-06-05T08:10:00.000Z","type":"response_item","payload":{"message":"literal \"type\":\"event_msg\" text"}}"#
+        ));
     }
 
     #[test]

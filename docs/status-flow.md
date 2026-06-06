@@ -100,6 +100,7 @@ Generic non-terminal activity is still considered recent for 2 hours.
 | --- | --- |
 | JSONL says `CompletedImmediate`, `Completed`, `Failed`, or `WaitingForInput` | Use JSONL terminal/input state. |
 | JSONL says unread `task_complete` | Keep as `CompletedImmediate` until read. |
+| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat the completed result as read/opened and apply the 30-minute `follow-up` window from `updated_at_ms`. |
 | Thread is archived without explicit unread completion evidence | Apply completion-age fallback, usually `CompletedStale` for old archived threads. |
 | Desktop thread has recent activity | `Running` |
 | Desktop thread is old and unarchived | `Idle` |
@@ -188,6 +189,7 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 | User action | Current transition |
 | --- | --- |
 | Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `follow-up` for 30 minutes. |
+| Open the same Codex Desktop thread outside this app | If Codex advances SQLite `updated_at_ms` after `task_complete`, infer it was read and show `follow-up` for 30 minutes. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `working` or `idle` | No state transition. |
 | Dismiss an `inspect` or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
@@ -256,14 +258,13 @@ This is not final. It is a candidate rule set for the next implementation pass.
 stateDiagram-v2
     [*] --> Working: recent live activity
     [*] --> Working: hook UserPromptSubmit/PreToolUse
-    Working --> Inspect: task_complete within 5 minutes
-    Inspect --> Needed: unconfirmed after 5 minutes
-    Needed --> Idle: unconfirmed after 30 minutes
-    Working --> Idle: old task_complete
+    Working --> Inspect: unread task_complete
+    Inspect --> Needed: user opens/reads result
+    Inspect --> Needed: SQLite updated_at_ms advances after task_complete
+    Needed --> Idle: read window exceeds 30 minutes
+    Working --> Idle: migrated old task_complete
     Working --> Idle: old activity without intervention signal
-    Inspect --> Idle: user confirms via Jump back
     Working --> Needed: waiting for user input
-    Needed --> Idle: user confirms via Jump back
     Working --> Blocked: actionable failure/source issue
     Blocked --> Idle: user confirms or issue clears
     Idle --> Working: new user_message or agent_message

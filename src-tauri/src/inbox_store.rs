@@ -15,6 +15,8 @@ use crate::codex_source::{discover_codex_observation_by_id, discover_codex_obser
 use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
 use crate::domain::source_health::{SourceCapability, SourceHealth, SourceStatus};
 
+const SESSION_ROWS_CACHE_TTL: Duration = Duration::from_millis(5500);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JumpResult {
@@ -39,6 +41,7 @@ enum JumpCommandPlan {
 pub struct InboxStore {
     dismissed_session_ids: Mutex<HashSet<String>>,
     acknowledged_signals: Mutex<HashSet<AcknowledgedSignal>>,
+    session_rows_cache: Mutex<Option<CachedSessionRows>>,
 }
 
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
@@ -80,8 +83,34 @@ impl AcknowledgedSignal {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedSessionRows {
+    rows: Vec<SessionRow>,
+    loaded_at: Instant,
+}
+
 impl InboxStore {
     pub fn list_sessions(&self) -> Vec<SessionRow> {
+        let mut cache = self
+            .session_rows_cache
+            .lock()
+            .expect("session row cache lock poisoned");
+        if let Some(cached) = cache.as_ref() {
+            if cached.loaded_at.elapsed() <= SESSION_ROWS_CACHE_TTL {
+                return cached.rows.clone();
+            }
+        }
+
+        let rows = self.compute_session_rows();
+        *cache = Some(CachedSessionRows {
+            rows: rows.clone(),
+            loaded_at: Instant::now(),
+        });
+
+        rows
+    }
+
+    fn compute_session_rows(&self) -> Vec<SessionRow> {
         self.refresh_persisted_acknowledged_signals();
         let dismissed_session_ids = self
             .dismissed_session_ids
@@ -122,6 +151,7 @@ impl InboxStore {
             .lock()
             .expect("dismissed session store lock poisoned")
             .insert(session_id.to_string());
+        self.invalidate_session_rows_cache();
 
         self.list_sessions()
     }
@@ -131,6 +161,7 @@ impl InboxStore {
             .lock()
             .expect("dismissed session store lock poisoned")
             .remove(session_id);
+        self.invalidate_session_rows_cache();
 
         self.list_sessions()
     }
@@ -195,6 +226,7 @@ impl InboxStore {
         if matches!(execution, Some(Ok(()))) {
             if let Some(row) = row.as_ref() {
                 self.acknowledge_session_signal(row);
+                self.invalidate_session_rows_cache();
             }
         }
         let message = match availability {
@@ -251,6 +283,13 @@ impl InboxStore {
             .expect("acknowledged signal store lock poisoned");
         acknowledged_signals.replace(AcknowledgedSignal::from_row_at(row, current_time_millis()));
         let _ = save_acknowledged_signals(&acknowledged_signals_path(), &acknowledged_signals);
+    }
+
+    fn invalidate_session_rows_cache(&self) {
+        *self
+            .session_rows_cache
+            .lock()
+            .expect("session row cache lock poisoned") = None;
     }
 
     fn fast_session_row_for_jump(&self, session_id: &str) -> Option<SessionRow> {
@@ -1070,6 +1109,30 @@ mod tests {
             }
             _ => panic!("current project row should be active or idle"),
         }
+    }
+
+    #[test]
+    fn fresh_session_rows_cache_short_circuits_local_discovery() {
+        let cached_row = SessionRow::new(
+            "cached-session",
+            "Cached session",
+            SessionState::Idle,
+            Confidence::Exact,
+        );
+        let store = InboxStore {
+            dismissed_session_ids: std::sync::Mutex::new(HashSet::new()),
+            acknowledged_signals: std::sync::Mutex::new(HashSet::new()),
+            session_rows_cache: std::sync::Mutex::new(Some(super::CachedSessionRows {
+                rows: vec![cached_row.clone()],
+                loaded_at: std::time::Instant::now(),
+            })),
+        };
+
+        let rows = store.list_sessions();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, cached_row.session_id);
+        assert_eq!(rows[0].label, cached_row.label);
     }
 
     #[test]
