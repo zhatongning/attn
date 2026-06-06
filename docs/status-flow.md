@@ -113,7 +113,7 @@ If a CLI row is `unknown` and a live Codex process is found for the same workspa
 ## Codex Hook Rules
 
 Codex supports lifecycle hooks such as `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
-These hooks should become the preferred source for live status transitions once this app owns a small hook writer.
+These hooks are the preferred source for live status transitions when the app-owned hook writer is installed.
 
 ### Hook Event Semantics
 
@@ -130,13 +130,12 @@ After `Stop`, the app should consult JSONL and any hook payload to decide whethe
 
 ### Hook Storage
 
-The hook writer should append compact events to an app-owned local store.
-It should not require the UI process to be running.
+The hook writer appends compact events to an app-owned local store.
+It does not require the UI process to be running.
 
-Candidate storage:
+Current storage:
 
-- SQLite table in the app data directory.
-- JSONL file in the app data directory.
+- JSONL file at `~/.codex/agent-session-inbox/hook-events.jsonl`.
 
 Minimum event fields:
 
@@ -147,7 +146,7 @@ Minimum event fields:
 | `eventType` | Hook event such as `UserPromptSubmit` or `Stop`. |
 | `timestamp` | Ordering and freshness. |
 | `source` | `codex-hook`. |
-| `payloadVersion` | Future migration safety. |
+| `schemaVersion` | Future migration safety. |
 
 ### Hook Trust and Scope
 
@@ -217,8 +216,8 @@ These are the areas that currently feel wrong or need product decisions.
 5. The panel still behaves partly like a list of sessions.
    The product goal is an intervention watchlist. Old quiet rows should probably be hidden or collapsed more aggressively.
 
-6. Hooks are not integrated yet.
-   Without hooks, "working" is inferred from SQLite/JSONL recency instead of a real lifecycle signal.
+6. Hook reading is integrated, but hook installation is still manual.
+   Without installed hooks, `working` still falls back to SQLite/JSONL/process inference.
 
 ## Open Product Decisions
 
@@ -244,11 +243,9 @@ We should decide these before more code changes.
 5. What is the retention rule for completed sessions?
    Current decision: completions older than 30 minutes become `idle`.
 
-6. Where should the hook writer live?
-   Options:
-   - User-level `~/.codex/hooks.json`, covering all local Codex sessions.
-   - Project-level `.codex/hooks.json`, covering only this repo.
-   - Plugin-bundled hook, installed/enabled with the app.
+6. How should the hook writer be installed?
+   Current implementation provides `scripts/attn-codex-hook.cjs` and reads its output.
+   Open decision: whether the management page should install/verify user-level `~/.codex/hooks.json`, project-level `.codex/hooks.json`, or a plugin-bundled hook.
 
 ## Proposed Direction
 

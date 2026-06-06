@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 
 const UNREAD_COMPLETION_TRACKING_START: &str = "2026-06-05T08:00:00.000Z";
 const SESSION_TAIL_READ_BYTES: u64 = 128 * 1024;
+const HOOK_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
 struct SessionFileSummary {
@@ -21,6 +23,15 @@ struct SessionFileSummary {
 struct ParsedSessionObservation {
     observation: SourceObservation,
     task_completed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexHookSignal {
+    event_name: String,
+    timestamp: String,
+    timestamp_time: SystemTime,
+    session_id: Option<String>,
+    workspace_path: Option<String>,
 }
 
 pub fn discover_codex_observations(sessions_root: &Path, limit: usize) -> Vec<SourceObservation> {
@@ -38,14 +49,35 @@ pub fn discover_codex_observations_with_state_db(
     limit: usize,
     now: SystemTime,
 ) -> Vec<SourceObservation> {
+    discover_codex_observations_with_state_db_and_hooks(
+        state_db,
+        sessions_root,
+        &codex_hook_events_path(),
+        limit,
+        now,
+    )
+}
+
+pub fn discover_codex_observations_with_state_db_and_hooks(
+    state_db: &Path,
+    sessions_root: &Path,
+    hook_events_path: &Path,
+    limit: usize,
+    now: SystemTime,
+) -> Vec<SourceObservation> {
     let threads = discover_threads_from_state_db(state_db, limit);
     if threads.is_empty() {
         return discover_codex_observations_with_now(sessions_root, limit, now);
     }
 
+    let hook_signals = load_latest_hook_signals(hook_events_path);
+
     threads
         .into_iter()
-        .filter_map(|thread| observation_from_thread(thread, now))
+        .filter_map(|thread| {
+            let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
+            observation_from_thread(thread, hook_signal, now)
+        })
         .collect()
 }
 
@@ -55,7 +87,9 @@ pub fn discover_codex_observation_by_id(
     now: SystemTime,
 ) -> Option<SourceObservation> {
     let thread = discover_thread_from_state_db_by_id(state_db, session_id)?;
-    observation_from_thread(thread, now)
+    let hook_signals = load_latest_hook_signals(&codex_hook_events_path());
+    let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
+    observation_from_thread(thread, hook_signal, now)
 }
 
 pub fn discover_codex_observations_with_now(
@@ -428,7 +462,11 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
     })
 }
 
-fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<SourceObservation> {
+fn observation_from_thread(
+    thread: ThreadSummary,
+    hook_signal: Option<&CodexHookSignal>,
+    now: SystemTime,
+) -> Option<SourceObservation> {
     let parsed_jsonl = parse_session_file_tail_detailed(&thread.rollout_path, now).ok().flatten();
     let jsonl_observation = parsed_jsonl.as_ref().map(|parsed| &parsed.observation);
     let jump_target = jsonl_observation
@@ -463,7 +501,31 @@ fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<Sou
         .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
     let jsonl_kind = jsonl_observation.as_ref().map(|observation| observation.kind);
     let thread_completion_kind = completion_kind_from_last_activity_at(last_activity_at.as_deref(), now);
-    let kind = if thread_updated_after_task_complete && matches!(jsonl_kind, Some(ObservationKind::CompletedImmediate)) {
+    let has_recent_hook_activity = hook_signal
+        .filter(|signal| is_hook_activity_event(&signal.event_name))
+        .and_then(|signal| now.duration_since(signal.timestamp_time).ok())
+        .is_some_and(|age| age <= HOOK_ACTIVITY_FRESHNESS);
+    let hook_activity_is_newer_than_jsonl = hook_signal
+        .zip(last_activity_at.as_deref().and_then(parse_utc_timestamp))
+        .is_some_and(|(signal, last_activity)| {
+            signal
+                .timestamp_time
+                .duration_since(last_activity)
+                .is_ok_and(|age| age > Duration::ZERO)
+        });
+    let hook_activity_can_override_terminal = !matches!(
+        jsonl_kind,
+        Some(
+            ObservationKind::Completed
+                | ObservationKind::CompletedImmediate
+                | ObservationKind::CompletedStale
+                | ObservationKind::Failed
+                | ObservationKind::WaitingForInput
+        )
+    ) || hook_activity_is_newer_than_jsonl;
+    let kind = if has_recent_hook_activity && hook_activity_can_override_terminal {
+        ObservationKind::Running
+    } else if thread_updated_after_task_complete && matches!(jsonl_kind, Some(ObservationKind::CompletedImmediate)) {
         thread_completion_kind
     } else if matches!(
         jsonl_kind,
@@ -498,10 +560,24 @@ fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<Sou
     } else {
         format!("Codex session {}", thread.id)
     };
-    let evidence_summary = jsonl_observation
-        .as_ref()
-        .and_then(|observation| observation.evidence_summary.clone())
-        .or_else(|| thread.preview.clone());
+    let evidence_summary = if has_recent_hook_activity {
+        hook_signal.map(|signal| format!("Codex hook {} observed.", signal.event_name))
+    } else {
+        None
+    }
+    .or_else(|| {
+        jsonl_observation
+            .as_ref()
+            .and_then(|observation| observation.evidence_summary.clone())
+    })
+    .or_else(|| thread.preview.clone());
+
+    let effective_last_activity_at = if has_recent_hook_activity {
+        hook_signal.map(|signal| signal.timestamp.clone())
+    } else {
+        None
+    }
+    .or(last_activity_at);
 
     let mut observation = SourceObservation::new(thread.id, kind)
         .with_label(label)
@@ -516,7 +592,7 @@ fn observation_from_thread(thread: ThreadSummary, now: SystemTime) -> Option<Sou
         observation = observation.with_project_name(project_name);
     }
 
-    if let Some(last_activity_at) = last_activity_at {
+    if let Some(last_activity_at) = effective_last_activity_at {
         observation = observation.with_last_activity(last_activity_at);
     }
 
@@ -548,6 +624,108 @@ fn jump_target_from_thread_source(thread: &ThreadSummary) -> JumpTarget {
     }
 }
 
+fn hook_signal_for_thread<'a>(
+    hook_signals: &'a HashMap<String, CodexHookSignal>,
+    thread: &ThreadSummary,
+) -> Option<&'a CodexHookSignal> {
+    hook_signals
+        .get(&hook_session_key(&thread.id))
+        .or_else(|| hook_signals.get(&hook_workspace_key(&thread.cwd)))
+}
+
+fn load_latest_hook_signals(path: &Path) -> HashMap<String, CodexHookSignal> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    let mut signals = HashMap::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Some(signal) = parse_hook_signal_line(line) else {
+            continue;
+        };
+
+        if let Some(session_id) = signal.session_id.as_deref().filter(|value| !value.is_empty()) {
+            upsert_latest_hook_signal(&mut signals, hook_session_key(session_id), signal.clone());
+        }
+
+        if let Some(workspace_path) = signal
+            .workspace_path
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            upsert_latest_hook_signal(&mut signals, hook_workspace_key(workspace_path), signal);
+        }
+    }
+
+    signals
+}
+
+fn parse_hook_signal_line(line: &str) -> Option<CodexHookSignal> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let event_name = value
+        .get("eventType")
+        .or_else(|| value.get("hookEventName"))
+        .or_else(|| value.get("hook_event_name"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)?;
+    let timestamp_time = parse_utc_timestamp(&timestamp)?;
+    let session_id = value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("threadId"))
+        .or_else(|| value.get("thread_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let workspace_path = value
+        .get("workspacePath")
+        .or_else(|| value.get("workspace_path"))
+        .or_else(|| value.get("cwd"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    Some(CodexHookSignal {
+        event_name,
+        timestamp,
+        timestamp_time,
+        session_id,
+        workspace_path,
+    })
+}
+
+fn upsert_latest_hook_signal(
+    signals: &mut HashMap<String, CodexHookSignal>,
+    key: String,
+    signal: CodexHookSignal,
+) {
+    let should_replace = signals
+        .get(&key)
+        .map(|existing| signal.timestamp_time.duration_since(existing.timestamp_time).is_ok())
+        .unwrap_or(true);
+
+    if should_replace {
+        signals.insert(key, signal);
+    }
+}
+
+fn hook_session_key(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
+fn hook_workspace_key(workspace_path: &str) -> String {
+    format!("workspace:{workspace_path}")
+}
+
+fn is_hook_activity_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
+    )
+}
+
 fn timestamp_ms_to_iso_utc(value: i64) -> Option<String> {
     let seconds = value.div_euclid(1000);
     let millis = value.rem_euclid(1000);
@@ -572,6 +750,15 @@ fn codex_state_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codex")
         .join("state_5.sqlite")
+}
+
+fn codex_hook_events_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+        .join("agent-session-inbox")
+        .join("hook-events.jsonl")
 }
 
 fn jump_target_from_session_meta(payload: &Value) -> Option<JumpTarget> {
@@ -666,6 +853,7 @@ mod tests {
     use crate::codex_source::{
         discover_codex_observation_by_id, discover_codex_observations_with_now,
         discover_codex_observations_with_state_db,
+        discover_codex_observations_with_state_db_and_hooks,
     };
     use crate::domain::session::{JumpTarget, ObservationKind};
 
@@ -1036,6 +1224,185 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, ObservationKind::Idle);
+    }
+
+    #[test]
+    fn recent_active_hook_event_promotes_stale_thread_to_running() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/03");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-03T02-00-00-019hook-running.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019hook-running","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}"#,
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019hook-running",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Hook running thread",
+            1_780_452_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019hook-running","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:29:30.000Z")
+        );
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("Codex hook PreToolUse observed.")
+        );
+    }
+
+    #[test]
+    fn latest_stop_hook_does_not_promote_thread_to_running() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/03");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-03T02-00-00-019hook-stop.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019hook-stop","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}"#,
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019hook-stop",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Hook stopped thread",
+            1_780_452_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:28:30.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019hook-stop","workspacePath":"/Users/edy/hook-project"}
+{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"Stop","sessionId":"019hook-stop","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Idle);
+    }
+
+    #[test]
+    fn newer_hook_activity_reopens_completed_thread_as_running() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T08-00-00-019hook-newer.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019hook-newer","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019hook-newer",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Hook newer thread",
+            1_780_648_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"UserPromptSubmit","sessionId":"019hook-newer","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:29:30.000Z")
+        );
+    }
+
+    #[test]
+    fn older_hook_activity_does_not_hide_unread_completion() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T08-00-00-019hook-older.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019hook-older","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019hook-older",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Hook older thread",
+            1_780_646_400_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:19:30.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019hook-older","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:20:00.000Z")
+        );
     }
 
     #[test]
