@@ -216,7 +216,7 @@ These are the areas that currently feel wrong or need product decisions.
 5. The panel still behaves partly like a list of sessions.
    The product goal is an intervention watchlist. Old quiet rows should probably be hidden or collapsed more aggressively.
 
-6. Hook reading is integrated, but hook installation is still manual.
+6. Hook reading is integrated, and hook installation is explicit from the management page.
    Without installed hooks, `working` still falls back to SQLite/JSONL/process inference.
 
 ## Open Product Decisions
@@ -244,8 +244,8 @@ We should decide these before more code changes.
    Current decision: completions older than 30 minutes become `idle`.
 
 6. How should the hook writer be installed?
-   Current implementation provides `scripts/attn-codex-hook.cjs` and reads its output.
-   Open decision: whether the management page should install/verify user-level `~/.codex/hooks.json`, project-level `.codex/hooks.json`, or a plugin-bundled hook.
+   Current implementation provides `scripts/attn-codex-hook.cjs`, reads its output, and can merge user-level `~/.codex/hooks.json` after the user confirms from the management page.
+   Open decision: whether a future plugin-bundled hook should replace the user-level install path.
 
 ## Proposed Direction
 

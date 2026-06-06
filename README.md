@@ -53,7 +53,10 @@ Hook activity is used as strong live evidence for `working`:
 
 `Stop` is recorded but does not by itself mean the session completed. After `Stop`, Attn falls back to JSONL and SQLite evidence to decide whether the row should become `inspect`, `follow-up`, `blocked`, or `idle`.
 
-The app does not edit `~/.codex/hooks.json` automatically yet. To enable this globally, merge calls to this script into your existing user-level Codex hooks, passing the hook name as the first argument, for example:
+The app does not edit `~/.codex/hooks.json` automatically at startup. Open the management page from the macOS app menu and choose `Install Codex hooks` to merge Attn hook commands into the existing user-level Codex hooks.
+Existing hooks are preserved and Attn commands are de-duplicated.
+
+The installed command shape is:
 
 ```bash
 node /Users/edy/sofdev/agent-session-inbox/scripts/attn-codex-hook.cjs PreToolUse

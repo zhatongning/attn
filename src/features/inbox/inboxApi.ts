@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { JumpAvailability, JumpTarget, SessionRow, SourceHealth } from "../../shared/types/session";
+import type {
+  CodexHookIntegrationStatus,
+  JumpAvailability,
+  JumpTarget,
+  SessionRow,
+  SourceHealth,
+} from "../../shared/types/session";
 import { fakeSourceHealth, initialSessions } from "./fakeSessions";
 
 interface JumpResult {
@@ -31,6 +37,34 @@ export async function loadSourceHealth(): Promise<SourceHealth> {
   return invoke<SourceHealth>("source_health").catch(() =>
     fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth),
   );
+}
+
+export async function loadCodexHookIntegrationStatus(): Promise<CodexHookIntegrationStatus> {
+  const fallback: CodexHookIntegrationStatus = {
+    installed: false,
+    hooksPath: "~/.codex/hooks.json",
+    eventStorePath: "~/.codex/agent-session-inbox/hook-events.jsonl",
+    detail: "Codex hook status is only available in the desktop app.",
+  };
+
+  if (!hasTauriRuntime()) {
+    return fallback;
+  }
+
+  return invoke<CodexHookIntegrationStatus>("codex_hook_integration_status").catch(() => fallback);
+}
+
+export async function installCodexHooks(): Promise<CodexHookIntegrationStatus> {
+  if (!hasTauriRuntime()) {
+    return {
+      installed: false,
+      hooksPath: "~/.codex/hooks.json",
+      eventStorePath: "~/.codex/agent-session-inbox/hook-events.jsonl",
+      detail: "Codex hooks can be installed from the desktop app.",
+    };
+  }
+
+  return invoke<CodexHookIntegrationStatus>("install_codex_hooks");
 }
 
 export async function dismissSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {

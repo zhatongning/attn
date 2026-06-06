@@ -29,3 +29,10 @@ export interface SourceHealth {
     detail: string;
   }>;
 }
+
+export interface CodexHookIntegrationStatus {
+  installed: boolean;
+  hooksPath: string;
+  eventStorePath: string;
+  detail: string;
+}

@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { SessionRow, SourceHealth } from "../../shared/types/session";
+import type { CodexHookIntegrationStatus, SessionRow, SourceHealth } from "../../shared/types/session";
 import {
   dismissSession as dismissSessionCommand,
+  installCodexHooks,
   jumpToSession as jumpToSessionCommand,
+  loadCodexHookIntegrationStatus,
   loadSessions,
   loadSourceHealth,
 } from "../inbox/inboxApi";
@@ -35,6 +37,8 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [expanded, setExpanded] = useState(false);
   const [commandMessage, setCommandMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
+  const [hookInstallPending, setHookInstallPending] = useState(false);
   const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss">>({});
   const [attentionCues, setAttentionCues] = useState<Record<string, boolean>>({});
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
@@ -52,6 +56,19 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }
   }
 
+  async function refreshHookStatus() {
+    try {
+      setHookStatus(await loadCodexHookIntegrationStatus());
+    } catch (error) {
+      setHookStatus({
+        installed: false,
+        hooksPath: "~/.codex/hooks.json",
+        eventStorePath: "~/.codex/agent-session-inbox/hook-events.jsonl",
+        detail: error instanceof Error ? error.message : "Unable to load Codex hook status.",
+      });
+    }
+  }
+
   useEffect(() => {
     void refreshPanel();
     const refreshTimer = window.setInterval(() => {
@@ -62,6 +79,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     void listen<string>("agent-session-inbox://open-management", (event) => {
       if (event.payload === "management") {
         updateDraftConfig(configRef.current);
+        void refreshHookStatus();
         setView("management");
       }
     }).then((unlisten) => {
@@ -262,6 +280,21 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             />
           </fieldset>
 
+          <section className="hook-settings" aria-label="Codex hook integration">
+            <div>
+              <h2>Codex hooks</h2>
+              <p>{hookStatus?.detail ?? "Checking Codex hook status..."}</p>
+              <code>{hookStatus?.hooksPath ?? "~/.codex/hooks.json"}</code>
+            </div>
+            <button
+              type="button"
+              disabled={hookInstallPending || hookStatus?.installed === true}
+              onClick={installHooks}
+            >
+              {hookStatus?.installed ? "Codex hooks installed" : hookInstallPending ? "Installing..." : "Install Codex hooks"}
+            </button>
+          </section>
+
           <div className="management-actions">
             <button type="button" onClick={applyDraftConfig}>
               Apply settings
@@ -368,6 +401,20 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     setConfig(nextConfig);
     updateDraftConfig(nextConfig);
     setView("panel");
+  }
+
+  async function installHooks() {
+    setHookInstallPending(true);
+    setErrorMessage(null);
+    try {
+      const nextStatus = await installCodexHooks();
+      setHookStatus(nextStatus);
+      setCommandMessage(nextStatus.detail);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Codex hook installation failed.");
+    } finally {
+      setHookInstallPending(false);
+    }
   }
 
   function hiddenToggleLabel() {

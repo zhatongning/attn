@@ -505,6 +505,40 @@ p {
   justify-content: flex-end;
 }
 
+.hook-settings {
+  align-items: center;
+  border: 1px solid #3b4048;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 8px;
+}
+
+.hook-settings h2 {
+  color: #d7dae0;
+  font-size: 12px;
+  line-height: 1.2;
+  margin: 0 0 4px;
+}
+
+.hook-settings p,
+.hook-settings code {
+  color: #8f96a3;
+  display: block;
+  font-size: 11px;
+  line-height: 1.25;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hook-settings button {
+  white-space: nowrap;
+}
+
 .color-field {
   align-items: center;
   grid-template-columns: minmax(0, 1fr) auto;

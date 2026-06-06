@@ -1,4 +1,5 @@
 pub mod codex_source;
+pub mod codex_hooks;
 pub mod domain;
 pub mod inbox_store;
 
@@ -55,6 +56,18 @@ fn source_health(
     state: tauri::State<Arc<inbox_store::InboxStore>>,
 ) -> domain::source_health::SourceHealth {
     state.source_health()
+}
+
+#[tauri::command]
+fn codex_hook_integration_status() -> codex_hooks::CodexHookIntegrationStatus {
+    codex_hooks::codex_hook_integration_status()
+}
+
+#[tauri::command]
+async fn install_codex_hooks() -> Result<codex_hooks::CodexHookIntegrationStatus, String> {
+    tauri::async_runtime::spawn_blocking(codex_hooks::install_codex_hooks)
+        .await
+        .map_err(|error| format!("install hook worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -345,6 +358,8 @@ pub fn run() {
             dismiss_session,
             restore_session,
             source_health,
+            codex_hook_integration_status,
+            install_codex_hooks,
             jump_to_session
         ])
         .run(tauri::generate_context!())

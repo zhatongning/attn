@@ -16,6 +16,14 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
 
+const tauriCoreMock = vi.hoisted(() => ({
+  invoke: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: tauriCoreMock.invoke,
+}));
+
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: vi.fn(() => ({
     setSize: tauriWindowMock.setSize,
@@ -31,7 +39,9 @@ vi.mock("@tauri-apps/api/dpi", () => ({
 
 afterEach(() => {
   window.localStorage.clear();
+  Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   tauriWindowMock.setSize.mockClear();
+  tauriCoreMock.invoke.mockReset();
   cleanup();
   vi.unstubAllGlobals();
 });
@@ -228,6 +238,52 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("1 进行中")).toBeTruthy();
     expect(screen.getByText("1 空闲")).toBeTruthy();
     expect(screen.getByText("待跟进")).toBeTruthy();
+  });
+
+  it("shows Codex hook integration status and installs only after confirmation", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "codex_hook_integration_status") {
+        return {
+          installed: false,
+          hooksPath: "/Users/edy/.codex/hooks.json",
+          eventStorePath: "/Users/edy/.codex/agent-session-inbox/hook-events.jsonl",
+          detail: "Attn hook commands are not installed.",
+        };
+      }
+      if (command === "install_codex_hooks") {
+        return {
+          installed: true,
+          hooksPath: "/Users/edy/.codex/hooks.json",
+          eventStorePath: "/Users/edy/.codex/agent-session-inbox/hook-events.jsonl",
+          detail: "Attn hook commands are installed.",
+        };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByText("Codex hooks")).toBeTruthy();
+    expect(await screen.findByText("Attn hook commands are not installed.")).toBeTruthy();
+    expect(tauriCoreMock.invoke).not.toHaveBeenCalledWith("install_codex_hooks");
+
+    fireEvent.click(screen.getByRole("button", { name: "Install Codex hooks" }));
+
+    expect(await screen.findByText("Attn hook commands are installed.")).toBeTruthy();
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("install_codex_hooks");
   });
 
   it("persists language settings across panel remounts", async () => {
