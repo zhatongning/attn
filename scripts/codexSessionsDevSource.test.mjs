@@ -99,6 +99,51 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
+  it("uses sqlite update after task_complete as a read signal", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-06T12-00-00-019read-signal.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019read-signal","cwd":"/Users/edy/project","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019read-signal",
+      rolloutPath,
+      cwd: "/Users/edy/project",
+      title: "Read signal",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Read signal",
+      updatedAtMs: Date.parse("2026-06-06T04:10:00.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:20:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019read-signal",
+      state: "needsAttention",
+      statusReason: "completed task still needs your attention",
+      lastActivityAt: "2026-06-06T04:10:00.000Z",
+    });
+  });
+
   it("keeps old unread JSONL completion evidence in inspect", () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
@@ -209,7 +254,7 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
-  it("jumps CLI sessions back to a previous iTerm tab before falling back to Desktop", async () => {
+  it("resumes exact CLI sessions in a previous iTerm tab instead of only focusing it", async () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
     fs.mkdirSync(sessionDir, { recursive: true });
@@ -234,11 +279,83 @@ describe("codexSessionsDevSource", () => {
       executeJump: async (_row, plan) => executed.push(plan),
     });
 
-    expect(executed).toEqual([{ kind: "iterm", tty: "ttys002", liveCodex: false }]);
-    expect(result.message).toBe("Focused previous iTerm session.");
+    expect(executed).toEqual([
+      {
+        kind: "iterm-resume",
+        threadId: "019cli",
+        workspacePath: "/Users/edy/wmhcar",
+        tty: "ttys002",
+      },
+    ]);
+    expect(result.message).toBe("Resumed Codex session in previous iTerm tab.");
   });
 
-  it("treats old archived threads without completion evidence as idle instead of requiring attention", () => {
+  it("starts a CLI session with codex resume when no iTerm item is alive", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019cli-resume.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019cli-resume","cwd":"/Users/edy/wmhcar","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    const executed = [];
+    const result = await jumpToSession("019cli-resume", {
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+      previousITermTtyForWorkspace: () => undefined,
+      executeJump: async (_row, plan) => executed.push(plan),
+    });
+
+    expect(executed).toEqual([
+      {
+        kind: "iterm-resume",
+        threadId: "019cli-resume",
+        workspacePath: "/Users/edy/wmhcar",
+        tty: undefined,
+      },
+    ]);
+    expect(result.message).toBe("Started iTerm Codex resume session.");
+  });
+
+  it("jumps Desktop-sourced rows to a live CLI terminal in the same workspace", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019desktop-live-cli.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-live-cli","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    const executed = [];
+    const result = await jumpToSession("019desktop-live-cli", {
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => "ttys009",
+      previousITermTtyForWorkspace: () => undefined,
+      executeJump: async (_row, plan) => executed.push(plan),
+    });
+
+    expect(executed).toEqual([{ kind: "iterm", tty: "ttys009", liveCodex: true }]);
+    expect(result.message).toBe("Focused live iTerm Codex session.");
+  });
+
+  it("excludes archived SQLite threads from discovery", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
     const sessionDir = path.join(temp, "sessions", "2026", "05", "26");
@@ -275,13 +392,7 @@ describe("codexSessionsDevSource", () => {
       liveCliTtyForWorkspace: () => undefined,
     });
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      sessionId: "019archived-old",
-      state: "idle",
-      confidence: "inferred",
-      statusReason: "completed task is no longer recent; idle until the next source signal",
-    });
+    expect(rows).toHaveLength(0);
   });
 
   it("treats a newer user message after task_complete as active work", () => {
@@ -314,6 +425,212 @@ describe("codexSessionsDevSource", () => {
       state: "running",
       statusReason: "running signal observed",
       lastActivityAt: "2026-06-03T02:30:00.000Z",
+    });
+  });
+
+  it("marks Desktop and CLI command approval prompts as needing attention", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019desktop-approval.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-approval","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-06T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"build desktop\\n"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need network access\\"}","call_id":"call_desktop"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019cli-approval.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019cli-approval","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-06T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"build cli\\n"}}',
+        '{"timestamp":"2026-06-06T04:06:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need network access\\"}","call_id":"call_cli"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    }).sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019cli-approval",
+      state: "idle",
+      confidence: "inferred",
+      statusReason: "No live Codex CLI process for pending input; idle until the next source signal.",
+      jumpTarget: "cli",
+      lastActivityAt: "2026-06-06T04:06:00.000Z",
+      evidenceSummary: "Codex is waiting for tool approval: npm run build",
+    });
+    expect(rows[1]).toMatchObject({
+      sessionId: "019desktop-approval",
+      state: "waitingForInput",
+      confidence: "exact",
+      jumpTarget: "desktop",
+      lastActivityAt: "2026-06-06T04:05:00.000Z",
+    });
+  });
+
+  it("keeps CLI command approval prompts waiting when a live CLI process exists", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019cli-live-approval.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019cli-live-approval","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-06T04:06:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need network access\\"}","call_id":"call_cli"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => "ttys123",
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019cli-live-approval",
+      state: "waitingForInput",
+      confidence: "exact",
+      statusReason: "waiting for user input",
+      jumpTarget: "cli",
+      evidenceSummary: "Codex is waiting for tool approval: npm run build",
+    });
+  });
+
+  it("clears command approval attention after matching function output arrives", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-06T12-00-00-019approval-cleared.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019approval-cleared","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need network access\\"}","call_id":"call_cli"}}',
+        '{"timestamp":"2026-06-06T04:06:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_cli","output":"approved"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019approval-cleared",
+      state: "running",
+      statusReason: "running signal observed",
+      lastActivityAt: "2026-06-06T04:06:00.000Z",
+      evidenceSummary: "local Codex JSONL activity observed",
+    });
+  });
+
+  it("does not leave interrupted command approval prompts waiting for input", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019approval-interrupted.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019approval-interrupted","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"git pull --ff-only origin develop\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need approval\\"}","call_id":"call_cli"}}',
+        '{"timestamp":"2026-06-06T04:06:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019approval-interrupted",
+      state: "running",
+      statusReason: "running signal observed",
+      evidenceSummary: "local Codex JSONL activity observed",
+    });
+  });
+
+  it("does not show stale CLI approval prompts as waiting for input without a live CLI process", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019stale-cli-approval.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019stale-cli-approval","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"git pull --ff-only origin develop\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need approval\\"}","call_id":"call_cli"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019stale-cli-approval",
+      state: "idle",
+      confidence: "inferred",
+      statusReason: "No live Codex CLI process for pending input; idle until the next source signal.",
+    });
+  });
+
+  it("does not show stale CLI approval prompts as waiting for input when another live CLI exists", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019stale-cli-live-approval.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019stale-cli-live-approval","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"git pull --ff-only origin develop\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need approval\\"}","call_id":"call_cli"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:40:01.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => "ttys123",
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019stale-cli-live-approval",
+      state: "idle",
+      confidence: "inferred",
+      statusReason: "Pending CLI input is stale; idle until the next source signal.",
     });
   });
 

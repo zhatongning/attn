@@ -1,6 +1,6 @@
 import type { Confidence, SessionRow } from "../../shared/types/session";
 
-export type InterventionStatus = "blocked" | "inspect" | "needed" | "working" | "idle";
+export type InterventionStatus = "blocked" | "input" | "inspect" | "needed" | "working" | "idle";
 
 export interface StatusPanelConfig {
   styleFamily: "atom";
@@ -29,6 +29,7 @@ export interface StatusPanelRow extends SessionRow {
   statusColor: string;
   statusTone: "alert" | "quiet";
   interventionReason: string;
+  evidenceTooltip: string;
 }
 
 export interface StatusPanelModel {
@@ -61,6 +62,7 @@ export const defaultStatusPanelConfig: StatusPanelConfig = {
   visibleItemCount: 3,
   statusColors: {
     blocked: "#e06c75",
+    input: "#c678dd",
     inspect: "#61afef",
     needed: "#e5c07b",
     working: "#98c379",
@@ -76,6 +78,11 @@ export const atomInterventionTheme: AtomInterventionTheme = {
       label: "blocked",
       marker: "●",
       color: defaultStatusPanelConfig.statusColors.blocked,
+    },
+    input: {
+      label: "input",
+      marker: "●",
+      color: defaultStatusPanelConfig.statusColors.input,
     },
     inspect: {
       label: "inspect",
@@ -102,15 +109,17 @@ export const atomInterventionTheme: AtomInterventionTheme = {
 
 const statusPriority: Record<InterventionStatus, number> = {
   blocked: 0,
-  inspect: 1,
-  needed: 2,
+  input: 1,
+  inspect: 2,
   working: 3,
-  idle: 4,
+  needed: 4,
+  idle: 5,
 };
 
 const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionStatus, string>> = {
   en: {
     blocked: "blocked",
+    input: "input",
     inspect: "inspect",
     needed: "follow-up",
     working: "working",
@@ -118,6 +127,7 @@ const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionSta
   },
   zh: {
     blocked: "受阻",
+    input: "待输入",
     inspect: "待检查",
     needed: "待跟进",
     working: "进行中",
@@ -188,6 +198,11 @@ function themeFromConfig(config: StatusPanelConfig): AtomInterventionTheme {
         label: statusLabels[config.language].blocked,
         color: config.statusColors.blocked,
       },
+      input: {
+        ...atomInterventionTheme.status.input,
+        label: statusLabels[config.language].input,
+        color: config.statusColors.input,
+      },
       inspect: {
         ...atomInterventionTheme.status.inspect,
         label: statusLabels[config.language].inspect,
@@ -237,11 +252,13 @@ function toPanelRow(row: SessionRow, theme: AtomInterventionTheme): StatusPanelR
     statusColor: status.color,
     statusTone: displayStatus === "working" || displayStatus === "idle" ? "quiet" : "alert",
     interventionReason: interventionReasonForRow(row, displayStatus),
+    evidenceTooltip: evidenceTooltipForRow(row),
   };
 }
 
 function displayStatusForRow(row: SessionRow): InterventionStatus {
   if (row.state === "inspect" || row.state === "dismissable") return "inspect";
+  if (row.state === "waitingForInput") return "input";
   if (row.state === "needsAttention") return "needed";
   if (row.state === "running") return "working";
   if (row.state === "idle") return "idle";
@@ -271,6 +288,8 @@ function interventionReasonForRow(row: SessionRow, status: InterventionStatus) {
   switch (status) {
     case "blocked":
       return "needs attention before work can continue";
+    case "input":
+      return "waiting for your input";
     case "inspect":
       return "ready to inspect";
     case "needed":
@@ -280,4 +299,14 @@ function interventionReasonForRow(row: SessionRow, status: InterventionStatus) {
     case "idle":
       return "last task completed";
   }
+}
+
+function evidenceTooltipForRow(row: SessionRow) {
+  return [
+    `Status: ${row.statusReason}`,
+    row.evidenceSummary ? `Evidence: ${row.evidenceSummary}` : undefined,
+    row.lastActivityAt ? `Last activity: ${row.lastActivityAt}` : undefined,
+    `Jump target: ${row.jumpTarget}`,
+    `Confidence: ${row.confidence}`,
+  ].filter(Boolean).join("\n");
 }

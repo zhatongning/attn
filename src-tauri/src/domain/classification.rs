@@ -19,7 +19,7 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
             "no recent activity observed; idle until the next source signal".to_string(),
         ),
         ObservationKind::WaitingForInput => (
-            SessionState::NeedsAttention,
+            SessionState::WaitingForInput,
             Confidence::Exact,
             "waiting for user input".to_string(),
         ),
@@ -55,6 +55,7 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
         .with_project_name(observation.project_name)
         .with_workspace(observation.workspace_path)
         .with_reason(reason)
+        .with_evidence_summary(observation.evidence_summary)
         .with_last_activity_option(observation.last_activity_at)
         .with_jump_target(observation.jump_target)
 }
@@ -73,7 +74,7 @@ mod tests {
 
         let row = classify_observation(observation);
 
-        assert_eq!(row.state, SessionState::NeedsAttention);
+        assert_eq!(row.state, SessionState::WaitingForInput);
         assert_eq!(row.confidence, Confidence::Exact);
         assert_eq!(row.workspace_path.as_deref(), Some("/repo"));
     }
@@ -102,13 +103,18 @@ mod tests {
 
     #[test]
     fn classifies_immediate_completed_observation_as_inspect() {
-        let observation = SourceObservation::new("s3", ObservationKind::CompletedImmediate);
+        let mut observation = SourceObservation::new("s3", ObservationKind::CompletedImmediate);
+        observation.evidence_summary = Some("JSONL task_complete at 2026-06-06T04:24:30.041Z".to_string());
 
         let row = classify_observation(observation);
 
         assert_eq!(row.state, SessionState::Inspect);
         assert_eq!(row.confidence, Confidence::Exact);
         assert!(row.status_reason.contains("completed"));
+        assert_eq!(
+            row.evidence_summary.as_deref(),
+            Some("JSONL task_complete at 2026-06-06T04:24:30.041Z")
+        );
     }
 
     #[test]

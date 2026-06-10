@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { LogicalSize } from "@tauri-apps/api/dpi";
+import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { CodexHookIntegrationStatus, SessionRow, SourceHealth } from "../../shared/types/session";
@@ -15,11 +15,13 @@ import { buildStatusPanelModel, defaultStatusPanelConfig, type StatusPanelConfig
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
+const PANEL_POSITION_STORAGE_KEY = "attn.panelPosition";
 const PANEL_WIDTH = 560;
 const MANAGEMENT_HEIGHT = 420;
 const PANEL_BASE_HEIGHT = 252;
 const PANEL_BASE_VISIBLE_ITEMS = 3;
 const PANEL_EXTRA_ROW_HEIGHT = 48;
+const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PANEL_EXTRA_ROW_HEIGHT;
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
@@ -98,8 +100,31 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }, [config]);
 
   useEffect(() => {
-    void resizePanelWindow(view === "management" ? MANAGEMENT_HEIGHT : panelWindowHeight(config.visibleItemCount));
-  }, [config.visibleItemCount, view]);
+    try {
+      const appWindow = getCurrentWindow();
+      const savedPosition = loadPanelPosition();
+      if (savedPosition) {
+        void appWindow.setPosition(new PhysicalPosition(savedPosition.x, savedPosition.y)).catch(() => undefined);
+      }
+
+      let unlistenMoved: (() => void) | undefined;
+      void appWindow.onMoved((event) => {
+        persistPanelPosition(event.payload);
+      }).then((unlisten) => {
+        unlistenMoved = unlisten;
+      }).catch(() => undefined);
+
+      return () => {
+        unlistenMoved?.();
+      };
+    } catch {
+      return undefined;
+    }
+  }, []);
+
+  useEffect(() => {
+    void resizePanelWindow(view === "management" ? MANAGEMENT_HEIGHT : panelWindowHeight(displayedRows.length));
+  }, [displayedRows.length, view]);
 
   useEffect(() => {
     const previousDisplayStatuses = previousDisplayStatusRef.current;
@@ -180,12 +205,11 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   if (view === "management") {
     return (
       <main className="panel-shell management-shell" data-theme={`${model.theme.styleFamily}-${model.theme.palette}`}>
-        <header className="panel-header">
+        <header className="panel-header panel-header--draggable" onPointerDown={startPanelDrag}>
           <div className="panel-title">
-            <span className="panel-prompt">$</span>
             <h1>management</h1>
         </div>
-        <button type="button" className="icon-button icon-button--back" onClick={() => {
+        <button type="button" className="icon-button icon-button--back" data-no-window-drag onClick={() => {
           updateDraftConfig(configRef.current);
           setView("panel");
         }}>
@@ -307,10 +331,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
   return (
     <main className="panel-shell" data-theme={`${model.theme.styleFamily}-${model.theme.palette}`}>
-      <header className="panel-header">
+      <header className="panel-header panel-header--draggable" onPointerDown={startPanelDrag}>
         <div className="panel-title">
-          <span className="panel-prompt">$</span>
-          <h1>attn</h1>
+          <h1>Attn</h1>
         </div>
         <div className="panel-counters" aria-label="Session counters">
           <span>{model.interventionCount} {model.copy.alertsLabel}</span>
@@ -439,6 +462,8 @@ interface StatusRowProps {
 }
 
 function StatusRow({ row, pendingAction, attentionCue = false, onJump, onDismiss }: StatusRowProps) {
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const evidenceRef = useRef<HTMLSpanElement | null>(null);
   const jumpTitle = pendingAction === "jump" ? "Opening session" : "Jump back";
   const dismissTitle = pendingAction === "dismiss" ? "Dismissing session" : "Dismiss";
   const rowClassName = [
@@ -447,6 +472,26 @@ function StatusRow({ row, pendingAction, attentionCue = false, onJump, onDismiss
     `status-row--${row.statusTone}`,
     attentionCue ? "status-row--attention-cue" : "",
   ].filter(Boolean).join(" ");
+
+  useEffect(() => {
+    if (!evidenceOpen) {
+      return;
+    }
+
+    function closeEvidenceOnOutsidePointer(event: PointerEvent) {
+      const target = event.target instanceof Node ? event.target : null;
+      if (target && evidenceRef.current?.contains(target)) {
+        return;
+      }
+
+      setEvidenceOpen(false);
+    }
+
+    document.addEventListener("pointerdown", closeEvidenceOnOutsidePointer);
+    return () => {
+      document.removeEventListener("pointerdown", closeEvidenceOnOutsidePointer);
+    };
+  }, [evidenceOpen]);
 
   return (
     <article
@@ -464,9 +509,34 @@ function StatusRow({ row, pendingAction, attentionCue = false, onJump, onDismiss
       </span>
       <div className="status-content">
         <h2>{row.label}</h2>
-        <p title={row.interventionReason}>
-          {rowSubtitle(row)}
-          <span>{row.confidence}</span>
+        <p className="status-meta">
+          <span className="status-workspace">{rowSubtitle(row)}</span>
+          <span className="status-confidence">{row.confidence}</span>
+          <span className="status-evidence-anchor" ref={evidenceRef}>
+            <button
+              type="button"
+              className="status-info"
+              aria-label={`Show status evidence for ${row.label}`}
+              aria-expanded={evidenceOpen}
+              aria-describedby={evidenceOpen ? `status-evidence-${row.sessionId}` : undefined}
+              onClick={() => setEvidenceOpen((current) => !current)}
+            >
+              i
+            </button>
+            {evidenceOpen ? (
+              <span
+                className="status-evidence-popover"
+                id={`status-evidence-${row.sessionId}`}
+                role="tooltip"
+                tabIndex={0}
+                onWheel={(event) => event.stopPropagation()}
+              >
+                {row.evidenceTooltip.split("\n").map((line) => (
+                  <span key={line}>{line}</span>
+                ))}
+              </span>
+            ) : null}
+          </span>
         </p>
       </div>
       <div className="status-actions">
@@ -521,7 +591,13 @@ function PendingIcon() {
 
 function panelWindowHeight(visibleItemCount: number) {
   const normalizedCount = Math.min(8, Math.max(1, visibleItemCount));
-  return Math.min(420, PANEL_BASE_HEIGHT + Math.max(0, normalizedCount - PANEL_BASE_VISIBLE_ITEMS) * PANEL_EXTRA_ROW_HEIGHT);
+  return Math.min(
+    420,
+    Math.max(
+      PANEL_MIN_HEIGHT,
+      PANEL_BASE_HEIGHT + (normalizedCount - PANEL_BASE_VISIBLE_ITEMS) * PANEL_EXTRA_ROW_HEIGHT,
+    ),
+  );
 }
 
 async function resizePanelWindow(height: number) {
@@ -530,6 +606,57 @@ async function resizePanelWindow(height: number) {
   } catch {
     // Browser preview and restricted window capabilities should not block the panel.
   }
+}
+
+function startPanelDrag(event: React.PointerEvent<HTMLElement>) {
+  if (event.button !== 0 || shouldSkipWindowDrag(event.target)) {
+    return;
+  }
+
+  try {
+    void getCurrentWindow().startDragging().catch(() => undefined);
+  } catch {
+    // Browser preview does not expose native window dragging.
+  }
+}
+
+function shouldSkipWindowDrag(target: EventTarget | null) {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+
+  return target.closest("button, input, select, textarea, a, [data-no-window-drag]") !== null;
+}
+
+function loadPanelPosition() {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const storedPosition = window.localStorage.getItem(PANEL_POSITION_STORAGE_KEY);
+    if (!storedPosition) return null;
+    const position = JSON.parse(storedPosition);
+    if (!isPersistablePanelPosition(position)) return null;
+    return position;
+  } catch {
+    return null;
+  }
+}
+
+function persistPanelPosition(position: { x: number; y: number }) {
+  try {
+    if (!isPersistablePanelPosition(position)) {
+      return;
+    }
+
+    window.localStorage.setItem(PANEL_POSITION_STORAGE_KEY, JSON.stringify({ x: position.x, y: position.y }));
+  } catch {
+    // Position persistence should not affect the panel itself.
+  }
+}
+
+function isPersistablePanelPosition(value: unknown): value is { x: number; y: number } {
+  if (!isObject(value)) return false;
+  return Number.isFinite(value.x) && Number.isFinite(value.y);
 }
 
 function loadInitialConfig(): StatusPanelConfig {
@@ -570,6 +697,7 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
     visibleItemCount,
     statusColors: {
       blocked: colorValue(statusColors.blocked, defaultStatusPanelConfig.statusColors.blocked),
+      input: colorValue(statusColors.input, defaultStatusPanelConfig.statusColors.input),
       inspect: colorValue(statusColors.inspect, defaultStatusPanelConfig.statusColors.inspect),
       needed: colorValue(statusColors.needed, defaultStatusPanelConfig.statusColors.needed),
       working: colorValue(statusColors.working, defaultStatusPanelConfig.statusColors.working),

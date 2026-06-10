@@ -21,7 +21,7 @@ const baseRow: SessionRow = {
 describe("buildStatusPanelModel", () => {
   it("maps source states to intervention display statuses", () => {
     const model = buildStatusPanelModel([
-      row("needs-input", "needsAttention", "waiting for user input"),
+      row("needs-input", "waitingForInput", "waiting for user input"),
       row("active", "running", "running signal observed"),
       row("complete", "dismissable", "completed task ready for inspect; confirm to mark idle"),
       row("unknown", "unknown", "source status unavailable"),
@@ -29,8 +29,8 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["unknown", "blocked"],
+      ["needs-input", "input"],
       ["complete", "inspect"],
-      ["needs-input", "follow-up"],
     ]);
     expect(model.hiddenRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["active", "working"],
@@ -55,7 +55,7 @@ describe("buildStatusPanelModel", () => {
     const model = buildStatusPanelModel(
       [
         row("blocked", "unknown", "source status unavailable"),
-        row("input", "needsAttention", "waiting for user input"),
+        row("input", "waitingForInput", "waiting for user input"),
         row("working", "running", "running signal observed"),
       ],
       { ...defaultStatusPanelConfig, visibleItemCount: 2 },
@@ -70,13 +70,15 @@ describe("buildStatusPanelModel", () => {
       [
         row("blocked", "unknown", "source status unavailable"),
         row("inspect", "inspect", "completed task ready to inspect; confirm to mark idle"),
-        row("needed", "needsAttention", "waiting for user input"),
+        row("input", "waitingForInput", "waiting for user input"),
+        row("needed", "needsAttention", "Read recently; keep in needed state until 30 minutes pass."),
         row("idle", "idle", "completed task is no longer recent; idle until the next source signal"),
       ],
       { ...defaultStatusPanelConfig, language: "zh" },
     );
 
-    expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待检查", "待跟进"]);
+    expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待输入", "待检查"]);
+    expect(model.hiddenRows.map((item) => item.statusLabel)).toEqual(["待跟进"]);
     expect(model.copy.alertsLabel).toBe("需关注");
     expect(model.copy.workingLabel).toBe("进行中");
     expect(model.copy.idleLabel).toBe("空闲");
@@ -119,15 +121,15 @@ describe("buildStatusPanelModel", () => {
       row("idle", "idle", "completed task observed; idle until the next source signal"),
       row("working", "running", "running signal observed"),
       row("inspect", "dismissable", "failed task can be manually reviewed and cleared"),
-      row("needed", "needsAttention", "waiting for user input"),
+      row("needed", "needsAttention", "Read recently; keep in needed state until 30 minutes pass."),
       row("blocked", "unknown", "source status unavailable"),
     ], { ...defaultStatusPanelConfig, visibleItemCount: 5 });
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
       "blocked",
       "inspect",
-      "needed",
       "working",
+      "needed",
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
     expect(model.idleCount).toBe(1);
@@ -136,12 +138,31 @@ describe("buildStatusPanelModel", () => {
   });
 
   it("uses the Atom intervention theme", () => {
-    const model = buildStatusPanelModel([row("input", "needsAttention", "waiting for user input")]);
+    const model = buildStatusPanelModel([row("input", "waitingForInput", "waiting for user input")]);
 
     expect(model.theme.styleFamily).toBe("atom");
     expect(model.visibleRows[0].statusMarker).toBe("●");
-    expect(model.visibleRows[0].statusLabel).toBe("follow-up");
-    expect(model.visibleRows[0].statusColor).toBe(atomInterventionTheme.status.needed.color);
+    expect(model.visibleRows[0].statusLabel).toBe("input");
+    expect(model.visibleRows[0].statusColor).toBe(atomInterventionTheme.status.input.color);
+  });
+
+  it("builds a compact source evidence tooltip for each row", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("inspect", "inspect", "completed task ready to inspect; open it to mark read"),
+        evidenceSummary: "JSONL task_complete at 2026-06-06T04:24:30.041Z",
+        lastActivityAt: "2026-06-06T04:24:30.041Z",
+        jumpTarget: "desktop",
+      },
+    ]);
+
+    expect(model.visibleRows[0].evidenceTooltip).toBe([
+      "Status: completed task ready to inspect; open it to mark read",
+      "Evidence: JSONL task_complete at 2026-06-06T04:24:30.041Z",
+      "Last activity: 2026-06-06T04:24:30.041Z",
+      "Jump target: desktop",
+      "Confidence: exact",
+    ].join("\n"));
   });
 });
 

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 const defaultUnreadCompletionTrackingStartMs = Date.parse("2026-06-05T08:00:00.000Z");
+const pendingCliInputFreshnessMs = 30 * 60 * 1000;
 const defaultDevSource = createCodexSessionsDevSource();
 
 export function defaultCodexSessionsRoot() {
@@ -19,7 +20,7 @@ export function sourceHealth({
   sessionsRoot = defaultCodexSessionsRoot(),
 } = {}) {
   return {
-    sourceName: "Codex desktop",
+    sourceName: "Codex sessions",
     status: fs.existsSync(sessionsRoot) ? "available" : "unknown",
     capabilities: [
       {
@@ -36,7 +37,7 @@ export function sourceHealth({
         name: "Window jump-back",
         availability: "inferred",
         detail:
-          "Routes Jump back to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for that workspace.",
+          "Routes Jump back to Codex Desktop, a live iTerm Codex session, a previous iTerm tab, or a resumed CLI item for that workspace.",
       },
     ],
   };
@@ -59,14 +60,14 @@ export function discoverCodexSessions({
     unreadCompletionTrackingStartMs: trackingStartMs,
     liveCliTtyForWorkspace,
   });
-  if (threadRows.length > 0) return threadRows;
+  if (threadRows !== null) return threadRows;
 
   return collectJsonlFiles(sessionsRoot)
     .sort((left, right) => right.modifiedAt - left.modifiedAt)
     .slice(0, limit)
     .map((file) => parseSessionFile(file.path, { nowMs, unreadCompletionTrackingStartMs: trackingStartMs }))
     .filter(Boolean)
-    .map((observation) => toSessionRow(observation, liveCliTtyForWorkspace));
+    .map((observation) => toSessionRow(observation, { liveCliTtyForWorkspace, nowMs }));
 }
 
 export function discoverCodexThreadById(sessionId, {
@@ -158,11 +159,11 @@ export function createCodexSessionsDevSource({
 }
 
 function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrackingStartMs, liveCliTtyForWorkspace }) {
-  if (!fs.existsSync(stateDbPath)) return [];
+  if (!fs.existsSync(stateDbPath)) return null;
 
-  const query = `${threadSummaryJsonSelect()} from threads order by coalesce(updated_at_ms, updated_at * 1000) desc limit ${limit};`;
+  const query = `${threadSummaryJsonSelect()} from threads where archived = 0 order by coalesce(updated_at_ms, updated_at * 1000) desc limit ${limit};`;
   const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDbPath, query], { encoding: "utf8" });
-  if (result.status !== 0) return [];
+  if (result.status !== 0) return null;
 
   return result.stdout
     .split("\n")
@@ -204,21 +205,21 @@ function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliT
   const workspacePath = thread.cwd || jsonlObservation?.workspacePath;
   const jumpTarget = jsonlObservation?.jumpTarget ?? jumpTargetFromThreadSource(thread);
   const jsonlKind = jsonlObservation?.kind;
-  const archived = Number(thread.archived) !== 0;
-  const lastActivityAt = lastActivityAtFromThread(thread, jsonlObservation);
+  const threadUpdatedAfterTaskComplete = threadUpdatedAfterTaskCompleteFromThread(thread, jsonlObservation);
+  const lastActivityAt = lastActivityAtFromThread(thread, jsonlObservation, threadUpdatedAfterTaskComplete);
   const hasRecentActivity = lastActivityAt
     ? nowMs - Date.parse(lastActivityAt) <= 2 * 60 * 60 * 1000
     : false;
-  const archivedCompletionKind = completionKindFromLastActivityAt(lastActivityAt, nowMs);
-  const kind = terminalOrInputKind(jsonlKind)
-    ? jsonlKind
-    : archived
-      ? archivedCompletionKind
+  const threadCompletionKind = completionKindFromLastActivityAt(lastActivityAt, nowMs);
+  const kind = threadUpdatedAfterTaskComplete && jsonlKind === "completedImmediate"
+    ? threadCompletionKind
+    : (terminalOrInputKind(jsonlKind)
+      ? jsonlKind
       : jumpTarget === "desktop" && hasRecentActivity
         ? "running"
         : jumpTarget === "desktop"
           ? "idle"
-          : jsonlKind ?? "insufficientEvidence";
+          : jsonlKind ?? "insufficientEvidence");
   const workspaceName = workspacePath ? path.basename(workspacePath) : undefined;
   const label = firstNonEmpty(
     thread.title,
@@ -243,11 +244,19 @@ function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliT
     lastActivityAt,
     evidenceSummary: jsonlObservation?.evidenceSummary ?? thread.preview,
     jumpTarget,
-  }, liveCliTtyForWorkspace);
+  }, { liveCliTtyForWorkspace, nowMs });
 }
 
-function lastActivityAtFromThread(thread, jsonlObservation) {
-  return jsonlObservation?.lastActivityAt ?? timestampMsToIsoUtc(Number(thread.updated_at_ms));
+function threadUpdatedAfterTaskCompleteFromThread(thread, jsonlObservation) {
+  const updatedAt = timestampMsToIsoUtc(Number(thread.updated_at_ms));
+  const taskCompleteAt = jsonlObservation?.taskCompleteAt;
+  return Boolean(updatedAt && taskCompleteAt && Date.parse(updatedAt) > Date.parse(taskCompleteAt));
+}
+
+function lastActivityAtFromThread(thread, jsonlObservation, threadUpdatedAfterTaskComplete = false) {
+  return threadUpdatedAfterTaskComplete
+    ? timestampMsToIsoUtc(Number(thread.updated_at_ms))
+    : jsonlObservation?.lastActivityAt ?? timestampMsToIsoUtc(Number(thread.updated_at_ms));
 }
 
 function terminalOrInputKind(kind) {
@@ -279,6 +288,8 @@ function parseSessionFile(filePath, {
   let lastActivityAt;
   let lastActivityKind = "insufficientEvidence";
   let lastMessage;
+  let pendingToolApproval;
+  let taskCompleteAt;
 
   for (const line of fs.readFileSync(filePath, "utf8").split("\n")) {
     if (!line.trim()) continue;
@@ -305,6 +316,11 @@ function parseSessionFile(filePath, {
       const eventType = value.payload?.type;
       if (eventType === "task_complete") {
         lastActivityKind = "completed";
+        pendingToolApproval = undefined;
+        taskCompleteAt = value.timestamp;
+      } else if (eventType === "turn_aborted") {
+        pendingToolApproval = undefined;
+        lastActivityKind = "running";
       } else if (eventType === "user_message" || eventType === "agent_message") {
         lastActivityKind = "running";
       }
@@ -316,6 +332,20 @@ function parseSessionFile(filePath, {
         }
       }
     }
+
+    if (value.type === "response_item") {
+      const approval = pendingToolApprovalFromResponseItem(value);
+      if (approval) {
+        lastActivityKind = "waitingForInput";
+        pendingToolApproval = approval;
+      } else if (value.payload?.type === "function_call_output") {
+        const callId = value.payload?.call_id;
+        if (callId && pendingToolApproval?.callId === callId) {
+          pendingToolApproval = undefined;
+          lastActivityKind = "running";
+        }
+      }
+    }
   }
 
   sessionId ??= path.basename(filePath, ".jsonl").split("-").at(-1);
@@ -323,7 +353,9 @@ function parseSessionFile(filePath, {
 
   const ageMs = lastActivityAt ? nowMs - Date.parse(lastActivityAt) : Number.POSITIVE_INFINITY;
   const recent = ageMs <= 2 * 60 * 60 * 1000;
-  const kind = lastActivityKind === "completed"
+  const kind = pendingToolApproval
+    ? "waitingForInput"
+    : lastActivityKind === "completed"
     ? lastActivityAt && Date.parse(lastActivityAt) >= unreadCompletionTrackingStartMs
       ? "completedImmediate"
       : "completedStale"
@@ -342,15 +374,43 @@ function parseSessionFile(filePath, {
     agentName,
     projectName,
     workspacePath,
-    lastActivityAt,
-    evidenceSummary: lastMessage ? truncate(lastMessage, 120) : "local Codex JSONL activity observed",
+    lastActivityAt: pendingToolApproval?.timestamp ?? lastActivityAt,
+    taskCompleteAt,
+    evidenceSummary: pendingToolApproval?.evidenceSummary
+      ?? (lastMessage ? truncate(lastMessage, 120) : "local Codex JSONL activity observed"),
     jumpTarget,
   };
 }
 
-function toSessionRow(observation, liveCliTtyForWorkspace) {
+function pendingToolApprovalFromResponseItem(value) {
+  if (value.payload?.type !== "function_call") return undefined;
+
+  let args;
+  try {
+    args = JSON.parse(value.payload?.arguments ?? "");
+  } catch {
+    return undefined;
+  }
+
+  if (args?.sandbox_permissions !== "require_escalated") return undefined;
+
+  const toolName = typeof value.payload?.name === "string" && value.payload.name.trim()
+    ? value.payload.name.trim()
+    : "tool";
+  const requestedAction = typeof args.cmd === "string" && args.cmd.trim()
+    ? truncate(args.cmd.trim(), 120)
+    : toolName;
+
+  return {
+    callId: typeof value.payload?.call_id === "string" ? value.payload.call_id : undefined,
+    timestamp: typeof value.timestamp === "string" ? value.timestamp : undefined,
+    evidenceSummary: `Codex is waiting for tool approval: ${requestedAction}`,
+  };
+}
+
+function toSessionRow(observation, { liveCliTtyForWorkspace, nowMs = Date.now() }) {
   const classified = classifyObservation(observation);
-  const row = applyLiveCliActivitySignal(classified, liveCliTtyForWorkspace);
+  const row = applyLiveCliActivitySignal(classified, liveCliTtyForWorkspace, nowMs);
   return {
     ...row,
     dismissabilityReason: dismissabilityReason(row.state),
@@ -369,6 +429,7 @@ function classifyObservation(observation) {
     projectName: emptyToUndefined(observation.projectName),
     workspacePath: observation.workspacePath,
     lastActivityAt: emptyToUndefined(observation.lastActivityAt),
+    evidenceSummary: emptyToUndefined(observation.evidenceSummary),
     state: classification.state,
     confidence: classification.confidence,
     statusReason: classification.reason,
@@ -391,7 +452,7 @@ function classificationForKind(kind) {
     };
   }
   if (kind === "waitingForInput") {
-    return { state: "needsAttention", confidence: "exact", reason: "waiting for user input" };
+    return { state: "waitingForInput", confidence: "exact", reason: "waiting for user input" };
   }
   if (kind === "completedImmediate") {
     return {
@@ -428,7 +489,22 @@ function classificationForKind(kind) {
   };
 }
 
-function applyLiveCliActivitySignal(row, liveCliTtyForWorkspace) {
+function applyLiveCliActivitySignal(row, liveCliTtyForWorkspace, nowMs = Date.now()) {
+  if (row.state === "waitingForInput" && row.jumpTarget === "cli") {
+    const tty = row.workspacePath ? liveCliTtyForWorkspace(row.workspacePath) : undefined;
+    if (tty && rowHasFreshActivity(row, nowMs, pendingCliInputFreshnessMs)) return row;
+    const statusReason = tty
+      ? "Pending CLI input is stale; idle until the next source signal."
+      : "No live Codex CLI process for pending input; idle until the next source signal.";
+
+    return {
+      ...row,
+      state: "idle",
+      confidence: "inferred",
+      statusReason,
+    };
+  }
+
   if (row.state !== "unknown" || row.jumpTarget !== "cli" || !row.workspacePath) return row;
 
   const tty = liveCliTtyForWorkspace(row.workspacePath);
@@ -442,10 +518,15 @@ function applyLiveCliActivitySignal(row, liveCliTtyForWorkspace) {
   };
 }
 
+function rowHasFreshActivity(row, nowMs, freshnessMs) {
+  return Boolean(row.lastActivityAt && nowMs - Date.parse(row.lastActivityAt) <= freshnessMs);
+}
+
 function applyAcknowledgedSessionState(row, acknowledgedSignals, nowMs = Date.now()) {
   if (!acknowledgedSignals.has(acknowledgedSignal(row))) return row;
   if (row.state === "running") return row;
   if (row.state === "idle") return row;
+  if (row.state === "waitingForInput") return row;
 
   const acknowledgedAtMs = acknowledgedSignals.get(acknowledgedSignal(row));
   if (typeof acknowledgedAtMs === "number" && nowMs - acknowledgedAtMs <= 30 * 60 * 1000) {
@@ -532,23 +613,36 @@ function truncate(value, maxLength) {
 }
 
 function buildJumpPlan(row, options = {}) {
+  const liveTty = row.workspacePath
+    ? (options.liveCliTtyForWorkspace ?? findLiveCodexTtyForWorkspace)(row.workspacePath)
+    : undefined;
+  if (liveTty) return { kind: "iterm", tty: liveTty, liveCodex: true };
+
   if (row.jumpTarget === "desktop" || row.jumpTarget === "unknown") return { kind: "desktop" };
 
-  const liveTty = (options.liveCliTtyForWorkspace ?? findLiveCodexTtyForWorkspace)(row.workspacePath);
-  if (liveTty) return { kind: "iterm", tty: liveTty, liveCodex: true };
-  const previousITermTty = (options.previousITermTtyForWorkspace ?? findPreviousITermTtyForWorkspace)(row.workspacePath);
-  if (previousITermTty) return { kind: "iterm", tty: previousITermTty, liveCodex: false };
-  return { kind: "desktop" };
+  const resumeTty = row.workspacePath
+    ? (options.previousITermTtyForWorkspace ?? findPreviousITermTtyForWorkspace)(row.workspacePath)
+    : undefined;
+
+  return {
+    kind: "iterm-resume",
+    threadId: row.sessionId,
+    workspacePath: row.workspacePath,
+    tty: resumeTty,
+  };
 }
 
 function jumpMessage(plan) {
   if (plan.kind === "iterm" && plan.liveCodex) return "Focused live iTerm Codex session.";
   if (plan.kind === "iterm") return "Focused previous iTerm session.";
+  if (plan.kind === "iterm-resume" && plan.tty) return "Resumed Codex session in previous iTerm tab.";
+  if (plan.kind === "iterm-resume") return "Started iTerm Codex resume session.";
   return "Opened Codex Desktop session.";
 }
 
 async function executeJump(row, plan) {
   if (plan.kind === "iterm") return activateITermTty(plan.tty);
+  if (plan.kind === "iterm-resume") return openITermCodexResume(plan.workspacePath, plan.threadId, plan.tty);
 
   return runDetached("open", [codexThreadDeeplink(row.sessionId)]);
 }
@@ -687,7 +781,51 @@ end repeat
 end tell
 end timeout`;
 
-  return runWithTimeout("osascript", ["-e", script], 4_000).catch(() => activateITerm());
+  return runWithTimeout("osascript", ["-e", script], 4_000);
+}
+
+function openITermCodexResume(workspacePath, threadId, tty) {
+  const command = `cd ${shellSingleQuote(workspacePath)} && codex resume ${shellSingleQuote(threadId)}`;
+  const script = tty ? resumeInExistingITermScript(tty, command) : `with timeout of 5 seconds
+tell application id "com.googlecode.iterm2"
+activate
+set newWindow to (create window with default profile)
+tell current session of newWindow
+write text ${applescriptStringLiteral(command)}
+end tell
+end tell
+end timeout`;
+
+  return runWithTimeout("osascript", ["-e", script], 6_000);
+}
+
+function resumeInExistingITermScript(tty, command) {
+  const ttyPath = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+  return `with timeout of 5 seconds
+tell application id "com.googlecode.iterm2"
+activate
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+try
+set sessionTty to tty of s as text
+if sessionTty is ${applescriptStringLiteral(tty)} or sessionTty is ${applescriptStringLiteral(ttyPath)} then
+select w
+select t
+select s
+write text ${applescriptStringLiteral(command)}
+return "resumed"
+end if
+end try
+end repeat
+end repeat
+end repeat
+set newWindow to (create window with default profile)
+tell current session of newWindow
+write text ${applescriptStringLiteral(command)}
+end tell
+end tell
+end timeout`;
 }
 
 function runDetached(command, args) {
@@ -740,4 +878,8 @@ function activateITerm() {
 
 function applescriptStringLiteral(value) {
   return `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }

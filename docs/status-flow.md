@@ -188,7 +188,7 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 | User action | Current transition |
 | --- | --- |
 | Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `follow-up` for 30 minutes. |
-| Open the same Codex Desktop thread outside this app | If Codex advances SQLite `updated_at_ms` after `task_complete`, infer it was read and show `follow-up` for 30 minutes. |
+| Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `working` or `idle` | No state transition. |
 | Dismiss an `inspect` or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
@@ -218,6 +218,9 @@ These are the areas that currently feel wrong or need product decisions.
 
 6. Hook reading is integrated, and hook installation is explicit from the management page.
    Without installed hooks, `working` still falls back to SQLite/JSONL/process inference.
+
+7. TODO: Find a reliable read/open evidence source for Codex Desktop history navigation.
+   Current local evidence is insufficient to prove an `inspect` row was read when the user opens that thread directly inside Codex Desktop. `threads.updated_at_ms` does not always advance, `threads` has no `read_at`/`seen_at` field, `logs_2.sqlite` has execution logs but no reliable post-completion read event, and generic UI click/Sentry data is not safely attributable to a specific session. Hooks are useful for execution lifecycle state, but they do not currently prove UI-level read/open actions.
 
 ## Open Product Decisions
 

@@ -19,6 +19,7 @@ pub enum ObservationKind {
 #[serde(rename_all = "camelCase")]
 pub enum SessionState {
     NeedsAttention,
+    WaitingForInput,
     Inspect,
     Running,
     Idle,
@@ -113,6 +114,7 @@ pub struct SessionRow {
     pub confidence: Confidence,
     pub workspace_path: Option<String>,
     pub last_activity_at: Option<String>,
+    pub evidence_summary: Option<String>,
     pub status_reason: String,
     pub dismissability_reason: Option<String>,
     pub handled: bool,
@@ -137,6 +139,7 @@ impl SessionRow {
             confidence,
             workspace_path: None,
             last_activity_at: None,
+            evidence_summary: None,
             status_reason: String::new(),
             dismissability_reason: None,
             handled: false,
@@ -173,6 +176,11 @@ impl SessionRow {
 
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.status_reason = reason.into();
+        self
+    }
+
+    pub fn with_evidence_summary(mut self, evidence_summary: Option<String>) -> Self {
+        self.evidence_summary = evidence_summary.filter(|value| !value.is_empty());
         self
     }
 

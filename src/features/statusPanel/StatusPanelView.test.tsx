@@ -10,6 +10,9 @@ import { StatusPanelView } from "./StatusPanelView";
 
 const tauriWindowMock = vi.hoisted(() => ({
   setSize: vi.fn(async () => undefined),
+  setPosition: vi.fn(async () => undefined),
+  startDragging: vi.fn(async () => undefined),
+  onMoved: vi.fn(async (_handler: unknown) => vi.fn()),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -27,6 +30,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: vi.fn(() => ({
     setSize: tauriWindowMock.setSize,
+    setPosition: tauriWindowMock.setPosition,
+    startDragging: tauriWindowMock.startDragging,
+    onMoved: tauriWindowMock.onMoved,
   })),
 }));
 
@@ -35,12 +41,20 @@ vi.mock("@tauri-apps/api/dpi", () => ({
     type = "Logical";
     constructor(public width: number, public height: number) {}
   },
+  PhysicalPosition: class PhysicalPosition {
+    type = "Physical";
+    constructor(public x: number, public y: number) {}
+  },
 }));
 
 afterEach(() => {
   window.localStorage.clear();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   tauriWindowMock.setSize.mockClear();
+  tauriWindowMock.setPosition.mockClear();
+  tauriWindowMock.startDragging.mockClear();
+  tauriWindowMock.onMoved.mockReset();
+  tauriWindowMock.onMoved.mockImplementation(async (_handler: unknown) => vi.fn());
   tauriCoreMock.invoke.mockReset();
   cleanup();
   vi.unstubAllGlobals();
@@ -67,9 +81,85 @@ describe("StatusPanelView", () => {
     const panel = screen.getByRole("main");
     const statusRows = within(panel).getAllByRole("article");
 
-    expect(screen.getByText("attn")).toBeTruthy();
+    expect(screen.getByText("Attn")).toBeTruthy();
+    expect(screen.queryByText("$")).toBeNull();
     expect(statusRows).toHaveLength(3);
     expect(screen.getByText(/quiet/)).toBeTruthy();
+  });
+
+  it("shows source evidence from an info control beside the workspace name", () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "evidence-row",
+      label: "Evidence row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+      evidenceSummary: "JSONL task_complete at 2026-06-06T04:24:30.041Z",
+      lastActivityAt: "2026-06-06T04:24:30.041Z",
+    };
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.queryByRole("tooltip")).toBeNull();
+
+    const infoButton = screen.getByLabelText("Show status evidence for Evidence row");
+
+    fireEvent.click(infoButton);
+
+    const tooltip = screen.getByRole("tooltip");
+    expect(tooltip.getAttribute("tabindex")).toBe("0");
+    expect(tooltip.textContent).toContain("Status: completed task ready to inspect; open it to mark read");
+    expect(tooltip.textContent).toContain("Evidence: JSONL task_complete at 2026-06-06T04:24:30.041Z");
+    expect(tooltip.textContent).toContain("Last activity: 2026-06-06T04:24:30.041Z");
+    expect(tooltip.textContent).toContain("Jump target: desktop");
+    expect(tooltip.textContent).toContain("Confidence: exact");
+
+    fireEvent.click(infoButton);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("closes source evidence when clicking outside but keeps it open inside the popover", () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "evidence-outside",
+      label: "Evidence outside row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+      evidenceSummary: "JSONL task_complete at 2026-06-06T04:24:30.041Z",
+    };
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(screen.getByLabelText("Show status evidence for Evidence outside row"));
+    const tooltip = screen.getByRole("tooltip");
+
+    fireEvent.pointerDown(tooltip);
+    expect(screen.getByRole("tooltip")).toBeTruthy();
+
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("keeps wheel scrolling inside the evidence popover", () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "evidence-wheel",
+      label: "Evidence wheel row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+      evidenceSummary: "JSONL task_complete at 2026-06-06T04:24:30.041Z",
+    };
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(screen.getByLabelText("Show status evidence for Evidence wheel row"));
+    const tooltip = screen.getByRole("tooltip");
+    const wheelEvent = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 30 });
+    const stopped = vi.spyOn(wheelEvent, "stopPropagation");
+
+    tooltip.dispatchEvent(wheelEvent);
+
+    expect(stopped).toHaveBeenCalled();
   });
 
   it("does not expand hidden quiet rows into the attention panel", () => {
@@ -120,6 +210,77 @@ describe("StatusPanelView", () => {
 
     expect(screen.queryByLabelText("Visible items")).toBeNull();
     expect(screen.queryByRole("button", { name: "Manage settings" })).toBeNull();
+  });
+
+  it("starts native window dragging from the panel header", () => {
+    const { container } = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    const header = container.querySelector(".panel-header");
+
+    expect(header).toBeTruthy();
+    fireEvent.pointerDown(header as Element, { button: 0 });
+
+    expect(tauriWindowMock.startDragging).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores a persisted panel position on mount", async () => {
+    window.localStorage.setItem("attn.panelPosition", JSON.stringify({ x: 144, y: 88 }));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(tauriWindowMock.setPosition).toHaveBeenCalledWith(expect.objectContaining({
+        x: 144,
+        y: 88,
+      }));
+    });
+  });
+
+  it("persists the panel position after the native window moves", async () => {
+    let movedHandler: ((event: { payload: { x: number; y: number } }) => void) | undefined;
+    tauriWindowMock.onMoved.mockImplementation(async (handler) => {
+      movedHandler = handler as (event: { payload: { x: number; y: number } }) => void;
+      return vi.fn();
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(movedHandler).toBeTruthy();
+    });
+
+    movedHandler?.({ payload: { x: 256, y: 192 } });
+
+    expect(window.localStorage.getItem("attn.panelPosition")).toBe(JSON.stringify({ x: 256, y: 192 }));
+  });
+
+  it("grants native window movement permissions to the single panel window", () => {
+    // @ts-expect-error This test reads local config without adding Node types to the app build.
+    const capability = JSON.parse(readFileSync(join(process.cwd(), "src-tauri/capabilities/default.json"), "utf8"));
+
+    expect(capability.windows).toEqual(["main"]);
+    expect(capability.permissions).toEqual(expect.arrayContaining([
+      "core:window:allow-set-position",
+      "core:window:allow-start-dragging",
+    ]));
+  });
+
+  it("lets macOS Dock desktop assignment control where the panel appears", () => {
+    // @ts-expect-error This test reads local config without adding Node types to the app build.
+    const tauriConfig = JSON.parse(readFileSync(join(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"));
+    // @ts-expect-error This test reads local source without adding Node types to the app build.
+    const tauriLib = readFileSync(join(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
+
+    expect(tauriConfig.app.windows[0].visibleOnAllWorkspaces).not.toBe(true);
+    expect(tauriLib).not.toContain("set_visible_on_all_workspaces(true)");
+  });
+
+  it("does not create extra panel windows for secondary displays", () => {
+    // @ts-expect-error This test reads local source without adding Node types to the app build.
+    const tauriLib = readFileSync(join(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
+
+    expect(tauriLib).not.toContain("panel-display-");
+    expect(tauriLib).not.toContain("All Displays");
+    expect(tauriLib).not.toContain("Current Display");
   });
 
   it("keeps long real session titles inside the status rows", () => {
@@ -371,10 +532,37 @@ describe("StatusPanelView", () => {
     });
   });
 
+  it("sizes the transparent window to the actual rendered row count", async () => {
+    const rows: SessionRow[] = [
+      {
+        ...initialSessions[0],
+        sessionId: "single-row",
+        label: "Single visible row",
+        state: "inspect",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") return jsonResponse(rows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 156,
+        width: 560,
+      }));
+    });
+  });
+
   it("uses small Atom status markers", () => {
     const rows: SessionRow[] = [
       { ...initialSessions[0], sessionId: "blocked", state: "unknown", statusReason: "source status unavailable" },
-      { ...initialSessions[0], sessionId: "needed", state: "needsAttention", statusReason: "waiting for user input" },
+      { ...initialSessions[0], sessionId: "input", state: "waitingForInput", statusReason: "waiting for user input" },
       { ...initialSessions[0], sessionId: "inspect", state: "inspect", statusReason: "ready to inspect" },
       { ...initialSessions[0], sessionId: "working", state: "running", statusReason: "running signal observed" },
       { ...initialSessions[0], sessionId: "idle", state: "idle", statusReason: "completed task observed; idle until the next source signal" },
@@ -385,16 +573,16 @@ describe("StatusPanelView", () => {
       element.textContent?.replace(/\s+/g, " ").trim(),
     );
 
-    expect(statusTexts).toEqual(["● blocked", "● inspect", "● follow-up"]);
+    expect(statusTexts).toEqual(["● blocked", "● input", "● inspect"]);
   });
 
   it("keeps an opened intervention row as needed during the read window", async () => {
     const attentionRow: SessionRow = {
       ...initialSessions[0],
       sessionId: "needs-input",
-      state: "needsAttention",
+      state: "inspect",
       confidence: "exact",
-      statusReason: "waiting for user input",
+      statusReason: "completed task ready to inspect; open it to mark read",
     };
     const confirmedRow: SessionRow = {
       ...attentionRow,
@@ -427,11 +615,17 @@ describe("StatusPanelView", () => {
 
     render(<StatusPanelView initialRows={[attentionRow]} sourceHealth={fakeSourceHealth} />);
 
-    expect(await screen.findByText("follow-up")).toBeTruthy();
+    expect(await screen.findByText("inspect")).toBeTruthy();
 
     fireEvent.click(screen.getByTitle("Jump back"));
 
-    expect(await screen.findByTitle("Read recently; keep in needed state until 30 minutes pass.")).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Show status evidence for AMap geolocation preload investigation")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByLabelText("Show status evidence for AMap geolocation preload investigation"));
+    expect(screen.getByRole("tooltip").textContent).toContain(
+      "Status: Read recently; keep in needed state until 30 minutes pass.",
+    );
     expect(screen.getByText("follow-up")).toBeTruthy();
   });
 
@@ -525,6 +719,23 @@ describe("StatusPanelView", () => {
     expect(css).toContain(".status-row--attention-cue");
     expect(css).toContain("animation: inspect-attention-cue 1800ms ease-out both;");
     expect(css).toContain("@keyframes inspect-attention-sweep");
+  });
+
+  it("allows the evidence popover to escape the status content clipping area", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const statusContentBlock = css.match(/\.status-content \{[^}]+\}/)?.[0];
+
+    expect(statusContentBlock).toBeTruthy();
+    expect(statusContentBlock).not.toContain("overflow: hidden");
+    expect(css).toContain(".status-evidence-popover");
+    expect(css).toContain("position: absolute;");
+    expect(css).toContain("max-height: 160px;");
+    expect(css).toContain("overflow-y: auto;");
+    expect(css).toContain("overscroll-behavior: contain;");
+    expect(css).toContain("scrollbar-width: thin;");
+    expect(css).toContain(".status-row:last-child .status-evidence-popover");
+    expect(css).toContain("bottom: calc(100% + 5px);");
   });
 });
 

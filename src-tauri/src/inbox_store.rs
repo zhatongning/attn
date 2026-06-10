@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::domain::classification::classify_observation;
 use crate::domain::confidence::Confidence;
 use crate::domain::dismissability::evaluate_dismissability;
-use crate::codex_source::{discover_codex_observation_by_id, discover_codex_observations};
+use crate::codex_source::{discover_codex_observation_by_id, discover_codex_observations, parse_utc_timestamp};
 use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
 use crate::domain::source_health::{SourceCapability, SourceHealth, SourceStatus};
 
 const SESSION_ROWS_CACHE_TTL: Duration = Duration::from_millis(5500);
+const PENDING_CLI_INPUT_FRESHNESS: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +36,11 @@ enum JumpCommandPlan {
         activate_bundle_id: String,
     },
     ITermActivate { tty: String, live_codex: bool },
+    ITermResume {
+        thread_id: String,
+        workspace_path: String,
+        tty: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -125,7 +131,7 @@ impl InboxStore {
             .into_iter()
             .map(|observation| {
                 let mut row = classify_observation(observation);
-                row = apply_live_cli_activity_signal(row, live_cli_tty_for_row);
+                row = apply_live_cli_activity_signal(row, live_cli_tty_for_row, SystemTime::now());
                 let dismissability = evaluate_dismissability(&row);
                 let jump_availability = if row.workspace_path.is_some() {
                     if matches!(row.jump_target, JumpTarget::Desktop) {
@@ -230,37 +236,30 @@ impl InboxStore {
             }
         }
         let message = match availability {
-            JumpAvailability::Exact | JumpAvailability::Approximate => match (target, plan, execution) {
-                (
-                    JumpTarget::Desktop | JumpTarget::Unknown,
-                    Some(JumpCommandPlan::CodexDesktop { .. }),
-                    Some(Ok(())),
-                ) => {
+            JumpAvailability::Exact | JumpAvailability::Approximate => match (plan, execution) {
+                (Some(JumpCommandPlan::CodexDesktop { .. }), Some(Ok(()))) => {
                     "Opened Codex Desktop session.".to_string()
                 }
                 (
-                    JumpTarget::Cli,
                     Some(JumpCommandPlan::ITermActivate {
                         live_codex: true, ..
                     }),
                     Some(Ok(())),
-                ) => {
-                    "Focused live iTerm Codex session.".to_string()
-                }
+                ) => "Focused live iTerm Codex session.".to_string(),
                 (
-                    JumpTarget::Cli,
                     Some(JumpCommandPlan::ITermActivate {
                         live_codex: false,
                         ..
                     }),
                     Some(Ok(())),
-                ) => {
-                    "Focused previous iTerm session.".to_string()
+                ) => "Focused previous iTerm session.".to_string(),
+                (Some(JumpCommandPlan::ITermResume { tty: Some(_), .. }), Some(Ok(()))) => {
+                    "Resumed Codex session in previous iTerm tab.".to_string()
                 }
-                (JumpTarget::Cli, Some(JumpCommandPlan::CodexDesktop { .. }), Some(Ok(()))) => {
-                    "Opened Codex Desktop session.".to_string()
+                (Some(JumpCommandPlan::ITermResume { tty: None, .. }), Some(Ok(()))) => {
+                    "Started iTerm Codex resume session.".to_string()
                 }
-                (_, _, Some(Err(error))) => format!("Jump-back failed: {error}"),
+                (_, Some(Err(error))) => format!("Jump-back failed: {error}"),
                 _ => "Jump-back unavailable: missing reliable target signal.".to_string(),
             }
             JumpAvailability::Unavailable => {
@@ -293,13 +292,14 @@ impl InboxStore {
     }
 
     fn fast_session_row_for_jump(&self, session_id: &str) -> Option<SessionRow> {
+        let now = SystemTime::now();
         let observation = discover_codex_observation_by_id(
             &codex_state_db_path(),
             session_id,
-            std::time::SystemTime::now(),
+            now,
         )?;
         let mut row = classify_observation(observation);
-        row = apply_live_cli_activity_signal(row, live_cli_tty_for_row);
+        row = apply_live_cli_activity_signal(row, live_cli_tty_for_row, now);
         let jump_availability = if row.workspace_path.is_some() {
             if matches!(row.jump_target, JumpTarget::Desktop) {
                 JumpAvailability::Exact
@@ -357,7 +357,10 @@ fn apply_acknowledged_session_state(
         return row;
     };
 
-    if matches!(row.state, SessionState::Running | SessionState::Idle) {
+    if matches!(
+        row.state,
+        SessionState::Running | SessionState::Idle | SessionState::WaitingForInput
+    ) {
         return row;
     }
 
@@ -401,7 +404,7 @@ fn apply_dismissed_session_state(
         return row;
     }
 
-    if matches!(row.state, SessionState::Running | SessionState::NeedsAttention) {
+    if matches!(row.state, SessionState::Running) {
         row.mark_restored()
     } else {
         row.mark_dismissed()
@@ -418,7 +421,27 @@ fn live_cli_tty_for_row(row: &SessionRow) -> Option<String> {
 fn apply_live_cli_activity_signal(
     row: SessionRow,
     live_tty_for_row: impl FnOnce(&SessionRow) -> Option<String>,
+    now: SystemTime,
 ) -> SessionRow {
+    if matches!(row.state, SessionState::WaitingForInput) && matches!(row.jump_target, JumpTarget::Cli) {
+        let has_live_tty = live_tty_for_row(&row).is_some();
+        if has_live_tty && row_has_fresh_activity(&row, now, PENDING_CLI_INPUT_FRESHNESS) {
+            return row;
+        }
+        let status_reason = if has_live_tty {
+            "Pending CLI input is stale; idle until the next source signal."
+        } else {
+            "No live Codex CLI process for pending input; idle until the next source signal."
+        };
+
+        return SessionRow {
+            state: SessionState::Idle,
+            confidence: Confidence::Inferred,
+            status_reason: status_reason.to_string(),
+            ..row
+        };
+    }
+
     if !matches!(row.state, SessionState::Unknown) || !matches!(row.jump_target, JumpTarget::Cli) {
         return row;
     }
@@ -435,58 +458,60 @@ fn apply_live_cli_activity_signal(
     }
 }
 
+fn row_has_fresh_activity(row: &SessionRow, now: SystemTime, freshness: Duration) -> bool {
+    row.last_activity_at
+        .as_deref()
+        .and_then(parse_utc_timestamp)
+        .and_then(|last_activity| now.duration_since(last_activity).ok())
+        .is_some_and(|age| age <= freshness)
+}
+
 fn build_jump_command_plan(row: &SessionRow) -> Option<JumpCommandPlan> {
-    let (live_tty, previous_iterm_tty) = match (row.jump_target, row.workspace_path.as_deref()) {
-        (JumpTarget::Cli, Some(workspace_path)) => {
-            let live_tty = find_live_codex_tty_for_workspace(workspace_path);
-            let previous_iterm_tty = if live_tty.is_none() {
+    let Some(workspace_path) = row.workspace_path.as_deref() else {
+        return build_jump_command_plan_with_cli_context(row, None, None);
+    };
+
+    let (live_tty, resume_tty) = find_live_codex_tty_for_workspace(workspace_path).map_or_else(
+        || {
+            let resume_tty = if matches!(row.jump_target, JumpTarget::Cli) {
                 find_previous_iterm_tty_for_workspace(workspace_path)
             } else {
                 None
             };
-            (live_tty, previous_iterm_tty)
-        }
-        _ => (None, None),
-    };
+            (None, resume_tty)
+        },
+        |tty| (Some(tty), None),
+    );
 
-    build_jump_command_plan_with_cli_ttys(row, live_tty, previous_iterm_tty)
+    build_jump_command_plan_with_cli_context(row, live_tty, resume_tty)
 }
 
-fn build_jump_command_plan_with_cli_ttys(
+fn build_jump_command_plan_with_cli_context(
     row: &SessionRow,
     live_tty: Option<String>,
-    previous_iterm_tty: Option<String>,
+    resume_tty: Option<String>,
 ) -> Option<JumpCommandPlan> {
     let workspace_path = row.workspace_path.clone()?;
 
+    if let Some(tty) = live_tty {
+        return Some(JumpCommandPlan::ITermActivate {
+            tty,
+            live_codex: true,
+        });
+    };
+
     match row.jump_target {
-        JumpTarget::Desktop | JumpTarget::Unknown => {
-            Some(JumpCommandPlan::CodexDesktop {
-                thread_id: row.session_id.clone(),
-                deeplink_url: codex_thread_deeplink(&row.session_id),
-                workspace_path,
-                activate_bundle_id: codex_bundle_id().to_string(),
-            })
-        }
-        JumpTarget::Cli => live_tty
-            .map(|tty| JumpCommandPlan::ITermActivate {
-                tty,
-                live_codex: true,
-            })
-            .or_else(|| {
-                previous_iterm_tty.map(|tty| JumpCommandPlan::ITermActivate {
-                    tty,
-                    live_codex: false,
-                })
-            })
-            .or_else(|| {
-                Some(JumpCommandPlan::CodexDesktop {
-                    thread_id: row.session_id.clone(),
-                    deeplink_url: codex_thread_deeplink(&row.session_id),
-                    workspace_path,
-                    activate_bundle_id: codex_bundle_id().to_string(),
-                })
-            }),
+        JumpTarget::Desktop | JumpTarget::Unknown => Some(JumpCommandPlan::CodexDesktop {
+            thread_id: row.session_id.clone(),
+            deeplink_url: codex_thread_deeplink(&row.session_id),
+            workspace_path,
+            activate_bundle_id: codex_bundle_id().to_string(),
+        }),
+        JumpTarget::Cli => Some(JumpCommandPlan::ITermResume {
+            thread_id: row.session_id.clone(),
+            workspace_path,
+            tty: resume_tty,
+        }),
     }
 }
 
@@ -508,6 +533,11 @@ fn execute_jump_command_plan(plan: JumpCommandPlan) -> Result<(), String> {
             )
         }
         JumpCommandPlan::ITermActivate { tty, .. } => activate_iterm_tty(&tty),
+        JumpCommandPlan::ITermResume {
+            thread_id,
+            workspace_path,
+            tty,
+        } => open_iterm_codex_resume(&workspace_path, &thread_id, tty.as_deref()),
     }
 }
 
@@ -710,7 +740,71 @@ end timeout"#,
     );
 
     run_command_with_timeout("osascript", &["-e", &script], Duration::from_secs(4))
-        .or_else(|_| activate_app("com.googlecode.iterm2"))
+}
+
+fn open_iterm_codex_resume(
+    workspace_path: &str,
+    thread_id: &str,
+    tty: Option<&str>,
+) -> Result<(), String> {
+    let command = format!(
+        "cd {} && codex resume {}",
+        shell_single_quote(workspace_path),
+        shell_single_quote(thread_id),
+    );
+
+    let script = if let Some(tty) = tty {
+        let tty_path = if tty.starts_with("/dev/") {
+            tty.to_string()
+        } else {
+            format!("/dev/{tty}")
+        };
+        format!(
+            r#"with timeout of 5 seconds
+tell application id "com.googlecode.iterm2"
+activate
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+try
+set sessionTty to tty of s as text
+if sessionTty is {quoted_tty} or sessionTty is {quoted_tty_path} then
+select w
+select t
+select s
+write text {quoted_command}
+return "resumed"
+end if
+end try
+end repeat
+end repeat
+end repeat
+set newWindow to (create window with default profile)
+tell current session of newWindow
+write text {quoted_command}
+end tell
+end tell
+end timeout"#,
+            quoted_tty = applescript_string_literal(tty),
+            quoted_tty_path = applescript_string_literal(&tty_path),
+            quoted_command = applescript_string_literal(&command)
+        )
+    } else {
+        format!(
+            r#"with timeout of 5 seconds
+tell application id "com.googlecode.iterm2"
+activate
+set newWindow to (create window with default profile)
+tell current session of newWindow
+write text {quoted_command}
+end tell
+end tell
+end timeout"#,
+            quoted_command = applescript_string_literal(&command)
+        )
+    };
+
+    run_command_with_timeout("osascript", &["-e", &script], Duration::from_secs(6))
 }
 
 fn codex_cli_path() -> PathBuf {
@@ -803,6 +897,10 @@ fn applescript_string_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn codex_sessions_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -839,6 +937,7 @@ fn current_time_millis() -> u64 {
 mod tests {
     use std::collections::HashSet;
     use std::fs;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use crate::domain::confidence::Confidence;
     use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
@@ -861,7 +960,12 @@ mod tests {
         let Some(session_id) = store
             .list_sessions()
             .into_iter()
-            .find(|row| !matches!(row.state, SessionState::Running | SessionState::NeedsAttention))
+            .find(|row| {
+                !matches!(
+                    row.state,
+                    SessionState::Running | SessionState::NeedsAttention | SessionState::WaitingForInput
+                )
+            })
             .map(|row| row.session_id)
         else {
             return;
@@ -913,13 +1017,35 @@ mod tests {
     }
 
     #[test]
+    fn live_cli_terminal_takes_precedence_over_desktop_jump_plan_for_same_workspace() {
+        let row = SessionRow::new("s1", "Desktop row", SessionState::Running, Confidence::Exact)
+            .with_workspace(Some("/Users/edy/project-a".to_string()))
+            .with_jump_availability(JumpAvailability::Exact)
+            .with_jump_target(JumpTarget::Desktop);
+
+        let plan = super::build_jump_command_plan_with_cli_context(
+            &row,
+            Some("ttys009".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            plan,
+            Some(super::JumpCommandPlan::ITermActivate {
+                tty: "ttys009".to_string(),
+                live_codex: true
+            })
+        );
+    }
+
+    #[test]
     fn cli_sessions_with_live_tty_build_iterm_activate_jump_plan() {
         let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-b".to_string()))
             .with_jump_availability(JumpAvailability::Approximate)
             .with_jump_target(JumpTarget::Cli);
 
-        let plan = super::build_jump_command_plan_with_cli_ttys(
+        let plan = super::build_jump_command_plan_with_cli_context(
             &row,
             Some("ttys008".to_string()),
             None,
@@ -935,13 +1061,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_sessions_without_live_tty_use_previous_iterm_terminal_before_desktop() {
+    fn cli_sessions_without_live_tty_resume_exact_session_in_previous_iterm_item() {
         let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-b".to_string()))
             .with_jump_availability(JumpAvailability::Approximate)
             .with_jump_target(JumpTarget::Cli);
 
-        let plan = super::build_jump_command_plan_with_cli_ttys(
+        let plan = super::build_jump_command_plan_with_cli_context(
             &row,
             None,
             Some("ttys002".to_string()),
@@ -949,29 +1075,29 @@ mod tests {
 
         assert_eq!(
             plan,
-            Some(super::JumpCommandPlan::ITermActivate {
-                tty: "ttys002".to_string(),
-                live_codex: false
+            Some(super::JumpCommandPlan::ITermResume {
+                thread_id: "s2".to_string(),
+                workspace_path: "/Users/edy/project-b".to_string(),
+                tty: Some("ttys002".to_string()),
             })
         );
     }
 
     #[test]
-    fn cli_sessions_without_any_terminal_fall_back_to_desktop_deeplink_jump_plan() {
+    fn cli_sessions_without_any_terminal_resume_in_new_iterm_item() {
         let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-b".to_string()))
             .with_jump_availability(JumpAvailability::Approximate)
             .with_jump_target(JumpTarget::Cli);
 
-        let plan = super::build_jump_command_plan_with_cli_ttys(&row, None, None);
+        let plan = super::build_jump_command_plan_with_cli_context(&row, None, None);
 
         assert_eq!(
             plan,
-            Some(super::JumpCommandPlan::CodexDesktop {
+            Some(super::JumpCommandPlan::ITermResume {
                 thread_id: "s2".to_string(),
                 workspace_path: "/Users/edy/project-b".to_string(),
-                deeplink_url: "codex://threads/s2".to_string(),
-                activate_bundle_id: "com.openai.codex".to_string()
+                tty: None,
             })
         );
     }
@@ -1052,13 +1178,28 @@ mod tests {
     }
 
     #[test]
+    fn iterm_activation_failure_is_reported_instead_of_only_activating_app() {
+        let result = super::run_command_with_timeout(
+            "osascript",
+            &["-e", "error \"missing target tty\""],
+            std::time::Duration::from_secs(1),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn unknown_cli_rows_with_live_process_signal_are_promoted_to_running() {
         let row = SessionRow::new("s4", "CLI row", SessionState::Unknown, Confidence::Unknown)
             .with_workspace(Some("/Users/edy/project-d".to_string()))
             .with_reason("missing source evidence for status classification")
             .with_jump_target(JumpTarget::Cli);
 
-        let row = super::apply_live_cli_activity_signal(row, |_| Some("ttys008".to_string()));
+        let row = super::apply_live_cli_activity_signal(
+            row,
+            |_| Some("ttys008".to_string()),
+            UNIX_EPOCH + Duration::from_secs(1_780_720_000),
+        );
 
         assert_eq!(row.state, SessionState::Running);
         assert_eq!(row.confidence, Confidence::Inferred);
@@ -1066,7 +1207,79 @@ mod tests {
     }
 
     #[test]
-    fn dismissed_inspect_rows_stay_hidden_until_they_run_again() {
+    fn stale_cli_waiting_for_input_without_live_process_is_idle() {
+        let row = SessionRow::new(
+            "s9",
+            "CLI waiting row",
+            SessionState::WaitingForInput,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_reason("waiting for user input")
+        .with_evidence_summary(Some("Codex is waiting for tool approval: git pull".to_string()))
+        .with_jump_target(JumpTarget::Cli);
+
+        let row = super::apply_live_cli_activity_signal(
+            row,
+            |_| None,
+            UNIX_EPOCH + Duration::from_secs(1_780_720_000),
+        );
+
+        assert_eq!(row.state, SessionState::Idle);
+        assert_eq!(row.confidence, Confidence::Inferred);
+        assert!(row.status_reason.contains("No live Codex CLI process"));
+    }
+
+    #[test]
+    fn fresh_cli_waiting_for_input_with_live_process_stays_waiting() {
+        let row = SessionRow::new(
+            "s10",
+            "CLI waiting row",
+            SessionState::WaitingForInput,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_reason("waiting for user input")
+        .with_last_activity("2026-06-06T04:05:00.000Z")
+        .with_jump_target(JumpTarget::Cli);
+
+        let row = super::apply_live_cli_activity_signal(
+            row,
+            |_| Some("ttys008".to_string()),
+            UNIX_EPOCH + Duration::from_secs(1_780_719_000),
+        );
+
+        assert_eq!(row.state, SessionState::WaitingForInput);
+        assert_eq!(row.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn stale_cli_waiting_for_input_with_live_process_is_idle() {
+        let row = SessionRow::new(
+            "s11",
+            "CLI waiting row",
+            SessionState::WaitingForInput,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_reason("waiting for user input")
+        .with_last_activity("2026-06-06T04:05:00.000Z")
+        .with_evidence_summary(Some("Codex is waiting for tool approval: git pull".to_string()))
+        .with_jump_target(JumpTarget::Cli);
+
+        let row = super::apply_live_cli_activity_signal(
+            row,
+            |_| Some("ttys008".to_string()),
+            UNIX_EPOCH + Duration::from_secs(1_780_720_801),
+        );
+
+        assert_eq!(row.state, SessionState::Idle);
+        assert_eq!(row.confidence, Confidence::Inferred);
+        assert!(row.status_reason.contains("Pending CLI input is stale"));
+    }
+
+    #[test]
+    fn dismissed_attention_rows_stay_hidden_until_they_run_again() {
         let dismissed_session_ids = HashSet::from(["s5".to_string()]);
         let inspect_row =
             SessionRow::new("s5", "Inspect row", SessionState::Inspect, Confidence::Exact);
@@ -1074,14 +1287,18 @@ mod tests {
             SessionRow::new("s5", "Running row", SessionState::Running, Confidence::Exact);
         let attention_row =
             SessionRow::new("s5", "Input row", SessionState::NeedsAttention, Confidence::Exact);
+        let input_row =
+            SessionRow::new("s5", "Waiting row", SessionState::WaitingForInput, Confidence::Exact);
 
         let inspect_row = super::apply_dismissed_session_state(inspect_row, &dismissed_session_ids);
         let running_row = super::apply_dismissed_session_state(running_row, &dismissed_session_ids);
         let attention_row = super::apply_dismissed_session_state(attention_row, &dismissed_session_ids);
+        let input_row = super::apply_dismissed_session_state(input_row, &dismissed_session_ids);
 
         assert!(inspect_row.dismissed);
         assert!(!running_row.dismissed);
-        assert!(!attention_row.dismissed);
+        assert!(attention_row.dismissed);
+        assert!(input_row.dismissed);
     }
 
     #[test]
@@ -1173,6 +1390,30 @@ mod tests {
 
         assert_eq!(changed_row.state, SessionState::Inspect);
         assert!(!changed_row.handled);
+    }
+
+    #[test]
+    fn acknowledged_waiting_for_input_rows_stay_waiting_for_input() {
+        let row = SessionRow::new(
+            "s8",
+            "Waiting row",
+            SessionState::WaitingForInput,
+            Confidence::Exact,
+        )
+        .with_reason("waiting for user input")
+        .with_last_activity("2026-06-08T07:20:00.000Z");
+        let acknowledged_at_ms = 1_780_000_000_000;
+        let acknowledged = HashSet::from([super::AcknowledgedSignal::from_row_at(&row, acknowledged_at_ms)]);
+
+        let confirmed_row = super::apply_acknowledged_session_state(
+            row,
+            &acknowledged,
+            acknowledged_at_ms + 29 * 60 * 1000,
+        );
+
+        assert_eq!(confirmed_row.state, SessionState::WaitingForInput);
+        assert_eq!(confirmed_row.status_reason, "waiting for user input");
+        assert!(!confirmed_row.handled);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 export type Confidence = "exact" | "inferred" | "unknown" | "unavailable";
-export type SessionState = "needsAttention" | "inspect" | "running" | "idle" | "unknown" | "dismissable";
+export type SessionState = "needsAttention" | "waitingForInput" | "inspect" | "running" | "idle" | "unknown" | "dismissable";
 export type JumpAvailability = "exact" | "approximate" | "unavailable";
 export type JumpTarget = "desktop" | "cli" | "unknown";
 
@@ -10,6 +10,7 @@ export interface SessionRow {
   projectName?: string;
   workspacePath?: string;
   lastActivityAt?: string;
+  evidenceSummary?: string;
   state: SessionState;
   confidence: Confidence;
   statusReason: string;

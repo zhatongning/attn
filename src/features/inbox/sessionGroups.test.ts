@@ -18,6 +18,7 @@ describe("groupSessions", () => {
   it("groups visible sessions by state and excludes dismissed rows", () => {
     const groups = groupSessions([
       baseRow,
+      { ...baseRow, sessionId: "s0", state: "waitingForInput" },
       { ...baseRow, sessionId: "s2", state: "unknown" },
       { ...baseRow, sessionId: "s3", state: "dismissable" },
       { ...baseRow, sessionId: "s4", state: "idle" },
@@ -25,6 +26,7 @@ describe("groupSessions", () => {
     ]);
 
     expect(groups.needsAttention).toHaveLength(1);
+    expect(groups.waitingForInput).toHaveLength(1);
     expect(groups.unknown).toHaveLength(1);
     expect(groups.dismissable).toHaveLength(1);
     expect(groups.idle).toHaveLength(1);

@@ -130,15 +130,19 @@ p {
   padding: 0 8px;
 }
 
+.panel-header--draggable {
+  cursor: grab;
+  user-select: none;
+}
+
+.panel-header--draggable:active {
+  cursor: grabbing;
+}
+
 .panel-title {
   flex: 1 1 auto;
   gap: 7px;
   min-width: 0;
-}
-
-.panel-prompt {
-  color: #98c379;
-  flex: 0 0 auto;
 }
 
 .panel-title h1 {
@@ -197,6 +201,7 @@ p {
   min-height: 42px;
   min-width: 0;
   padding: 6px 7px 6px 8px;
+  position: relative;
 }
 
 .status-row--blocked {
@@ -305,11 +310,9 @@ p {
 
 .status-content {
   min-width: 0;
-  overflow: hidden;
 }
 
-.status-content h2,
-.status-content p {
+.status-content h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -321,7 +324,7 @@ p {
   font-weight: 650;
 }
 
-.status-content p {
+.status-meta {
   align-items: center;
   color: #7f848e;
   display: flex;
@@ -329,15 +332,84 @@ p {
   gap: 7px;
   margin-top: 2px;
   min-width: 0;
+  overflow: visible;
+  position: relative;
 }
 
-.status-content p span {
+.status-workspace {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-confidence {
   border: 1px solid #3b4048;
   border-radius: 999px;
   color: #abb2bf;
   flex: 0 0 auto;
   font-size: 10px;
   padding: 0 5px;
+}
+
+.status-evidence-anchor {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.status-info {
+  background: #252931;
+  border: 1px solid #4b5263;
+  border-radius: 999px;
+  color: #7f848e;
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 700;
+  height: 14px;
+  min-width: 14px;
+  padding: 0;
+  position: relative;
+}
+
+.status-info:hover,
+.status-info:focus-visible {
+  background: #2c313a;
+  border-color: #61afef;
+  color: #d7dae0;
+}
+
+.status-evidence-popover {
+  background: #1b1f27;
+  border: 1px solid #3b4048;
+  border-radius: 5px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34);
+  color: #abb2bf;
+  display: grid;
+  font-size: 10px;
+  gap: 3px;
+  left: 0;
+  line-height: 1.35;
+  max-height: 160px;
+  max-width: min(360px, calc(100vw - 42px));
+  overscroll-behavior: contain;
+  overflow-y: auto;
+  padding: 8px 9px;
+  position: absolute;
+  scrollbar-width: thin;
+  top: calc(100% + 5px);
+  -webkit-overflow-scrolling: touch;
+  white-space: normal;
+  width: max-content;
+  z-index: 10;
+}
+
+.status-evidence-popover span:first-child {
+  color: #d7dae0;
+}
+
+.status-row:last-child .status-evidence-popover {
+  bottom: calc(100% + 5px);
+  top: auto;
 }
 
 .status-actions {

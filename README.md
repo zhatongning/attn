@@ -11,7 +11,10 @@ Mac local attention panel for agent sessions that need intervention.
 - Routes jump-back to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for the same workspace.
 - Reads local Codex threads from `~/.codex/state_5.sqlite`, uses JSONL files under `~/.codex/sessions` as durable event evidence, can consume compact Codex hook events from `~/.codex/agent-session-inbox/hook-events.jsonl`, and refreshes the inbox every 5 seconds.
 - Shows settings from the macOS app menu. The panel itself does not render a settings button.
-- Floats above other windows and is configured to appear on all macOS Spaces.
+- Floats above other windows as a single panel window. macOS Dock `Options -> Assign To` controls which Desktop/Display owns the panel; Attn does not create duplicate panels for secondary displays.
+- Supports moving the panel by dragging the header, persists the dragged position, and keeps app-menu `Position` commands for quick corner placement.
+
+See [Window Placement](docs/window-placement.md) for the current macOS Spaces and display behavior.
 
 ## Status Tokens
 

@@ -34,6 +34,13 @@ struct CodexHookSignal {
     workspace_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingToolApproval {
+    call_id: Option<String>,
+    timestamp: Option<String>,
+    evidence_summary: String,
+}
+
 pub fn discover_codex_observations(sessions_root: &Path, limit: usize) -> Vec<SourceObservation> {
     let state_db = codex_state_db_path();
     if state_db.exists() {
@@ -65,10 +72,9 @@ pub fn discover_codex_observations_with_state_db_and_hooks(
     limit: usize,
     now: SystemTime,
 ) -> Vec<SourceObservation> {
-    let threads = discover_threads_from_state_db(state_db, limit);
-    if threads.is_empty() {
+    let Some(threads) = discover_threads_from_state_db(state_db, limit) else {
         return discover_codex_observations_with_now(sessions_root, limit, now);
-    }
+    };
 
     let hook_signals = load_latest_hook_signals(hook_events_path);
 
@@ -188,6 +194,7 @@ fn parse_session_content(
     let mut task_completed_at = None;
     let mut last_activity_kind = ObservationKind::InsufficientEvidence;
     let mut last_agent_message = None;
+    let mut pending_tool_approval = None;
 
     for line in content
         .lines()
@@ -236,6 +243,9 @@ fn parse_session_content(
                         .and_then(Value::as_str)
                         .and_then(parse_utc_timestamp)
                         .or(task_completed_at);
+                } else if event_type == Some("turn_aborted") {
+                    pending_tool_approval = None;
+                    last_activity_kind = ObservationKind::Running;
                 } else if matches!(event_type, Some("user_message" | "agent_message")) {
                     last_activity_kind = ObservationKind::Running;
                 }
@@ -252,6 +262,23 @@ fn parse_session_content(
                         }
                     } else {
                         last_agent_message = Some(message.to_string());
+                    }
+                }
+            }
+            Some("response_item") => {
+                if let Some(approval) = pending_tool_approval_from_response_item(&value) {
+                    last_activity_kind = ObservationKind::WaitingForInput;
+                    pending_tool_approval = Some(approval);
+                } else if response_item_payload_type(&value) == Some("function_call_output") {
+                    if let Some(call_id) = response_item_call_id(&value) {
+                        let resolves_pending_approval = pending_tool_approval
+                            .as_ref()
+                            .and_then(|approval: &PendingToolApproval| approval.call_id.as_deref())
+                            .is_some_and(|pending_call_id| pending_call_id == call_id);
+                        if resolves_pending_approval {
+                            pending_tool_approval = None;
+                            last_activity_kind = ObservationKind::Running;
+                        }
                     }
                 }
             }
@@ -276,7 +303,9 @@ fn parse_session_content(
                 .map(|last_activity| last_activity.duration_since(tracking_start).is_ok())
         })
         .unwrap_or(false);
-    let kind = if matches!(last_activity_kind, ObservationKind::Completed) {
+    let kind = if pending_tool_approval.is_some() {
+        ObservationKind::WaitingForInput
+    } else if matches!(last_activity_kind, ObservationKind::Completed) {
         if is_tracked_unread_completion {
             ObservationKind::CompletedImmediate
         } else {
@@ -300,8 +329,10 @@ fn parse_session_content(
         .or_else(|| project_name.as_ref().map(|name| format!("Codex: {name}")))
         .unwrap_or_else(|| format!("Codex session {session_id}"));
 
-    let evidence_summary = last_agent_message
-        .map(|message| truncate_for_summary(&message, 120))
+    let evidence_summary = pending_tool_approval
+        .as_ref()
+        .map(|approval| approval.evidence_summary.clone())
+        .or_else(|| last_agent_message.map(|message| truncate_for_summary(&message, 120)))
         .or_else(|| Some("local Codex JSONL activity observed".to_string()));
 
     let mut observation = SourceObservation::new(session_id, kind)
@@ -320,7 +351,11 @@ fn parse_session_content(
         observation = observation.with_workspace(cwd);
     }
 
-    if let Some(timestamp) = latest_timestamp {
+    if let Some(timestamp) = pending_tool_approval
+        .as_ref()
+        .and_then(|approval| approval.timestamp.clone())
+        .or(latest_timestamp)
+    {
         observation = observation.with_last_activity(timestamp);
     }
 
@@ -338,7 +373,68 @@ fn should_parse_session_status_line(line: &str) -> bool {
         && (line.contains("\"type\":\"session_meta\"")
             || line.contains("\"type\": \"session_meta\"")
             || line.contains("\"type\":\"event_msg\"")
-            || line.contains("\"type\": \"event_msg\""))
+            || line.contains("\"type\": \"event_msg\"")
+            || ((line.contains("\"type\":\"response_item\"")
+                || line.contains("\"type\": \"response_item\""))
+                && (line.contains("\"type\":\"function_call\"")
+                    || line.contains("\"type\": \"function_call\"")
+                    || line.contains("\"type\":\"function_call_output\"")
+                    || line.contains("\"type\": \"function_call_output\""))))
+}
+
+fn pending_tool_approval_from_response_item(value: &Value) -> Option<PendingToolApproval> {
+    if response_item_payload_type(value) != Some("function_call") {
+        return None;
+    }
+
+    let payload = value.get("payload")?;
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())?;
+
+    if arguments
+        .get("sandbox_permissions")
+        .and_then(Value::as_str)
+        != Some("require_escalated")
+    {
+        return None;
+    }
+
+    let tool_name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let requested_action = arguments
+        .get("cmd")
+        .and_then(Value::as_str)
+        .map(|command| truncate_for_summary(command.trim(), 120))
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| tool_name.to_string());
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    Some(PendingToolApproval {
+        call_id: response_item_call_id(value).map(ToString::to_string),
+        timestamp,
+        evidence_summary: format!("Codex is waiting for tool approval: {requested_action}"),
+    })
+}
+
+fn response_item_payload_type(value: &Value) -> Option<&str> {
+    value
+        .get("payload")
+        .and_then(|payload| payload.get("type"))
+        .and_then(Value::as_str)
+}
+
+fn response_item_call_id(value: &Value) -> Option<&str> {
+    value
+        .get("payload")
+        .and_then(|payload| payload.get("call_id"))
+        .and_then(Value::as_str)
 }
 
 #[derive(Debug, Clone)]
@@ -355,9 +451,9 @@ struct ThreadSummary {
     preview: Option<String>,
 }
 
-fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Vec<ThreadSummary> {
+fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Option<Vec<ThreadSummary>> {
     let query = format!(
-        "{} from threads order by coalesce(updated_at_ms, updated_at * 1000) desc limit {};",
+        "{} from threads where archived = 0 order by coalesce(updated_at_ms, updated_at * 1000) desc limit {};",
         thread_summary_json_select(),
         limit
     );
@@ -368,17 +464,17 @@ fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Vec<ThreadSu
         .arg(query)
         .output()
     else {
-        return Vec::new();
+        return None;
     };
 
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
 
-    String::from_utf8_lossy(&output.stdout)
+    Some(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_thread_summary_json)
-        .collect()
+        .collect())
 }
 
 fn discover_thread_from_state_db_by_id(state_db: &Path, session_id: &str) -> Option<ThreadSummary> {
@@ -471,7 +567,13 @@ fn observation_from_thread(
     let jsonl_observation = parsed_jsonl.as_ref().map(|parsed| &parsed.observation);
     let jump_target = jsonl_observation
         .as_ref()
-        .map(|observation| observation.jump_target)
+        .and_then(|observation| {
+            if matches!(observation.jump_target, JumpTarget::Unknown) {
+                None
+            } else {
+                Some(observation.jump_target)
+            }
+        })
         .unwrap_or_else(|| jump_target_from_thread_source(&thread));
     let thread_updated_at = thread
         .updated_at_ms
@@ -797,7 +899,7 @@ fn truncate_for_summary(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn parse_utc_timestamp(value: &str) -> Option<SystemTime> {
+pub(crate) fn parse_utc_timestamp(value: &str) -> Option<SystemTime> {
     let (date, time) = value.split_once('T')?;
     let mut date_parts = date.split('-');
     let year = date_parts.next()?.parse::<i32>().ok()?;
@@ -1105,6 +1207,129 @@ mod tests {
         assert_eq!(
             rows[0].last_activity_at.as_deref(),
             Some("2026-06-03T03:30:00.000Z")
+        );
+    }
+
+    #[test]
+    fn command_approval_prompt_marks_desktop_and_cli_sessions_waiting_for_input() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/06");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-06T12-00-00-019desktop-approval.jsonl"),
+            r#"{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-approval","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"build desktop\n"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need network access\"}","call_id":"call_desktop"}}"#
+                + "\n",
+        )
+        .expect("desktop session file");
+        fs::write(
+            session_dir.join("rollout-2026-06-06T12-00-00-019cli-approval.jsonl"),
+            r#"{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019cli-approval","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"build cli\n"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:06:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need network access\"}","call_id":"call_cli"}}"#
+                + "\n",
+        )
+        .expect("cli session file");
+
+        let mut rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_720_000),
+        );
+        rows.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_id, "019cli-approval");
+        assert_eq!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[0].jump_target, JumpTarget::Cli);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-06T04:06:00.000Z")
+        );
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("Codex is waiting for tool approval: npm run build")
+        );
+        assert_eq!(rows[1].session_id, "019desktop-approval");
+        assert_eq!(rows[1].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[1].jump_target, JumpTarget::Desktop);
+        assert_eq!(
+            rows[1].last_activity_at.as_deref(),
+            Some("2026-06-06T04:05:00.000Z")
+        );
+    }
+
+    #[test]
+    fn command_approval_output_clears_waiting_for_input() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/06");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-06T12-00-00-019approval-cleared.jsonl"),
+            r#"{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019approval-cleared","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need network access\"}","call_id":"call_cli"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:06:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_cli","output":"approved"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_720_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-06T04:06:00.000Z")
+        );
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("local Codex JSONL activity observed")
+        );
+    }
+
+    #[test]
+    fn interrupted_command_approval_is_not_left_waiting_for_input() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/06");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-06T12-00-00-019approval-interrupted.jsonl"),
+            r#"{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019approval-interrupted","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git pull --ff-only origin develop\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_pending"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-06T04:06:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_720_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("local Codex JSONL activity observed")
         );
     }
 
@@ -1473,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn old_archived_threads_without_completion_evidence_are_idle() {
+    fn archived_threads_are_excluded_from_discovery() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let session_dir = temp.path().join("2026/05/26");
@@ -1509,8 +1734,7 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_646_400),
         );
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, ObservationKind::CompletedStale);
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -1599,6 +1823,43 @@ mod tests {
         assert_eq!(row.workspace_path.as_deref(), Some("/Users/edy/target"));
         assert_eq!(row.kind, ObservationKind::Running);
         assert_eq!(row.jump_target, JumpTarget::Desktop);
+    }
+
+    #[test]
+    fn sqlite_cli_thread_keeps_cli_jump_target_when_tail_lacks_session_meta() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let rollout_path = temp
+            .path()
+            .join("rollout-2026-06-06T12-00-00-019tail-cli-input.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git pull --ff-only origin develop\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_cli"}}"#
+                .to_string()
+                + "\n",
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(format!(
+                "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
+                 values ('019tail-cli-input', '{}', 1780718400, 1780718700, 'cli', 'OpenAI', '/Users/edy/project-cli', 'CLI pending input', '{{\"type\":\"disabled\"}}', 'never', 1780718700000, 'user', 'CLI pending input');",
+                rollout_path.display()
+            ))
+            .status()
+            .expect("insert thread");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_720_801),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[0].jump_target, JumpTarget::Cli);
     }
 
     fn create_threads_table(state_db: &std::path::Path) {

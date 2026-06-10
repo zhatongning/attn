@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "explain:session": "node scripts/explainCodexSession.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
