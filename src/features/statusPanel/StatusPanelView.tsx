@@ -23,7 +23,6 @@ const PANEL_BASE_VISIBLE_ITEMS = 3;
 const PANEL_EXTRA_ROW_HEIGHT = 48;
 const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PANEL_EXTRA_ROW_HEIGHT;
 const PANEL_STRIP_HEIGHT = 60;
-const AUTO_EXPAND_MS = 8000;
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
@@ -45,7 +44,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [hookInstallPending, setHookInstallPending] = useState(false);
   const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss">>({});
   const [attentionCues, setAttentionCues] = useState<Record<string, boolean>>({});
-  const [panelOpen, setPanelOpen] = useState(false);
+  const [panelOpen, setPanelOpen] = useState(config.panelMode === "persistent");
   const alertSignatureRef = useRef<string | null>(null);
   const autoCollapseTimerRef = useRef<number | undefined>(undefined);
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
@@ -311,6 +310,38 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             />
           </label>
 
+          <label className="setting-field">
+            <span>Panel display</span>
+            <select
+              aria-label="Panel display"
+              value={draftConfig.panelMode}
+              onChange={(event) =>
+                updateDraftConfig((current) => ({ ...current, panelMode: event.target.value as StatusPanelConfig["panelMode"] }))
+              }
+            >
+              <option value="auto">Auto collapse</option>
+              <option value="persistent">Persistent</option>
+            </select>
+          </label>
+
+          <label className="setting-field">
+            <span>Alert display seconds</span>
+            <input
+              aria-label="Alert display seconds"
+              type="number"
+              min={1}
+              max={120}
+              value={Math.round(draftConfig.autoCollapseDelayMs / 1000)}
+              disabled={draftConfig.panelMode === "persistent"}
+              onChange={(event) => {
+                const nextSeconds = Number(event.target.value);
+                if (!Number.isNaN(nextSeconds)) {
+                  updateDraftConfig((current) => ({ ...current, autoCollapseDelayMs: nextSeconds * 1000 }));
+                }
+              }}
+            />
+          </label>
+
           <fieldset className="status-color-settings">
             <legend>Status colors</legend>
             <ColorField
@@ -474,6 +505,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   function applyDraftConfig() {
     const nextConfig = normalizeConfig(draftConfigRef.current);
     setConfig(nextConfig);
+    setPanelOpen(nextConfig.panelMode === "persistent");
     updateDraftConfig(nextConfig);
     setView("panel");
   }
@@ -510,11 +542,16 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }
 
   function openPanelTemporarily() {
+    if (configRef.current.panelMode === "persistent") {
+      setPanelOpen(true);
+      return;
+    }
+
     clearAutoCollapseTimer();
     setPanelOpen(true);
     autoCollapseTimerRef.current = window.setTimeout(() => {
       setPanelOpen(false);
-    }, AUTO_EXPAND_MS);
+    }, configRef.current.autoCollapseDelayMs);
   }
 
   function clearAutoCollapseTimer() {
@@ -763,12 +800,17 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
   const visibleItemCount = typeof value.visibleItemCount === "number"
     ? Math.min(8, Math.max(1, value.visibleItemCount))
     : defaultStatusPanelConfig.visibleItemCount;
+  const autoCollapseDelayMs = typeof value.autoCollapseDelayMs === "number"
+    ? Math.min(120000, Math.max(1000, value.autoCollapseDelayMs))
+    : defaultStatusPanelConfig.autoCollapseDelayMs;
 
   return {
     styleFamily: value.styleFamily === "atom" ? value.styleFamily : defaultStatusPanelConfig.styleFamily,
     palette: value.palette === "oneDark" ? value.palette : defaultStatusPanelConfig.palette,
     language: value.language === "zh" ? "zh" : "en",
     visibleItemCount,
+    panelMode: value.panelMode === "persistent" ? "persistent" : "auto",
+    autoCollapseDelayMs,
     statusColors: {
       blocked: colorValue(statusColors.blocked, defaultStatusPanelConfig.statusColors.blocked),
       input: colorValue(statusColors.input, defaultStatusPanelConfig.statusColors.input),

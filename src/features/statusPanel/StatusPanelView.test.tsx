@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 // @ts-expect-error This test reads local CSS without adding Node types to the app build.
 import { readFileSync } from "node:fs";
@@ -48,6 +48,7 @@ vi.mock("@tauri-apps/api/dpi", () => ({
 }));
 
 afterEach(() => {
+  vi.useRealTimers();
   window.localStorage.clear();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   tauriWindowMock.setSize.mockClear();
@@ -134,6 +135,82 @@ describe("StatusPanelView", () => {
       expect(screen.getByText("New inspect row")).toBeTruthy();
     });
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
+  });
+
+  it("auto-collapses after the configured alert display duration", async () => {
+    const firstRows = initialSessions.filter((row) => row.state !== "needsAttention");
+    const nextRows = [
+      ...firstRows,
+      {
+        ...initialSessions[0],
+        sessionId: "timed-inspect-row",
+        label: "Timed inspect row",
+        state: "inspect" as const,
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") return jsonResponse(nextRows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+    const originalSetTimeout = window.setTimeout.bind(window);
+    let autoCollapseCallback: (() => void) | undefined;
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (timeout === 8000 && typeof handler === "function") {
+        autoCollapseCallback = () => handler();
+        return 8000;
+      }
+
+      return originalSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+
+    render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Timed inspect row")).toBeTruthy();
+    });
+    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 8000);
+
+    await act(async () => {
+      autoCollapseCallback?.();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("main").className).toContain("panel-shell--collapsed");
+    });
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("persists panel display behavior after management confirmation", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByLabelText("Panel display")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Panel display"), { target: { value: "persistent" } });
+    fireEvent.change(screen.getByLabelText("Alert display seconds"), { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
+    rendered.unmount();
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
+
+    const persistedConfig = JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
+    expect(persistedConfig.panelMode).toBe("persistent");
+    expect(persistedConfig.autoCollapseDelayMs).toBe(12000);
   });
 
   it("shows source evidence from an info control beside the workspace name", () => {
@@ -580,6 +657,7 @@ describe("StatusPanelView", () => {
     handler?.({ payload: "management" });
     fireEvent.change(await screen.findByLabelText("Visible items"), { target: { value: "5" } });
     fireEvent.click(await screen.findByRole("button", { name: "Apply settings" }));
+    expandPanel();
     await waitFor(() => {
       expect(screen.getAllByRole("article")).toHaveLength(5);
     });

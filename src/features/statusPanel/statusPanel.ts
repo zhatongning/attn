@@ -7,6 +7,8 @@ export interface StatusPanelConfig {
   palette: "oneDark";
   language: "en" | "zh";
   visibleItemCount: number;
+  panelMode: "auto" | "persistent";
+  autoCollapseDelayMs: number;
   statusColors: Record<InterventionStatus, string>;
 }
 
@@ -60,6 +62,8 @@ export const defaultStatusPanelConfig: StatusPanelConfig = {
   palette: "oneDark",
   language: "en",
   visibleItemCount: 3,
+  panelMode: "auto",
+  autoCollapseDelayMs: 8000,
   statusColors: {
     blocked: "#e06c75",
     input: "#c678dd",

@@ -51,6 +51,11 @@ describe("buildStatusPanelModel", () => {
     expect(model.quietHiddenCount).toBe(1);
   });
 
+  it("defaults to an auto-collapsing panel that stays open for eight seconds after alerts", () => {
+    expect(defaultStatusPanelConfig.panelMode).toBe("auto");
+    expect(defaultStatusPanelConfig.autoCollapseDelayMs).toBe(8000);
+  });
+
   it("uses the configured visible item count from management settings", () => {
     const model = buildStatusPanelModel(
       [
