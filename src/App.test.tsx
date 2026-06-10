@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import App from "./App";
 import { StatusPanelView } from "./features/statusPanel/StatusPanelView";
@@ -14,6 +14,7 @@ describe("App", () => {
 
     expect(screen.queryByText("AMap geolocation preload investigation")).toBeNull();
     expect(screen.queryByText("Codex: wmhcar")).toBeNull();
+    expandPanel();
     expect(screen.getByText("no active Codex sessions")).toBeTruthy();
   });
 
@@ -39,9 +40,14 @@ describe("App", () => {
     );
 
     expect(screen.queryByText("Codex: wmhcar")).toBeNull();
+    expandPanel();
     expect(screen.getByText("no active Codex sessions")).toBeTruthy();
   });
 });
+
+function expandPanel() {
+  fireEvent.click(screen.getByRole("button", { name: "Expand status panel" }));
+}
 
 const baseRow: SessionRow = {
   sessionId: "s1",

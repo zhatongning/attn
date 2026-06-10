@@ -77,6 +77,7 @@ describe("StatusPanelView", () => {
         sourceHealth={fakeSourceHealth}
       />,
     );
+    expandPanel();
 
     const panel = screen.getByRole("main");
     const statusRows = within(panel).getAllByRole("article");
@@ -85,6 +86,54 @@ describe("StatusPanelView", () => {
     expect(screen.queryByText("$")).toBeNull();
     expect(statusRows).toHaveLength(3);
     expect(screen.getByText(/quiet/)).toBeTruthy();
+  });
+
+  it("starts collapsed as a compact status strip", () => {
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.getByRole("main").className).toContain("panel-shell--collapsed");
+    expect(screen.queryByRole("article")).toBeNull();
+    expect(screen.getByText("Attn")).toBeTruthy();
+    expect(screen.getByText("1 alerts")).toBeTruthy();
+  });
+
+  it("expands the compact strip when clicked", () => {
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand status panel" }));
+
+    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+  });
+
+  it("auto-expands when a new attention row appears after refresh", async () => {
+    const firstRows = initialSessions.filter((row) => row.state !== "needsAttention");
+    const nextRows = [
+      ...firstRows,
+      {
+        ...initialSessions[0],
+        sessionId: "new-inspect-row",
+        label: "New inspect row",
+        state: "inspect" as const,
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") {
+        return jsonResponse(nextRows);
+      }
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
+    expect(screen.queryByRole("article")).toBeNull();
+
+    await waitFor(() => {
+      expect(screen.getByText("New inspect row")).toBeTruthy();
+    });
+    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
   });
 
   it("shows source evidence from an info control beside the workspace name", () => {
@@ -99,6 +148,7 @@ describe("StatusPanelView", () => {
     };
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     expect(screen.queryByRole("tooltip")).toBeNull();
 
@@ -129,6 +179,7 @@ describe("StatusPanelView", () => {
     };
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     fireEvent.click(screen.getByLabelText("Show status evidence for Evidence outside row"));
     const tooltip = screen.getByRole("tooltip");
@@ -151,6 +202,7 @@ describe("StatusPanelView", () => {
     };
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     fireEvent.click(screen.getByLabelText("Show status evidence for Evidence wheel row"));
     const tooltip = screen.getByRole("tooltip");
@@ -198,6 +250,7 @@ describe("StatusPanelView", () => {
         sourceHealth={fakeSourceHealth}
       />,
     );
+    expandPanel();
 
     fireEvent.click(screen.getByText(/\+\d+ quiet/));
 
@@ -296,6 +349,7 @@ describe("StatusPanelView", () => {
         sourceHealth={fakeSourceHealth}
       />,
     );
+    expandPanel();
 
     expect(screen.getByText("收到一个工单反馈用车详情页面太卡，主要是地图没法进行缩放展示。这里有一段非常长的真实标题")).toBeTruthy();
   });
@@ -317,6 +371,7 @@ describe("StatusPanelView", () => {
         sourceHealth={fakeSourceHealth}
       />,
     );
+    expandPanel();
 
     expect(screen.getByText("agent-session-inbox")).toBeTruthy();
     expect(screen.queryByText("running signal observed")).toBeNull();
@@ -389,6 +444,7 @@ describe("StatusPanelView", () => {
     fireEvent.click(screen.getByText("Back"));
 
     expect(screen.getByText("1 alerts")).toBeTruthy();
+    expandPanel();
     expect(screen.getByText("follow-up")).toBeTruthy();
 
     handler?.({ payload: "management" });
@@ -398,6 +454,7 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("1 需关注")).toBeTruthy();
     expect(screen.getByText("1 进行中")).toBeTruthy();
     expect(screen.getByText("1 空闲")).toBeTruthy();
+    expandPanel();
     expect(screen.getByText("待跟进")).toBeTruthy();
   });
 
@@ -462,6 +519,7 @@ describe("StatusPanelView", () => {
     rendered.unmount();
 
     render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     expect(screen.getByText("1 需关注")).toBeTruthy();
     expect(screen.getByText("待跟进")).toBeTruthy();
@@ -511,6 +569,7 @@ describe("StatusPanelView", () => {
     }));
 
     render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
     expect(screen.getAllByRole("article")).toHaveLength(3);
 
     handler?.({ payload: "management" });
@@ -553,6 +612,13 @@ describe("StatusPanelView", () => {
 
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 60,
+        width: 560,
+      }));
+    });
+    expandPanel();
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
         height: 156,
         width: 560,
       }));
@@ -568,6 +634,7 @@ describe("StatusPanelView", () => {
       { ...initialSessions[0], sessionId: "idle", state: "idle", statusReason: "completed task observed; idle until the next source signal" },
     ];
     const { container } = render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     const statusTexts = Array.from(container.querySelectorAll(".status-code")).map((element) =>
       element.textContent?.replace(/\s+/g, " ").trim(),
@@ -614,6 +681,7 @@ describe("StatusPanelView", () => {
     }));
 
     render(<StatusPanelView initialRows={[attentionRow]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     expect(await screen.findByText("inspect")).toBeTruthy();
 
@@ -645,6 +713,7 @@ describe("StatusPanelView", () => {
     }));
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     fireEvent.click(screen.getByTitle("Dismiss"));
 
@@ -672,6 +741,7 @@ describe("StatusPanelView", () => {
     }));
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     const jumpButton = screen.getByTitle("Jump back");
     fireEvent.click(jumpButton);
@@ -692,6 +762,7 @@ describe("StatusPanelView", () => {
 
   it("uses styled SVG action icons instead of text glyphs", () => {
     render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
 
     const jumpButton = screen.getAllByTitle("Jump back")[0];
     const dismissButton = screen.getAllByTitle("Dismiss")[0];
@@ -738,6 +809,13 @@ describe("StatusPanelView", () => {
     expect(css).toContain("bottom: calc(100% + 5px);");
   });
 });
+
+function expandPanel() {
+  const expandButton = screen.queryByRole("button", { name: "Expand status panel" });
+  if (expandButton) {
+    fireEvent.click(expandButton);
+  }
+}
 
 function jsonResponse(payload: unknown, status = 200) {
   return new Response(JSON.stringify(payload), {

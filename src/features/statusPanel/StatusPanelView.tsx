@@ -22,6 +22,8 @@ const PANEL_BASE_HEIGHT = 252;
 const PANEL_BASE_VISIBLE_ITEMS = 3;
 const PANEL_EXTRA_ROW_HEIGHT = 48;
 const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PANEL_EXTRA_ROW_HEIGHT;
+const PANEL_STRIP_HEIGHT = 60;
+const AUTO_EXPAND_MS = 8000;
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
@@ -43,8 +45,18 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [hookInstallPending, setHookInstallPending] = useState(false);
   const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss">>({});
   const [attentionCues, setAttentionCues] = useState<Record<string, boolean>>({});
+  const [panelOpen, setPanelOpen] = useState(false);
+  const alertSignatureRef = useRef<string | null>(null);
+  const autoCollapseTimerRef = useRef<number | undefined>(undefined);
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
+  const alertSignature = useMemo(() => {
+    return [...model.visibleRows, ...model.hiddenRows]
+      .filter((row) => row.statusTone === "alert")
+      .map((row) => `${row.sessionId}:${row.displayStatus}:${row.lastActivityAt ?? ""}`)
+      .sort()
+      .join("|");
+  }, [model.hiddenRows, model.visibleRows]);
   const previousDisplayStatusRef = useRef<Record<string, string>>({});
 
   async function refreshPanel() {
@@ -123,8 +135,32 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }, []);
 
   useEffect(() => {
-    void resizePanelWindow(view === "management" ? MANAGEMENT_HEIGHT : panelWindowHeight(displayedRows.length));
-  }, [displayedRows.length, view]);
+    const nextHeight = view === "management"
+      ? MANAGEMENT_HEIGHT
+      : panelOpen
+        ? panelWindowHeight(displayedRows.length)
+        : PANEL_STRIP_HEIGHT;
+    void resizePanelWindow(nextHeight);
+  }, [displayedRows.length, panelOpen, view]);
+
+  useEffect(() => {
+    const previousSignature = alertSignatureRef.current;
+    alertSignatureRef.current = alertSignature;
+
+    if (previousSignature === null || previousSignature === alertSignature) {
+      return;
+    }
+
+    if (alertSignature.length > 0) {
+      openPanelTemporarily();
+    }
+  }, [alertSignature]);
+
+  useEffect(() => {
+    return () => {
+      clearAutoCollapseTimer();
+    };
+  }, []);
 
   useEffect(() => {
     const previousDisplayStatuses = previousDisplayStatusRef.current;
@@ -330,7 +366,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }
 
   return (
-    <main className="panel-shell" data-theme={`${model.theme.styleFamily}-${model.theme.palette}`}>
+    <main
+      className={`panel-shell${panelOpen ? "" : " panel-shell--collapsed"}`}
+      data-theme={`${model.theme.styleFamily}-${model.theme.palette}`}
+    >
       <header className="panel-header panel-header--draggable" onPointerDown={startPanelDrag}>
         <div className="panel-title">
           <h1>Attn</h1>
@@ -340,54 +379,67 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           <span>{model.workingCount} {model.copy.workingLabel}</span>
           <span>{model.idleCount} {model.copy.idleLabel}</span>
         </div>
+        <button
+          type="button"
+          className="strip-toggle"
+          data-no-window-drag
+          aria-label={panelOpen ? "Collapse status panel" : "Expand status panel"}
+          onClick={() => setManualPanelOpen(!panelOpen)}
+        >
+          {panelOpen ? "-" : "+"}
+        </button>
       </header>
 
-      <section
-        className={`status-list${expanded ? " status-list--expanded" : ""}`}
-        aria-label="Codex status panel"
-      >
-        {displayedRows.length === 0 ? (
-          <p className="empty-panel">no active Codex sessions</p>
-        ) : (
-          displayedRows.map((row) => (
-            <StatusRow
-              key={row.sessionId}
-              row={row}
-              pendingAction={pendingActions[row.sessionId]}
-              attentionCue={attentionCues[row.sessionId] === true}
-              onJump={jumpToSession}
-              onDismiss={dismissSession}
-            />
-          ))
-        )}
-      </section>
-
-      <footer className="panel-footer">
-        <span className={`source-dot source-dot--${health.status}`} />
-        <span>{health.sourceName}</span>
-        <span>{health.status}</span>
-        <span>local data</span>
-        {model.hiddenCount > 0 ? (
-          <button
-            type="button"
-            className="hidden-toggle"
-            disabled={model.expandableHiddenCount === 0}
-            onClick={() => {
-              if (model.expandableHiddenCount > 0) {
-                setExpanded((value) => !value);
-              }
-            }}
+      {panelOpen ? (
+        <>
+          <section
+            className={`status-list${expanded ? " status-list--expanded" : ""}`}
+            aria-label="Codex status panel"
           >
-            {expanded ? model.copy.collapseLabel : hiddenToggleLabel()}
-          </button>
-        ) : null}
-      </footer>
+            {displayedRows.length === 0 ? (
+              <p className="empty-panel">no active Codex sessions</p>
+            ) : (
+              displayedRows.map((row) => (
+                <StatusRow
+                  key={row.sessionId}
+                  row={row}
+                  pendingAction={pendingActions[row.sessionId]}
+                  attentionCue={attentionCues[row.sessionId] === true}
+                  onJump={jumpToSession}
+                  onDismiss={dismissSession}
+                />
+              ))
+            )}
+          </section>
 
-      {(commandMessage || errorMessage) && (
-        <div className="panel-message" role="status">
-          {errorMessage ?? commandMessage}
-        </div>
-      )}
+          <footer className="panel-footer">
+            <span className={`source-dot source-dot--${health.status}`} />
+            <span>{health.sourceName}</span>
+            <span>{health.status}</span>
+            <span>local data</span>
+            {model.hiddenCount > 0 ? (
+              <button
+                type="button"
+                className="hidden-toggle"
+                disabled={model.expandableHiddenCount === 0}
+                onClick={() => {
+                  if (model.expandableHiddenCount > 0) {
+                    setExpanded((value) => !value);
+                  }
+                }}
+              >
+                {expanded ? model.copy.collapseLabel : hiddenToggleLabel()}
+              </button>
+            ) : null}
+          </footer>
+
+          {(commandMessage || errorMessage) && (
+            <div className="panel-message" role="status">
+              {errorMessage ?? commandMessage}
+            </div>
+          )}
+        </>
+      ) : null}
     </main>
   );
 
@@ -450,6 +502,28 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }
 
     return `+${model.expandableHiddenCount}`;
+  }
+
+  function setManualPanelOpen(nextOpen: boolean) {
+    clearAutoCollapseTimer();
+    setPanelOpen(nextOpen);
+  }
+
+  function openPanelTemporarily() {
+    clearAutoCollapseTimer();
+    setPanelOpen(true);
+    autoCollapseTimerRef.current = window.setTimeout(() => {
+      setPanelOpen(false);
+    }, AUTO_EXPAND_MS);
+  }
+
+  function clearAutoCollapseTimer() {
+    if (autoCollapseTimerRef.current === undefined) {
+      return;
+    }
+
+    window.clearTimeout(autoCollapseTimerRef.current);
+    autoCollapseTimerRef.current = undefined;
   }
 }
 

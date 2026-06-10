@@ -110,6 +110,11 @@ p {
   width: min(100vw - 12px, 540px);
 }
 
+.panel-shell--collapsed {
+  grid-template-rows: 30px;
+  padding: 6px;
+}
+
 .panel-header,
 .panel-title,
 .panel-counters,
@@ -163,6 +168,14 @@ p {
   margin-left: auto;
   min-width: 0;
   white-space: nowrap;
+}
+
+.strip-toggle {
+  color: #7f848e;
+  flex: 0 0 auto;
+  height: 22px;
+  min-width: 22px;
+  padding: 0;
 }
 
 .icon-button {
