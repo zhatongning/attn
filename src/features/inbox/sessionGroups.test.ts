@@ -21,6 +21,7 @@ describe("groupSessions", () => {
       { ...baseRow, sessionId: "s0", state: "waitingForInput" },
       { ...baseRow, sessionId: "s2", state: "unknown" },
       { ...baseRow, sessionId: "s3", state: "dismissable" },
+      { ...baseRow, sessionId: "s6", state: "stopped" },
       { ...baseRow, sessionId: "s4", state: "idle" },
       { ...baseRow, sessionId: "s5", state: "running", dismissed: true },
     ]);
@@ -29,6 +30,7 @@ describe("groupSessions", () => {
     expect(groups.waitingForInput).toHaveLength(1);
     expect(groups.unknown).toHaveLength(1);
     expect(groups.dismissable).toHaveLength(1);
+    expect(groups.stopped).toHaveLength(1);
     expect(groups.idle).toHaveLength(1);
     expect(groups.running).toHaveLength(0);
   });

@@ -245,7 +245,7 @@ fn parse_session_content(
                         .or(task_completed_at);
                 } else if event_type == Some("turn_aborted") {
                     pending_tool_approval = None;
-                    last_activity_kind = ObservationKind::Running;
+                    last_activity_kind = ObservationKind::Stopped;
                 } else if matches!(event_type, Some("user_message" | "agent_message")) {
                     last_activity_kind = ObservationKind::Running;
                 }
@@ -311,6 +311,8 @@ fn parse_session_content(
         } else {
             ObservationKind::CompletedStale
         }
+    } else if matches!(last_activity_kind, ObservationKind::Stopped) {
+        ObservationKind::Stopped
     } else if matches!(last_activity_kind, ObservationKind::Running) && is_recent {
         ObservationKind::Running
     } else if is_recent {
@@ -1302,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_command_approval_is_not_left_waiting_for_input() {
+    fn interrupted_command_approval_is_stopped() {
         let temp = tempdir().expect("temp dir");
         let session_dir = temp.path().join("2026/06/06");
         fs::create_dir_all(&session_dir).expect("session dir");
@@ -1326,7 +1328,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_ne!(rows[0].kind, ObservationKind::WaitingForInput);
-        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(rows[0].kind, ObservationKind::Stopped);
         assert_eq!(
             rows[0].evidence_summary.as_deref(),
             Some("local Codex JSONL activity observed")

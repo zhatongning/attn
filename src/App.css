@@ -112,7 +112,6 @@ p {
 
 .panel-shell--collapsed {
   grid-template-rows: 30px;
-  padding: 6px;
 }
 
 .panel-header,
@@ -174,8 +173,10 @@ p {
   color: #7f848e;
   flex: 0 0 auto;
   height: 22px;
+  line-height: 20px;
   min-width: 22px;
   padding: 0;
+  width: 22px;
 }
 
 .icon-button {
@@ -196,6 +197,7 @@ p {
   gap: 6px;
   min-width: 0;
   overflow: hidden;
+  padding-left: 4px;
 }
 
 .status-list--expanded {
@@ -204,17 +206,35 @@ p {
 
 .status-row {
   --row-border-color: #323844;
+  --status-accent-width: 3px;
   background: #252931;
   border: 1px solid var(--row-border-color);
-  border-left: 3px solid var(--status-color);
   border-radius: 6px;
   display: grid;
   gap: 9px;
-  grid-template-columns: 82px minmax(0, 1fr) auto;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
   min-height: 42px;
   min-width: 0;
-  padding: 6px 7px 6px 8px;
+  padding: 6px 7px 6px 12px;
   position: relative;
+  width: calc(100% - 4px);
+  z-index: 0;
+}
+
+.status-row--evidence-open {
+  z-index: 20;
+}
+
+.status-row::before {
+  background: var(--status-color);
+  border-radius: 999px;
+  bottom: 6px;
+  content: "";
+  left: 1px;
+  pointer-events: none;
+  position: absolute;
+  top: 6px;
+  width: var(--status-accent-width);
 }
 
 .status-row--blocked {
@@ -228,8 +248,13 @@ p {
 }
 
 .status-row--inspect {
-  --row-border-color: #2b4150;
-  background: #202832;
+  --row-border-color: #31536b;
+  background: #222d39;
+}
+
+.status-row--stopped {
+  --row-border-color: #5a3d27;
+  background: #2d2924;
 }
 
 .status-row--attention-cue {
@@ -291,8 +316,13 @@ p {
 
 .status-row--working {
   --status-color: #98c379;
-  --row-border-color: #334334;
-  background: #232b28;
+  --row-border-color: #2f3a34;
+  background: #24292e;
+  border-left-color: var(--status-color);
+}
+
+.status-row--working::before {
+  content: none;
 }
 
 .status-row--idle {
@@ -306,11 +336,14 @@ p {
 }
 
 .status-code {
+  align-items: center;
   color: var(--status-color);
+  display: flex;
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0;
   line-height: 1;
+  min-width: 76px;
   text-align: left;
   text-transform: lowercase;
   white-space: nowrap;
@@ -318,7 +351,7 @@ p {
 
 .status-code span {
   font-size: 10px;
-  margin-right: 5px;
+  margin-right: 8px;
 }
 
 .status-content {
@@ -583,6 +616,43 @@ p {
   color: #d7dae0;
   font-size: 12px;
   padding: 0 4px;
+}
+
+.status-checkbox-settings {
+  border: 1px solid #3b4048;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  min-width: 0;
+  padding: 8px;
+}
+
+.status-checkbox-settings legend {
+  color: #d7dae0;
+  font-size: 12px;
+  padding: 0 4px;
+}
+
+.status-checkbox-grid {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.status-checkbox-field {
+  align-items: center;
+  color: #abb2bf;
+  display: flex;
+  font-size: 12px;
+  gap: 6px;
+  min-width: 0;
+}
+
+.status-checkbox-field span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .management-actions {

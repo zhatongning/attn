@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -126,30 +126,40 @@ impl InboxStore {
             .acknowledged_signals
             .lock()
             .expect("acknowledged signal store lock poisoned");
+        let now = SystemTime::now();
+        let now_ms = current_time_millis();
+        let live_cli_sessions = find_live_codex_cli_sessions();
 
-        discover_codex_observations(&codex_sessions_root(), 80)
+        let rows = discover_codex_observations(&codex_sessions_root(), 80)
             .into_iter()
             .map(|observation| {
                 let mut row = classify_observation(observation);
-                row = apply_live_cli_activity_signal(row, live_cli_tty_for_row, SystemTime::now());
-                let dismissability = evaluate_dismissability(&row);
-                let jump_availability = if row.workspace_path.is_some() {
-                    if matches!(row.jump_target, JumpTarget::Desktop) {
-                        JumpAvailability::Exact
-                    } else {
-                        JumpAvailability::Approximate
-                    }
-                } else {
-                    JumpAvailability::Unavailable
-                };
-                row = row
-                    .with_dismissability_reason(Some(dismissability.reason))
-                    .with_jump_availability(jump_availability);
-
-                row = apply_acknowledged_session_state(row, &acknowledged_signals, current_time_millis());
-                apply_dismissed_session_state(row, &dismissed_session_ids)
+                row = apply_live_cli_activity_signal(
+                    row,
+                    |row| live_cli_tty_for_row_from_sessions(row, &live_cli_sessions),
+                    now,
+                );
+                row
             })
-            .collect()
+            .collect();
+        let rows = merge_live_cli_sessions_with_row_builder(rows, live_cli_sessions, |live_session| {
+            live_cli_session_row(live_session, now)
+        });
+
+        let mut rows = rows
+            .into_iter()
+            .map(|row| {
+                finalize_session_row(
+                    row,
+                    &acknowledged_signals,
+                    &dismissed_session_ids,
+                    now_ms,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(compare_session_rows_for_store);
+        rows.truncate(80);
+        rows
     }
 
     pub fn dismiss_session(&self, session_id: &str) -> Vec<SessionRow> {
@@ -293,13 +303,23 @@ impl InboxStore {
 
     fn fast_session_row_for_jump(&self, session_id: &str) -> Option<SessionRow> {
         let now = SystemTime::now();
+        let live_cli_sessions = find_live_codex_cli_sessions();
         let observation = discover_codex_observation_by_id(
             &codex_state_db_path(),
             session_id,
             now,
         )?;
         let mut row = classify_observation(observation);
-        row = apply_live_cli_activity_signal(row, live_cli_tty_for_row, now);
+        row = apply_live_cli_activity_signal(
+            row,
+            |row| live_cli_tty_for_row_from_sessions(row, &live_cli_sessions),
+            now,
+        );
+        row = merge_live_cli_sessions_with_row_builder(vec![row], live_cli_sessions, |live_session| {
+            live_cli_session_row(live_session, now)
+        })
+        .into_iter()
+        .find(|row| row.session_id == session_id)?;
         let jump_availability = if row.workspace_path.is_some() {
             if matches!(row.jump_target, JumpTarget::Desktop) {
                 JumpAvailability::Exact
@@ -325,6 +345,62 @@ impl InboxStore {
             .expect("acknowledged signal store lock poisoned");
         acknowledged_signals.extend(loaded);
     }
+}
+
+fn finalize_session_row(
+    row: SessionRow,
+    acknowledged_signals: &HashSet<AcknowledgedSignal>,
+    dismissed_session_ids: &HashSet<String>,
+    now_ms: u64,
+) -> SessionRow {
+    let dismissability = evaluate_dismissability(&row);
+    let jump_availability = jump_availability_for_row(&row);
+    let row = row
+        .with_dismissability_reason(Some(dismissability.reason))
+        .with_jump_availability(jump_availability);
+    let row = apply_acknowledged_session_state(row, acknowledged_signals, now_ms);
+    apply_dismissed_session_state(row, dismissed_session_ids)
+}
+
+fn jump_availability_for_row(row: &SessionRow) -> JumpAvailability {
+    if row.workspace_path.is_none() {
+        return JumpAvailability::Unavailable;
+    }
+
+    if matches!(row.jump_target, JumpTarget::Desktop) {
+        JumpAvailability::Exact
+    } else {
+        JumpAvailability::Approximate
+    }
+}
+
+fn compare_session_rows_for_store(left: &SessionRow, right: &SessionRow) -> std::cmp::Ordering {
+    session_state_priority(left.state)
+        .cmp(&session_state_priority(right.state))
+        .then_with(|| {
+            timestamp_value(right.last_activity_at.as_deref())
+                .cmp(&timestamp_value(left.last_activity_at.as_deref()))
+        })
+}
+
+fn session_state_priority(state: SessionState) -> u8 {
+    match state {
+        SessionState::WaitingForInput => 0,
+        SessionState::Inspect | SessionState::Dismissable => 1,
+        SessionState::Stopped => 2,
+        SessionState::Running => 3,
+        SessionState::NeedsAttention => 4,
+        SessionState::Idle => 5,
+        SessionState::Unknown => 6,
+    }
+}
+
+fn timestamp_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(parse_utc_timestamp)
+        .and_then(|timestamp| timestamp.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn load_acknowledged_signals(path: &std::path::Path) -> HashSet<AcknowledgedSignal> {
@@ -411,11 +487,27 @@ fn apply_dismissed_session_state(
     }
 }
 
-fn live_cli_tty_for_row(row: &SessionRow) -> Option<String> {
-    match (row.jump_target, row.workspace_path.as_deref()) {
-        (JumpTarget::Cli, Some(workspace_path)) => find_live_codex_tty_for_workspace(workspace_path),
-        _ => None,
+fn live_cli_tty_for_row_from_sessions(
+    row: &SessionRow,
+    live_sessions: &[LiveCliSession],
+) -> Option<String> {
+    if !matches!(row.jump_target, JumpTarget::Cli) {
+        return None;
     }
+
+    if let Some(session) = live_sessions
+        .iter()
+        .find(|session| session.session_id.as_deref() == Some(row.session_id.as_str()))
+    {
+        return Some(session.tty.clone());
+    }
+
+    row.workspace_path.as_deref().and_then(|workspace_path| {
+        live_sessions
+            .iter()
+            .find(|session| session.session_id.is_none() && session.workspace_path == workspace_path)
+            .map(|session| session.tty.clone())
+    })
 }
 
 fn apply_live_cli_activity_signal(
@@ -458,6 +550,130 @@ fn apply_live_cli_activity_signal(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveCliSession {
+    session_id: Option<String>,
+    workspace_path: String,
+    tty: String,
+}
+
+#[cfg(test)]
+fn merge_live_cli_sessions(rows: Vec<SessionRow>, live_sessions: Vec<LiveCliSession>) -> Vec<SessionRow> {
+    merge_live_cli_sessions_with_row_builder(rows, live_sessions, fallback_live_cli_session_row)
+}
+
+fn merge_live_cli_sessions_with_row_builder(
+    mut rows: Vec<SessionRow>,
+    live_sessions: Vec<LiveCliSession>,
+    missing_row: impl Fn(&LiveCliSession) -> SessionRow,
+) -> Vec<SessionRow> {
+    for live_session in live_sessions {
+        if let Some(session_id) = live_session.session_id.as_deref() {
+            let mut matched = false;
+            for row in rows.iter_mut().filter(|row| row.session_id == session_id) {
+                *row = mark_live_cli_session_running(row.clone(), &live_session.tty);
+                matched = true;
+            }
+            if matched {
+                continue;
+            }
+        }
+
+        let row = missing_row(&live_session);
+        if rows.iter().any(|existing| existing.session_id == row.session_id) {
+            continue;
+        }
+        rows.push(mark_live_cli_session_running(row, &live_session.tty));
+    }
+
+    rows
+}
+
+fn mark_live_cli_session_running(row: SessionRow, tty: &str) -> SessionRow {
+    if !should_promote_live_cli_row(row.state) {
+        return row;
+    }
+
+    SessionRow {
+        state: SessionState::Running,
+        confidence: Confidence::Inferred,
+        status_reason: format!("Live Codex CLI process observed on {tty}."),
+        evidence_summary: row
+            .evidence_summary
+            .or_else(|| Some(format!("Live Codex CLI process observed on {tty}."))),
+        handled: false,
+        dismissed: false,
+        jump_target: JumpTarget::Cli,
+        ..row
+    }
+}
+
+fn should_promote_live_cli_row(state: SessionState) -> bool {
+    matches!(state, SessionState::Unknown | SessionState::Idle)
+}
+
+fn live_cli_session_row(live_session: &LiveCliSession, now: SystemTime) -> SessionRow {
+    let row = live_session
+        .session_id
+        .as_deref()
+        .and_then(|session_id| discover_codex_observation_by_id(&codex_state_db_path(), session_id, now))
+        .map(classify_observation)
+        .unwrap_or_else(|| fallback_live_cli_session_row(live_session));
+
+    let project_name = live_session
+        .workspace_path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    let workspace_path = row
+        .workspace_path
+        .clone()
+        .or_else(|| Some(live_session.workspace_path.clone()));
+    let project_name = row.project_name.clone().or(project_name);
+
+    row.with_workspace(workspace_path)
+        .with_project_name(project_name)
+        .with_jump_target(JumpTarget::Cli)
+}
+
+fn fallback_live_cli_session_row(live_session: &LiveCliSession) -> SessionRow {
+    let session_id = live_session
+        .session_id
+        .clone()
+        .unwrap_or_else(|| live_cli_synthetic_session_id(live_session));
+    let project_name = live_session
+        .workspace_path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let label = project_name
+        .as_ref()
+        .map(|name| format!("Codex CLI: {name}"))
+        .unwrap_or_else(|| "Codex CLI session".to_string());
+
+    SessionRow::new(session_id, label, SessionState::Running, Confidence::Inferred)
+        .with_agent_name(Some("cli".to_string()))
+        .with_project_name(project_name)
+        .with_workspace(Some(live_session.workspace_path.clone()))
+        .with_reason(format!("Live Codex CLI process observed on {}.", live_session.tty))
+        .with_evidence_summary(Some(format!(
+            "Live Codex CLI process observed on {}.",
+            live_session.tty
+        )))
+        .with_jump_availability(JumpAvailability::Approximate)
+        .with_jump_target(JumpTarget::Cli)
+}
+
+fn live_cli_synthetic_session_id(live_session: &LiveCliSession) -> String {
+    format!(
+        "live-cli:{}:{}",
+        live_session.workspace_path, live_session.tty
+    )
+}
+
 fn row_has_fresh_activity(row: &SessionRow, now: SystemTime, freshness: Duration) -> bool {
     row.last_activity_at
         .as_deref()
@@ -467,23 +683,55 @@ fn row_has_fresh_activity(row: &SessionRow, now: SystemTime, freshness: Duration
 }
 
 fn build_jump_command_plan(row: &SessionRow) -> Option<JumpCommandPlan> {
+    let live_sessions = find_live_codex_cli_sessions();
+    build_jump_command_plan_with_live_sessions(
+        row,
+        &live_sessions,
+        find_previous_iterm_tty_for_workspace,
+    )
+}
+
+fn build_jump_command_plan_with_live_sessions(
+    row: &SessionRow,
+    live_sessions: &[LiveCliSession],
+    previous_iterm_tty_for_workspace: impl FnOnce(&str) -> Option<String>,
+) -> Option<JumpCommandPlan> {
     let Some(workspace_path) = row.workspace_path.as_deref() else {
         return build_jump_command_plan_with_cli_context(row, None, None);
     };
-
-    let (live_tty, resume_tty) = find_live_codex_tty_for_workspace(workspace_path).map_or_else(
-        || {
-            let resume_tty = if matches!(row.jump_target, JumpTarget::Cli) {
-                find_previous_iterm_tty_for_workspace(workspace_path)
-            } else {
-                None
-            };
-            (None, resume_tty)
-        },
-        |tty| (Some(tty), None),
-    );
+    let live_tty = live_cli_tty_for_jump_plan(row, live_sessions);
+    let resume_tty = if live_tty.is_none() && matches!(row.jump_target, JumpTarget::Cli) {
+        previous_iterm_tty_for_workspace(workspace_path)
+    } else {
+        None
+    };
 
     build_jump_command_plan_with_cli_context(row, live_tty, resume_tty)
+}
+
+fn live_cli_tty_for_jump_plan(
+    row: &SessionRow,
+    live_sessions: &[LiveCliSession],
+) -> Option<String> {
+    if let Some(session) = live_sessions
+        .iter()
+        .find(|session| session.session_id.as_deref() == Some(row.session_id.as_str()))
+    {
+        return Some(session.tty.clone());
+    }
+
+    let workspace_path = row.workspace_path.as_deref()?;
+    if matches!(row.jump_target, JumpTarget::Cli) {
+        return live_sessions
+            .iter()
+            .find(|session| session.session_id.is_none() && session.workspace_path == workspace_path)
+            .map(|session| session.tty.clone());
+    }
+
+    live_sessions
+        .iter()
+        .find(|session| session.workspace_path == workspace_path)
+        .map(|session| session.tty.clone())
 }
 
 fn build_jump_command_plan_with_cli_context(
@@ -552,12 +800,16 @@ fn execute_codex_desktop_jump(
     open_deeplink(deeplink_url)
 }
 
-fn find_live_codex_tty_for_workspace(workspace_path: &str) -> Option<String> {
-    let output = Command::new("ps")
+fn find_live_codex_cli_sessions() -> Vec<LiveCliSession> {
+    let output = match Command::new("ps")
         .args(["-axo", "pid=,tty=,comm=,args="])
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut sessions_by_terminal = HashMap::<(String, String), LiveCliSession>::new();
 
     for line in stdout.lines() {
         let Some((pid, tty, args)) = parse_codex_process_line(line) else {
@@ -566,12 +818,31 @@ fn find_live_codex_tty_for_workspace(workspace_path: &str) -> Option<String> {
         let Some(cwd) = process_cwd(pid) else {
             continue;
         };
-        if cwd == workspace_path && !args.contains(" app-server ") {
-            return Some(tty.to_string());
-        }
+        let session_id = live_cli_session_id_from_args(args)
+            .or_else(|| live_cli_session_id_from_open_files(pid));
+        let key = (cwd.clone(), tty.to_string());
+        sessions_by_terminal
+            .entry(key)
+            .and_modify(|existing| {
+                if existing.session_id.is_none() {
+                    existing.session_id = session_id.clone();
+                }
+            })
+            .or_insert_with(|| LiveCliSession {
+                session_id,
+                workspace_path: cwd,
+                tty: tty.to_string(),
+            });
     }
 
-    None
+    let mut sessions = sessions_by_terminal.into_values().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        left.workspace_path
+            .cmp(&right.workspace_path)
+            .then(left.tty.cmp(&right.tty))
+            .then(left.session_id.cmp(&right.session_id))
+    });
+    sessions
 }
 
 fn find_previous_iterm_tty_for_workspace(workspace_path: &str) -> Option<String> {
@@ -669,6 +940,60 @@ fn parse_codex_process_line(line: &str) -> Option<(&str, &str, &str)> {
     }
 
     Some((pid, tty, args))
+}
+
+fn live_cli_session_id_from_args(args: &str) -> Option<String> {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        if matches!(*part, "resume" | "--resume") {
+            let candidate = parts.get(index + 1)?;
+            if looks_like_codex_session_id(candidate) {
+                return Some((*candidate).to_string());
+            }
+        }
+
+        if let Some(candidate) = part.strip_prefix("--resume=") {
+            if looks_like_codex_session_id(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn live_cli_session_id_from_open_files(pid: &str) -> Option<String> {
+    let output = Command::new("lsof").arg("-p").arg(pid).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find(|part| part.contains("rollout-") && part.ends_with(".jsonl"))
+        })
+        .filter_map(session_id_from_jsonl_path)
+        .next()
+}
+
+fn session_id_from_jsonl_path(path: &str) -> Option<String> {
+    let file_name = path.rsplit('/').next()?;
+    let stem = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+    let parts = stem.split('-').collect::<Vec<_>>();
+    let candidate = if parts.len() >= 5 {
+        parts[parts.len() - 5..].join("-")
+    } else {
+        stem.rsplit('-').next().unwrap_or(stem).to_string()
+    };
+    let candidate = candidate.as_str();
+    looks_like_codex_session_id(candidate).then(|| candidate.to_string())
+}
+
+fn looks_like_codex_session_id(value: &str) -> bool {
+    value.len() >= 20
+        && value.contains('-')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
 }
 
 fn parse_shell_process_line(line: &str) -> Option<(&str, &str)> {
@@ -1061,6 +1386,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_jump_plan_targets_matching_live_session_when_workspace_has_multiple_tabs() {
+        let row = SessionRow::new(
+            "019eaa00-0000-7000-8000-000000000002",
+            "CLI row",
+            SessionState::Running,
+            Confidence::Inferred,
+        )
+        .with_workspace(Some("/Users/edy/hose/tmc_symposium/tmc_surprise".to_string()))
+        .with_jump_availability(JumpAvailability::Approximate)
+        .with_jump_target(JumpTarget::Cli);
+        let live_sessions = vec![
+            super::LiveCliSession {
+                session_id: Some("019eaa00-0000-7000-8000-000000000001".to_string()),
+                workspace_path: "/Users/edy/hose/tmc_symposium/tmc_surprise".to_string(),
+                tty: "ttys001".to_string(),
+            },
+            super::LiveCliSession {
+                session_id: Some("019eaa00-0000-7000-8000-000000000002".to_string()),
+                workspace_path: "/Users/edy/hose/tmc_symposium/tmc_surprise".to_string(),
+                tty: "ttys004".to_string(),
+            },
+        ];
+
+        let plan = super::build_jump_command_plan_with_live_sessions(
+            &row,
+            &live_sessions,
+            |_| None,
+        );
+
+        assert_eq!(
+            plan,
+            Some(super::JumpCommandPlan::ITermActivate {
+                tty: "ttys004".to_string(),
+                live_codex: true
+            })
+        );
+    }
+
+    #[test]
     fn cli_sessions_without_live_tty_resume_exact_session_in_previous_iterm_item() {
         let row = SessionRow::new("s2", "CLI row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-b".to_string()))
@@ -1204,6 +1568,102 @@ mod tests {
         assert_eq!(row.state, SessionState::Running);
         assert_eq!(row.confidence, Confidence::Inferred);
         assert!(row.status_reason.contains("Live Codex CLI process"));
+    }
+
+    #[test]
+    fn live_cli_sessions_missing_from_discovery_are_added_as_running_rows() {
+        let rows = vec![SessionRow::new(
+            "old",
+            "Old CLI row",
+            SessionState::Inspect,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_jump_target(JumpTarget::Cli)];
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("live-session".to_string()),
+            workspace_path: "/repo".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+
+        let rows = super::merge_live_cli_sessions(rows, live_sessions);
+
+        let live_row = rows
+            .iter()
+            .find(|row| row.session_id == "live-session")
+            .expect("live CLI session row");
+        assert_eq!(live_row.state, SessionState::Running);
+        assert_eq!(live_row.jump_target, JumpTarget::Cli);
+        assert_eq!(live_row.workspace_path.as_deref(), Some("/repo"));
+        assert!(live_row.status_reason.contains("Live Codex CLI process observed on ttys008"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "old")
+                .expect("old row")
+                .state,
+            SessionState::Inspect
+        );
+    }
+
+    #[test]
+    fn live_cli_sessions_promote_matching_rows_without_adding_duplicates() {
+        let rows = vec![SessionRow::new(
+            "live-session",
+            "Known CLI row",
+            SessionState::Unknown,
+            Confidence::Unknown,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_jump_target(JumpTarget::Cli)];
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("live-session".to_string()),
+            workspace_path: "/repo".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+
+        let rows = super::merge_live_cli_sessions(rows, live_sessions);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, SessionState::Running);
+        assert_eq!(rows[0].confidence, Confidence::Inferred);
+    }
+
+    #[test]
+    fn live_cli_sessions_keep_completed_matching_rows_in_inspect() {
+        let rows = vec![SessionRow::new(
+            "live-session",
+            "Known completed CLI row",
+            SessionState::Inspect,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_reason("completed task ready to inspect; open it to mark read")
+        .with_jump_target(JumpTarget::Cli)];
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("live-session".to_string()),
+            workspace_path: "/repo".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+
+        let rows = super::merge_live_cli_sessions(rows, live_sessions);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, SessionState::Inspect);
+        assert_eq!(rows[0].confidence, Confidence::Exact);
+        assert_eq!(
+            rows[0].status_reason,
+            "completed task ready to inspect; open it to mark read"
+        );
+    }
+
+    #[test]
+    fn parses_session_id_from_rollout_jsonl_path_with_uuid_segments() {
+        assert_eq!(
+            super::session_id_from_jsonl_path(
+                "/Users/edy/.codex/archived_sessions/rollout-2026-06-04T14-30-34-019e9153-943a-7402-8e61-9e89cee5a6f4.jsonl"
+            ),
+            Some("019e9153-943a-7402-8e61-9e89cee5a6f4".to_string())
+        );
     }
 
     #[test]

@@ -49,34 +49,53 @@ export function discoverCodexSessions({
   limit = 80,
   nowMs = Date.now(),
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
-  liveCliTtyForWorkspace = findLiveCodexTtyForWorkspace,
+  liveCliTtyForWorkspace,
+  liveCliSessions,
 } = {}) {
   if (arguments.length === 0) return defaultDevSource.discoverCodexSessions();
+  liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
 
   const threadRows = discoverCodexThreads({
     stateDbPath,
     limit,
     nowMs,
     unreadCompletionTrackingStartMs: trackingStartMs,
+    liveCliSessions,
     liveCliTtyForWorkspace,
   });
-  if (threadRows !== null) return threadRows;
+  if (threadRows !== null) {
+    return sortAndLimitRows(
+      mergeLiveCliSessions(threadRows, liveCliSessions, (liveSession) =>
+        liveCliSessionRow(liveSession, {
+          stateDbPath,
+          nowMs,
+          unreadCompletionTrackingStartMs: trackingStartMs,
+          liveCliSessions,
+          liveCliTtyForWorkspace,
+        }),
+      ),
+      limit,
+    );
+  }
 
-  return collectJsonlFiles(sessionsRoot)
+  const jsonlRows = collectJsonlFiles(sessionsRoot)
     .sort((left, right) => right.modifiedAt - left.modifiedAt)
     .slice(0, limit)
     .map((file) => parseSessionFile(file.path, { nowMs, unreadCompletionTrackingStartMs: trackingStartMs }))
     .filter(Boolean)
-    .map((observation) => toSessionRow(observation, { liveCliTtyForWorkspace, nowMs }));
+    .map((observation) => toSessionRow(observation, { liveCliSessions, liveCliTtyForWorkspace, nowMs }));
+  return sortAndLimitRows(mergeLiveCliSessions(jsonlRows, liveCliSessions, fallbackLiveCliSessionRow), limit);
 }
 
 export function discoverCodexThreadById(sessionId, {
   stateDbPath = defaultCodexStateDbPath(),
   nowMs = Date.now(),
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
-  liveCliTtyForWorkspace = findLiveCodexTtyForWorkspace,
+  liveCliTtyForWorkspace,
+  liveCliSessions,
 } = {}) {
   if (!fs.existsSync(stateDbPath)) return null;
+  liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
 
   const query = `${threadSummaryJsonSelect()} from threads where id = '${sqliteStringLiteral(sessionId)}' limit 1;`;
   const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDbPath, query], { encoding: "utf8" });
@@ -85,7 +104,12 @@ export function discoverCodexThreadById(sessionId, {
   return result.stdout
     .split("\n")
     .filter(Boolean)
-    .map((line) => parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs: trackingStartMs, liveCliTtyForWorkspace }))
+    .map((line) => parseThreadRow(line, {
+      nowMs,
+      unreadCompletionTrackingStartMs: trackingStartMs,
+      liveCliTtyForWorkspace,
+      liveCliSessions,
+    }))
     .find(Boolean) ?? null;
 }
 
@@ -123,6 +147,7 @@ export function createCodexSessionsDevSource({
   nowMs = Date.now(),
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
   liveCliTtyForWorkspace = findLiveCodexTtyForWorkspace,
+  liveCliSessions,
   previousITermTtyForWorkspace = findPreviousITermTtyForWorkspace,
   executeJump: executeJumpOverride,
 } = {}) {
@@ -134,6 +159,7 @@ export function createCodexSessionsDevSource({
     nowMs: typeof nowMs === "function" ? nowMs() : nowMs,
     unreadCompletionTrackingStartMs: trackingStartMs,
     liveCliTtyForWorkspace,
+    liveCliSessions,
     previousITermTtyForWorkspace,
   });
 
@@ -158,7 +184,7 @@ export function createCodexSessionsDevSource({
   };
 }
 
-function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrackingStartMs, liveCliTtyForWorkspace }) {
+function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
   if (!fs.existsSync(stateDbPath)) return null;
 
   const query = `${threadSummaryJsonSelect()} from threads where archived = 0 order by coalesce(updated_at_ms, updated_at * 1000) desc limit ${limit};`;
@@ -168,7 +194,7 @@ function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrack
   return result.stdout
     .split("\n")
     .filter(Boolean)
-    .map((line) => parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliTtyForWorkspace }))
+    .map((line) => parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }))
     .filter(Boolean);
 }
 
@@ -191,7 +217,7 @@ function sqliteStringLiteral(value) {
   return String(value).replaceAll("'", "''");
 }
 
-function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliTtyForWorkspace }) {
+function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
   let thread;
   try {
     thread = JSON.parse(line);
@@ -244,7 +270,7 @@ function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliT
     lastActivityAt,
     evidenceSummary: jsonlObservation?.evidenceSummary ?? thread.preview,
     jumpTarget,
-  }, { liveCliTtyForWorkspace, nowMs });
+  }, { liveCliSessions, liveCliTtyForWorkspace, nowMs });
 }
 
 function threadUpdatedAfterTaskCompleteFromThread(thread, jsonlObservation) {
@@ -320,7 +346,7 @@ function parseSessionFile(filePath, {
         taskCompleteAt = value.timestamp;
       } else if (eventType === "turn_aborted") {
         pendingToolApproval = undefined;
-        lastActivityKind = "running";
+        lastActivityKind = "stopped";
       } else if (eventType === "user_message" || eventType === "agent_message") {
         lastActivityKind = "running";
       }
@@ -359,6 +385,8 @@ function parseSessionFile(filePath, {
     ? lastActivityAt && Date.parse(lastActivityAt) >= unreadCompletionTrackingStartMs
       ? "completedImmediate"
       : "completedStale"
+    : lastActivityKind === "stopped"
+      ? "stopped"
     : lastActivityKind === "running" && recent
       ? "running"
       : recent
@@ -408,9 +436,9 @@ function pendingToolApprovalFromResponseItem(value) {
   };
 }
 
-function toSessionRow(observation, { liveCliTtyForWorkspace, nowMs = Date.now() }) {
+function toSessionRow(observation, { liveCliSessions = [], liveCliTtyForWorkspace, nowMs = Date.now() }) {
   const classified = classifyObservation(observation);
-  const row = applyLiveCliActivitySignal(classified, liveCliTtyForWorkspace, nowMs);
+  const row = applyLiveCliActivitySignal(classified, liveCliSessions, liveCliTtyForWorkspace, nowMs);
   return {
     ...row,
     dismissabilityReason: dismissabilityReason(row.state),
@@ -482,6 +510,13 @@ function classificationForKind(kind) {
       reason: "failed task can be manually reviewed and cleared",
     };
   }
+  if (kind === "stopped") {
+    return {
+      state: "stopped",
+      confidence: "exact",
+      reason: "stopped before completion; decide whether to continue, inspect, or dismiss",
+    };
+  }
   return {
     state: "unknown",
     confidence: "unknown",
@@ -489,9 +524,9 @@ function classificationForKind(kind) {
   };
 }
 
-function applyLiveCliActivitySignal(row, liveCliTtyForWorkspace, nowMs = Date.now()) {
+function applyLiveCliActivitySignal(row, liveCliSessions, liveCliTtyForWorkspace, nowMs = Date.now()) {
   if (row.state === "waitingForInput" && row.jumpTarget === "cli") {
-    const tty = row.workspacePath ? liveCliTtyForWorkspace(row.workspacePath) : undefined;
+    const tty = liveCliTtyForRow(row, liveCliSessions, liveCliTtyForWorkspace);
     if (tty && rowHasFreshActivity(row, nowMs, pendingCliInputFreshnessMs)) return row;
     const statusReason = tty
       ? "Pending CLI input is stale; idle until the next source signal."
@@ -507,7 +542,7 @@ function applyLiveCliActivitySignal(row, liveCliTtyForWorkspace, nowMs = Date.no
 
   if (row.state !== "unknown" || row.jumpTarget !== "cli" || !row.workspacePath) return row;
 
-  const tty = liveCliTtyForWorkspace(row.workspacePath);
+  const tty = liveCliTtyForRow(row, liveCliSessions, liveCliTtyForWorkspace);
   if (!tty) return row;
 
   return {
@@ -516,6 +551,121 @@ function applyLiveCliActivitySignal(row, liveCliTtyForWorkspace, nowMs = Date.no
     confidence: "inferred",
     statusReason: `Live Codex CLI process observed on ${tty}.`,
   };
+}
+
+function liveCliTtyForRow(row, liveCliSessions, liveCliTtyForWorkspace) {
+  if (row.jumpTarget !== "cli") return undefined;
+  return liveCliSessions.find((session) => session.sessionId === row.sessionId)?.tty
+    ?? liveCliSessions.find((session) => !session.sessionId && session.workspacePath === row.workspacePath)?.tty
+    ?? (row.workspacePath && liveCliTtyForWorkspace ? liveCliTtyForWorkspace(row.workspacePath) : undefined);
+}
+
+function mergeLiveCliSessions(rows, liveCliSessions, missingRow) {
+  const merged = [...rows];
+
+  for (const liveSession of liveCliSessions) {
+    let matched = false;
+    if (liveSession.sessionId) {
+      for (let index = 0; index < merged.length; index += 1) {
+        if (merged[index].sessionId !== liveSession.sessionId) continue;
+        merged[index] = markLiveCliSessionRunning(merged[index], liveSession.tty);
+        matched = true;
+      }
+    }
+
+    if (matched) continue;
+
+    const row = missingRow(liveSession);
+    if (merged.some((existing) => existing.sessionId === row.sessionId)) continue;
+    merged.push(markLiveCliSessionRunning(row, liveSession.tty));
+  }
+
+  return merged;
+}
+
+function markLiveCliSessionRunning(row, tty) {
+  if (!shouldPromoteLiveCliRow(row.state)) return row;
+
+  return {
+    ...row,
+    state: "running",
+    confidence: "inferred",
+    statusReason: `Live Codex CLI process observed on ${tty}.`,
+    evidenceSummary: row.evidenceSummary ?? `Live Codex CLI process observed on ${tty}.`,
+    handled: false,
+    dismissed: false,
+    jumpAvailability: row.workspacePath ? "approximate" : row.jumpAvailability,
+    jumpTarget: "cli",
+  };
+}
+
+function shouldPromoteLiveCliRow(state) {
+  return state === "unknown" || state === "idle";
+}
+
+function liveCliSessionRow(liveSession, options) {
+  if (liveSession.sessionId) {
+    const row = discoverCodexThreadById(liveSession.sessionId, options);
+    if (row) {
+      return {
+        ...row,
+        workspacePath: row.workspacePath ?? liveSession.workspacePath,
+        projectName: row.projectName ?? path.basename(liveSession.workspacePath),
+        jumpTarget: "cli",
+        jumpAvailability: "approximate",
+      };
+    }
+  }
+
+  return fallbackLiveCliSessionRow(liveSession);
+}
+
+function fallbackLiveCliSessionRow(liveSession) {
+  const projectName = path.basename(liveSession.workspacePath);
+  const sessionId = liveSession.sessionId ?? `live-cli:${liveSession.workspacePath}:${liveSession.tty}`;
+  return {
+    sessionId,
+    label: projectName ? `Codex CLI: ${projectName}` : "Codex CLI session",
+    agentName: "cli",
+    projectName,
+    workspacePath: liveSession.workspacePath,
+    lastActivityAt: undefined,
+    evidenceSummary: `Live Codex CLI process observed on ${liveSession.tty}.`,
+    state: "running",
+    confidence: "inferred",
+    statusReason: `Live Codex CLI process observed on ${liveSession.tty}.`,
+    handled: false,
+    dismissed: false,
+    dismissabilityReason: dismissabilityReason("running"),
+    jumpAvailability: "approximate",
+    jumpTarget: "cli",
+  };
+}
+
+function sortAndLimitRows(rows, limit) {
+  return [...rows]
+    .sort(compareSessionRows)
+    .slice(0, limit);
+}
+
+function compareSessionRows(left, right) {
+  return sessionStatePriority(left.state) - sessionStatePriority(right.state)
+    || timestampValue(right.lastActivityAt) - timestampValue(left.lastActivityAt);
+}
+
+function sessionStatePriority(state) {
+  if (state === "waitingForInput") return 0;
+  if (state === "inspect" || state === "dismissable") return 1;
+  if (state === "running") return 2;
+  if (state === "needsAttention") return 3;
+  if (state === "idle") return 4;
+  return 5;
+}
+
+function timestampValue(value) {
+  if (!value) return 0;
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? 0 : timestamp;
 }
 
 function rowHasFreshActivity(row, nowMs, freshnessMs) {
@@ -556,6 +706,7 @@ function acknowledgedSignal(row) {
 
 function dismissabilityReason(state) {
   if (state === "inspect") return "Inspect row can be manually dismissed.";
+  if (state === "stopped") return "Stopped row can be manually dismissed.";
   if (state === "dismissable") return "Inspect row can be manually dismissed.";
   if (state === "unknown") return "Unknown rows are never auto-dismissable.";
   return "Row is not in a dismissable state.";
@@ -613,9 +764,11 @@ function truncate(value, maxLength) {
 }
 
 function buildJumpPlan(row, options = {}) {
-  const liveTty = row.workspacePath
-    ? (options.liveCliTtyForWorkspace ?? findLiveCodexTtyForWorkspace)(row.workspacePath)
-    : undefined;
+  const liveTty = liveCliTtyForJumpPlan(
+    row,
+    options.liveCliSessions ?? findLiveCodexCliSessions(),
+    options.liveCliTtyForWorkspace ?? findLiveCodexTtyForWorkspace,
+  );
   if (liveTty) return { kind: "iterm", tty: liveTty, liveCodex: true };
 
   if (row.jumpTarget === "desktop" || row.jumpTarget === "unknown") return { kind: "desktop" };
@@ -630,6 +783,17 @@ function buildJumpPlan(row, options = {}) {
     workspacePath: row.workspacePath,
     tty: resumeTty,
   };
+}
+
+function liveCliTtyForJumpPlan(row, liveCliSessions, liveCliTtyForWorkspace) {
+  const exactSessionTty = liveCliSessions.find((session) => session.sessionId === row.sessionId)?.tty;
+  if (exactSessionTty) return exactSessionTty;
+
+  if (row.jumpTarget === "cli") {
+    return liveCliSessions.find((session) => !session.sessionId && session.workspacePath === row.workspacePath)?.tty;
+  }
+
+  return row.workspacePath && liveCliTtyForWorkspace ? liveCliTtyForWorkspace(row.workspacePath) : undefined;
 }
 
 function jumpMessage(plan) {
@@ -648,21 +812,45 @@ async function executeJump(row, plan) {
 }
 
 function findLiveCodexTtyForWorkspace(workspacePath) {
+  return findLiveCodexCliSessions()
+    .find((session) => session.workspacePath === workspacePath)
+    ?.tty;
+}
+
+function findLiveCodexCliSessions() {
   let output = "";
   try {
     output = execFileSync("ps", ["-axo", "pid=,tty=,comm=,args="], { encoding: "utf8" });
   } catch {
-    return undefined;
+    return [];
   }
 
+  const sessionsByTerminal = new Map();
   for (const line of output.split("\n")) {
     const processInfo = parseCodexProcessLine(line);
     if (!processInfo) continue;
     const cwd = processCwd(processInfo.pid);
-    if (cwd === workspacePath) return processInfo.tty;
+    if (!cwd) continue;
+    const sessionId = liveCliSessionIdFromArgs(processInfo.args)
+      ?? liveCliSessionIdFromOpenFiles(processInfo.pid);
+    const key = `${cwd}\0${processInfo.tty}`;
+    const existing = sessionsByTerminal.get(key);
+    if (existing) {
+      if (!existing.sessionId) existing.sessionId = sessionId;
+      continue;
+    }
+    sessionsByTerminal.set(key, {
+      sessionId,
+      workspacePath: cwd,
+      tty: processInfo.tty,
+    });
   }
 
-  return undefined;
+  return [...sessionsByTerminal.values()].sort((left, right) =>
+    left.workspacePath.localeCompare(right.workspacePath)
+      || left.tty.localeCompare(right.tty)
+      || String(left.sessionId ?? "").localeCompare(String(right.sessionId ?? "")),
+  );
 }
 
 function findPreviousITermTtyForWorkspace(workspacePath) {
@@ -726,7 +914,56 @@ function parseCodexProcessLine(line) {
   if (!match) return undefined;
   const [, pid, tty, args] = match;
   if (!args.includes("codex") || args.includes(" app-server ")) return undefined;
-  return { pid, tty };
+  return { pid, tty, args };
+}
+
+function liveCliSessionIdFromArgs(args) {
+  const parts = args.split(/\s+/).filter(Boolean);
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (part === "resume" || part === "--resume") {
+      const candidate = parts[index + 1];
+      if (looksLikeCodexSessionId(candidate)) return candidate;
+    }
+    if (part.startsWith("--resume=")) {
+      const candidate = part.slice("--resume=".length);
+      if (looksLikeCodexSessionId(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function liveCliSessionIdFromOpenFiles(pid) {
+  let output = "";
+  try {
+    output = execFileSync("lsof", ["-p", pid], { encoding: "utf8" });
+  } catch {
+    return undefined;
+  }
+
+  return output
+    .split("\n")
+    .flatMap((line) => line.split(/\s+/))
+    .filter((part) => part.includes("rollout-") && part.endsWith(".jsonl"))
+    .map(sessionIdFromJsonlPath)
+    .find(Boolean);
+}
+
+function sessionIdFromJsonlPath(filePath) {
+  const fileName = path.basename(filePath);
+  const stem = fileName.endsWith(".jsonl") ? fileName.slice(0, -".jsonl".length) : fileName;
+  const parts = stem.split("-");
+  const candidate = parts.length >= 5
+    ? parts.slice(-5).join("-")
+    : parts.at(-1);
+  return looksLikeCodexSessionId(candidate) ? candidate : undefined;
+}
+
+function looksLikeCodexSessionId(value) {
+  return typeof value === "string"
+    && value.length >= 20
+    && value.includes("-")
+    && /^[0-9a-f-]+$/i.test(value);
 }
 
 function parseShellProcessLine(line) {

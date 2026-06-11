@@ -18,12 +18,12 @@ pub fn evaluate_dismissability(row: &SessionRow) -> Dismissability {
         };
     }
 
-    if matches!(row.state, SessionState::Inspect | SessionState::Dismissable)
+    if matches!(row.state, SessionState::Inspect | SessionState::Stopped | SessionState::Dismissable)
         && matches!(row.confidence, Confidence::Exact | Confidence::Inferred)
     {
         return Dismissability {
             is_dismissable: true,
-            reason: "inspect row can be manually dismissed".to_string(),
+            reason: "intervention row can be manually dismissed".to_string(),
         };
     }
 
@@ -47,7 +47,18 @@ mod tests {
         let result = evaluate_dismissability(&row);
 
         assert!(result.is_dismissable);
-        assert!(result.reason.contains("inspect"));
+        assert!(result.reason.contains("intervention"));
+    }
+
+    #[test]
+    fn marks_stopped_exact_rows_dismissable_with_reason() {
+        let row = SessionRow::new("s3", "Stopped task", SessionState::Stopped, Confidence::Exact)
+            .with_last_activity("2026-06-02T10:00:00Z");
+
+        let result = evaluate_dismissability(&row);
+
+        assert!(result.is_dismissable);
+        assert!(result.reason.contains("intervention"));
     }
 
     #[test]

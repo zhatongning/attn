@@ -143,10 +143,10 @@ describe("StatusPanelView", () => {
       ...firstRows,
       {
         ...initialSessions[0],
-        sessionId: "timed-inspect-row",
-        label: "Timed inspect row",
-        state: "inspect" as const,
-        statusReason: "completed task ready to inspect; open it to mark read",
+        sessionId: "timed-follow-up-row",
+        label: "Timed follow-up row",
+        state: "needsAttention" as const,
+        statusReason: "Read recently; keep in needed state until 30 minutes pass.",
       },
     ];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
@@ -172,7 +172,7 @@ describe("StatusPanelView", () => {
     render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
 
     await waitFor(() => {
-      expect(screen.getByText("Timed inspect row")).toBeTruthy();
+      expect(screen.getByText("Timed follow-up row")).toBeTruthy();
     });
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
     expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 8000);
@@ -183,6 +183,41 @@ describe("StatusPanelView", () => {
     await waitFor(() => {
       expect(screen.getByRole("main").className).toContain("panel-shell--collapsed");
     });
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("keeps the panel open when a configured status is present", async () => {
+    const firstRows = initialSessions.filter((row) => row.state !== "needsAttention");
+    const nextRows = [
+      ...firstRows,
+      {
+        ...initialSessions[0],
+        sessionId: "sticky-inspect-row",
+        label: "Sticky inspect row",
+        state: "inspect" as const,
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") return jsonResponse(nextRows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+    const originalSetTimeout = window.setTimeout.bind(window);
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => originalSetTimeout(handler, timeout)) as typeof window.setTimeout);
+
+    render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Sticky inspect row")).toBeTruthy();
+    });
+    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
+    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), 8000);
+
     setTimeoutSpy.mockRestore();
   });
 
@@ -211,6 +246,28 @@ describe("StatusPanelView", () => {
     const persistedConfig = JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
     expect(persistedConfig.panelMode).toBe("persistent");
     expect(persistedConfig.autoCollapseDelayMs).toBe(12000);
+  });
+
+  it("persists statuses that keep the auto panel open after management confirmation", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByText("Keep open for statuses")).toBeTruthy();
+    expect((screen.getByLabelText("inspect") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("follow-up") as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(screen.getByLabelText("follow-up"));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    const persistedConfig = JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
+    expect(persistedConfig.preventAutoCollapseStatuses).toEqual(["inspect", "needed"]);
   });
 
   it("shows source evidence from an info control beside the workspace name", () => {
@@ -602,6 +659,54 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("待跟进")).toBeTruthy();
   });
 
+  it("localizes built-in panel and management copy when Chinese is selected", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      ...defaultZhConfig(),
+      panelMode: "persistent",
+    }));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.getByText("Attn")).toBeTruthy();
+    expect(screen.getByText("1 需关注")).toBeTruthy();
+    expect(screen.getByText("1 进行中")).toBeTruthy();
+    expect(screen.getByText("1 空闲")).toBeTruthy();
+    expect(screen.getByText("Codex 桌面端")).toBeTruthy();
+    expect(screen.getByText("本地数据")).toBeTruthy();
+    expect(screen.getByText("降级")).toBeTruthy();
+    expect(screen.getByText("精确")).toBeTruthy();
+    expect(screen.getAllByTitle("返回会话")).toHaveLength(2);
+    expect(screen.getAllByTitle("忽略")).toHaveLength(2);
+    expect(screen.queryByText("local data")).toBeNull();
+    expect(screen.queryByText("degraded")).toBeNull();
+
+    fireEvent.click(screen.getByLabelText("查看 AMap geolocation preload investigation 的状态依据"));
+    expect(screen.getByRole("tooltip").textContent).toContain("状态：Codex reports the task is waiting for user input.");
+    expect(screen.getByRole("tooltip").textContent).toContain("跳转目标：桌面端");
+    expect(screen.getByRole("tooltip").textContent).toContain("置信度：精确");
+
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByText("设置")).toBeTruthy();
+    expect(screen.getByLabelText("语言")).toBeTruthy();
+    expect(screen.getByLabelText("显示条数")).toBeTruthy();
+    expect(screen.getByLabelText("面板显示")).toBeTruthy();
+    expect(screen.getByLabelText("提醒显示秒数")).toBeTruthy();
+    expect(screen.getByText("包含这些状态时不收起")).toBeTruthy();
+    expect((screen.getByLabelText("待检查") as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByText("状态颜色")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "应用设置" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "返回" })).toBeTruthy();
+    expect(screen.queryByText("Language")).toBeNull();
+    expect(screen.queryByText("Apply settings")).toBeNull();
+  });
+
   it("loads settings from the legacy agent-session-inbox storage key", () => {
     window.localStorage.setItem("agent-session-inbox.statusPanelConfig", JSON.stringify({
       styleFamily: "atom",
@@ -611,6 +716,7 @@ describe("StatusPanelView", () => {
       statusColors: {
         blocked: "#e06c75",
         inspect: "#61afef",
+        stopped: "#d19a66",
         needed: "#e5c07b",
         working: "#98c379",
         idle: "#5c6370",
@@ -698,6 +804,47 @@ describe("StatusPanelView", () => {
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
         height: 156,
+        width: 560,
+      }));
+    });
+  });
+
+  it("reserves panel height for jump command feedback", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "jump-message-row",
+      label: "Jump message row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    let resolveJump: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/jump" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          resolveJump = resolve;
+        });
+      }
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row]));
+      if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
+      return Promise.resolve(jsonResponse({}, 404));
+    }));
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+    fireEvent.click(screen.getByTitle("Jump back"));
+
+    resolveJump?.(jsonResponse({
+      sessionId: row.sessionId,
+      availability: "exact",
+      target: "desktop",
+      message: "Opened Codex Desktop session.",
+    }));
+
+    expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 186,
         width: 560,
       }));
     });
@@ -855,10 +1002,21 @@ describe("StatusPanelView", () => {
     // @ts-expect-error This test runs in Node and does not need app-level Node globals.
     const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
 
-    expect(css).toContain("padding: 6px;");
+    expect(css).toContain("padding: 8px;");
     expect(css).toContain("width: min(100vw - 12px, 540px);");
     expect(css).toContain("max-height: calc(100vh - 12px);");
     expect(css).toContain("inset 0 1px 0 rgba(171, 178, 191, 0.08);");
+  });
+
+  it("keeps the strip toggle from shifting header layout", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const collapsedBlock = css.match(/\.panel-shell--collapsed \{[^}]+\}/)?.[0];
+    const stripToggleBlock = css.match(/\.strip-toggle \{[^}]+\}/)?.[0];
+
+    expect(collapsedBlock).not.toContain("padding:");
+    expect(stripToggleBlock).toContain("width: 22px;");
+    expect(stripToggleBlock).toContain("line-height: 20px;");
   });
 
   it("defines a non-looping inspect attention cue animation", () => {
@@ -868,6 +1026,66 @@ describe("StatusPanelView", () => {
     expect(css).toContain(".status-row--attention-cue");
     expect(css).toContain("animation: inspect-attention-cue 1800ms ease-out both;");
     expect(css).toContain("@keyframes inspect-attention-sweep");
+  });
+
+  it("gives inspect rows stronger visual priority than working rows", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const inspectBlock = css.match(/\.status-row--inspect \{[^}]+\}/)?.[0];
+    const workingBlock = css.match(/\.status-row--working \{[^}]+\}/)?.[0];
+
+    expect(inspectBlock).toContain("background: #222d39;");
+    expect(inspectBlock).toContain("--row-border-color: #31536b;");
+    expect(workingBlock).toContain("border-left-color: var(--status-color);");
+    expect(workingBlock).toContain("background: #24292e;");
+  });
+
+  it("keeps localized status labels from crowding the left column", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const rowBlock = css.match(/\.status-row \{[^}]+\}/)?.[0];
+    const statusCodeBlock = css.match(/\.status-code \{[^}]+\}/)?.[0];
+    const statusMarkerBlock = css.match(/\.status-code span \{[^}]+\}/)?.[0];
+
+    expect(rowBlock).toContain("grid-template-columns: 96px minmax(0, 1fr) auto;");
+    expect(rowBlock).toContain("padding: 6px 7px 6px 12px;");
+    expect(statusCodeBlock).toContain("align-items: center;");
+    expect(statusCodeBlock).toContain("display: flex;");
+    expect(statusCodeBlock).toContain("min-width: 76px;");
+    expect(statusMarkerBlock).toContain("margin-right: 8px;");
+  });
+
+  it("keeps status row left borders inside the clipped panel area", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const listBlock = css.match(/\.status-list \{[^}]+\}/)?.[0];
+    const rowBlock = css.match(/\.status-row \{[^}]+\}/)?.[0];
+
+    expect(listBlock).toContain("padding-left: 4px;");
+    expect(rowBlock).toContain("width: calc(100% - 4px);");
+  });
+
+  it("draws the status accent inside a complete row outline", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const rowBlock = css.match(/\.status-row \{[^}]+\}/)?.[0];
+    const accentBlock = css.match(/\.status-row::before \{[^}]+\}/)?.[0];
+
+    expect(rowBlock).toContain("border: 1px solid var(--row-border-color);");
+    expect(rowBlock).not.toContain("border-left: 3px solid var(--status-color);");
+    expect(accentBlock).toContain("background: var(--status-color);");
+    expect(accentBlock).toContain("left: 1px;");
+  });
+
+  it("uses the complete left border for quiet working rows", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const workingBlock = css.match(/\.status-row--working \{[^}]+\}/)?.[0];
+    const workingBeforeBlock = css.match(/\.status-row--working::before \{[^}]+\}/)?.[0];
+
+    expect(workingBlock).toContain("border-left-color: var(--status-color);");
+    expect(workingBlock).not.toContain("--status-accent-width: 1px;");
+    expect(workingBeforeBlock).toContain("content: none;");
   });
 
   it("allows the evidence popover to escape the status content clipping area", () => {
@@ -886,13 +1104,47 @@ describe("StatusPanelView", () => {
     expect(css).toContain(".status-row:last-child .status-evidence-popover");
     expect(css).toContain("bottom: calc(100% + 5px);");
   });
+
+  it("raises the row that owns an open evidence popover above later rows", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const rowBlock = css.match(/\.status-row \{[^}]+\}/)?.[0];
+    const evidenceOpenBlock = css.match(/\.status-row--evidence-open \{[^}]+\}/)?.[0];
+    const popoverBlock = css.match(/\.status-evidence-popover \{[^}]+\}/)?.[0];
+
+    expect(rowBlock).toContain("position: relative;");
+    expect(rowBlock).toContain("z-index: 0;");
+    expect(evidenceOpenBlock).toContain("z-index: 20;");
+    expect(popoverBlock).toContain("z-index: 10;");
+  });
 });
 
 function expandPanel() {
-  const expandButton = screen.queryByRole("button", { name: "Expand status panel" });
+  const expandButton = screen.queryByRole("button", { name: "Expand status panel" })
+    ?? screen.queryByRole("button", { name: "展开状态面板" });
   if (expandButton) {
     fireEvent.click(expandButton);
   }
+}
+
+function defaultZhConfig() {
+  return {
+    styleFamily: "atom",
+    palette: "oneDark",
+    language: "zh",
+    visibleItemCount: 3,
+    panelMode: "auto",
+    autoCollapseDelayMs: 8000,
+    statusColors: {
+      blocked: "#e06c75",
+      input: "#c678dd",
+      inspect: "#61afef",
+      stopped: "#d19a66",
+      needed: "#e5c07b",
+      working: "#98c379",
+      idle: "#5c6370",
+    },
+  };
 }
 
 function jsonResponse(payload: unknown, status = 200) {

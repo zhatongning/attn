@@ -1,6 +1,6 @@
 import type { Confidence, SessionRow } from "../../shared/types/session";
 
-export type InterventionStatus = "blocked" | "input" | "inspect" | "needed" | "working" | "idle";
+export type InterventionStatus = "blocked" | "input" | "inspect" | "stopped" | "needed" | "working" | "idle";
 
 export interface StatusPanelConfig {
   styleFamily: "atom";
@@ -9,6 +9,7 @@ export interface StatusPanelConfig {
   visibleItemCount: number;
   panelMode: "auto" | "persistent";
   autoCollapseDelayMs: number;
+  preventAutoCollapseStatuses: InterventionStatus[];
   statusColors: Record<InterventionStatus, string>;
 }
 
@@ -55,6 +56,49 @@ export interface StatusPanelCopy {
   quietLabel: string;
   hiddenAlertsLabel: string;
   collapseLabel: string;
+  managementTitle: string;
+  languageLabel: string;
+  styleFamilyLabel: string;
+  paletteLabel: string;
+  visibleItemsLabel: string;
+  panelDisplayLabel: string;
+  autoCollapseLabel: string;
+  persistentLabel: string;
+  alertDisplaySecondsLabel: string;
+  preventAutoCollapseStatusesLabel: string;
+  statusColorsLabel: string;
+  blockedColorLabel: string;
+  inspectColorLabel: string;
+  stoppedColorLabel: string;
+  followUpColorLabel: string;
+  workingColorLabel: string;
+  idleColorLabel: string;
+  codexHooksLabel: string;
+  checkingCodexHooksLabel: string;
+  installCodexHooksLabel: string;
+  installingLabel: string;
+  codexHooksInstalledLabel: string;
+  applySettingsLabel: string;
+  backLabel: string;
+  emptyPanelLabel: string;
+  localDataLabel: string;
+  expandPanelLabel: string;
+  collapsePanelLabel: string;
+  jumpBackLabel: string;
+  openingSessionLabel: string;
+  dismissLabel: string;
+  dismissingLabel: string;
+  showEvidenceLabel: (label: string) => string;
+  statusPrefix: string;
+  evidencePrefix: string;
+  lastActivityPrefix: string;
+  jumpTargetPrefix: string;
+  confidencePrefix: string;
+  labelSeparator: string;
+  confidenceLabels: Record<Confidence, string>;
+  jumpTargetLabels: Record<SessionRow["jumpTarget"], string>;
+  sourceStatusLabels: Record<"available" | "degraded" | "unknown", string>;
+  sourceNameLabels: Record<string, string>;
 }
 
 export const defaultStatusPanelConfig: StatusPanelConfig = {
@@ -64,10 +108,12 @@ export const defaultStatusPanelConfig: StatusPanelConfig = {
   visibleItemCount: 3,
   panelMode: "auto",
   autoCollapseDelayMs: 8000,
+  preventAutoCollapseStatuses: ["inspect"],
   statusColors: {
     blocked: "#e06c75",
     input: "#c678dd",
     inspect: "#61afef",
+    stopped: "#d19a66",
     needed: "#e5c07b",
     working: "#98c379",
     idle: "#5c6370",
@@ -93,6 +139,11 @@ export const atomInterventionTheme: AtomInterventionTheme = {
       marker: "●",
       color: defaultStatusPanelConfig.statusColors.inspect,
     },
+    stopped: {
+      label: "stopped",
+      marker: "●",
+      color: defaultStatusPanelConfig.statusColors.stopped,
+    },
     needed: {
       label: "follow-up",
       marker: "●",
@@ -115,9 +166,10 @@ const statusPriority: Record<InterventionStatus, number> = {
   blocked: 0,
   input: 1,
   inspect: 2,
-  working: 3,
-  needed: 4,
-  idle: 5,
+  stopped: 3,
+  working: 4,
+  needed: 5,
+  idle: 6,
 };
 
 const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionStatus, string>> = {
@@ -125,14 +177,16 @@ const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionSta
     blocked: "blocked",
     input: "input",
     inspect: "inspect",
+    stopped: "stopped",
     needed: "follow-up",
     working: "working",
     idle: "idle",
   },
   zh: {
     blocked: "受阻",
-    input: "待输入",
+    input: "待介入",
     inspect: "待检查",
+    stopped: "已停止",
     needed: "待跟进",
     working: "进行中",
     idle: "空闲",
@@ -147,6 +201,64 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     quietLabel: "quiet",
     hiddenAlertsLabel: "alerts",
     collapseLabel: "collapse",
+    managementTitle: "management",
+    languageLabel: "Language",
+    styleFamilyLabel: "Style family",
+    paletteLabel: "Palette",
+    visibleItemsLabel: "Visible items",
+    panelDisplayLabel: "Panel display",
+    autoCollapseLabel: "Auto collapse",
+    persistentLabel: "Persistent",
+    alertDisplaySecondsLabel: "Alert display seconds",
+    preventAutoCollapseStatusesLabel: "Keep open for statuses",
+    statusColorsLabel: "Status colors",
+    blockedColorLabel: "Blocked color",
+    inspectColorLabel: "Inspect color",
+    stoppedColorLabel: "Stopped color",
+    followUpColorLabel: "Follow-up color",
+    workingColorLabel: "Working color",
+    idleColorLabel: "Idle color",
+    codexHooksLabel: "Codex hooks",
+    checkingCodexHooksLabel: "Checking Codex hook status...",
+    installCodexHooksLabel: "Install Codex hooks",
+    installingLabel: "Installing...",
+    codexHooksInstalledLabel: "Codex hooks installed",
+    applySettingsLabel: "Apply settings",
+    backLabel: "Back",
+    emptyPanelLabel: "no active Codex sessions",
+    localDataLabel: "local data",
+    expandPanelLabel: "Expand status panel",
+    collapsePanelLabel: "Collapse status panel",
+    jumpBackLabel: "Jump back",
+    openingSessionLabel: "Opening session",
+    dismissLabel: "Dismiss",
+    dismissingLabel: "Dismissing session",
+    showEvidenceLabel: (label) => `Show status evidence for ${label}`,
+    statusPrefix: "Status",
+    evidencePrefix: "Evidence",
+    lastActivityPrefix: "Last activity",
+    jumpTargetPrefix: "Jump target",
+    confidencePrefix: "Confidence",
+    labelSeparator: ": ",
+    confidenceLabels: {
+      exact: "exact",
+      inferred: "inferred",
+      unknown: "unknown",
+      unavailable: "unavailable",
+    },
+    jumpTargetLabels: {
+      desktop: "desktop",
+      cli: "cli",
+      unknown: "unknown",
+    },
+    sourceStatusLabels: {
+      available: "available",
+      degraded: "degraded",
+      unknown: "unknown",
+    },
+    sourceNameLabels: {
+      "Codex desktop": "Codex desktop",
+    },
   },
   zh: {
     alertsLabel: "需关注",
@@ -155,6 +267,64 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     quietLabel: "安静",
     hiddenAlertsLabel: "需关注",
     collapseLabel: "收起",
+    managementTitle: "设置",
+    languageLabel: "语言",
+    styleFamilyLabel: "样式",
+    paletteLabel: "配色",
+    visibleItemsLabel: "显示条数",
+    panelDisplayLabel: "面板显示",
+    autoCollapseLabel: "自动收起",
+    persistentLabel: "常驻",
+    alertDisplaySecondsLabel: "提醒显示秒数",
+    preventAutoCollapseStatusesLabel: "包含这些状态时不收起",
+    statusColorsLabel: "状态颜色",
+    blockedColorLabel: "受阻颜色",
+    inspectColorLabel: "待检查颜色",
+    stoppedColorLabel: "已停止颜色",
+    followUpColorLabel: "待跟进颜色",
+    workingColorLabel: "进行中颜色",
+    idleColorLabel: "空闲颜色",
+    codexHooksLabel: "Codex 钩子",
+    checkingCodexHooksLabel: "正在检查 Codex hook 状态...",
+    installCodexHooksLabel: "安装 Codex 钩子",
+    installingLabel: "安装中...",
+    codexHooksInstalledLabel: "Codex 钩子已安装",
+    applySettingsLabel: "应用设置",
+    backLabel: "返回",
+    emptyPanelLabel: "没有活跃的 Codex 会话",
+    localDataLabel: "本地数据",
+    expandPanelLabel: "展开状态面板",
+    collapsePanelLabel: "收起状态面板",
+    jumpBackLabel: "返回会话",
+    openingSessionLabel: "正在打开会话",
+    dismissLabel: "忽略",
+    dismissingLabel: "正在忽略",
+    showEvidenceLabel: (label) => `查看 ${label} 的状态依据`,
+    statusPrefix: "状态",
+    evidencePrefix: "依据",
+    lastActivityPrefix: "最后活动",
+    jumpTargetPrefix: "跳转目标",
+    confidencePrefix: "置信度",
+    labelSeparator: "：",
+    confidenceLabels: {
+      exact: "精确",
+      inferred: "推断",
+      unknown: "未知",
+      unavailable: "不可用",
+    },
+    jumpTargetLabels: {
+      desktop: "桌面端",
+      cli: "命令行",
+      unknown: "未知",
+    },
+    sourceStatusLabels: {
+      available: "可用",
+      degraded: "降级",
+      unknown: "未知",
+    },
+    sourceNameLabels: {
+      "Codex desktop": "Codex 桌面端",
+    },
   },
 };
 
@@ -163,10 +333,11 @@ export function buildStatusPanelModel(
   config = defaultStatusPanelConfig,
 ): StatusPanelModel {
   const theme = themeFromConfig(config);
+  const copy = panelCopy[config.language];
   const panelRows = rows
     .filter((row) => !row.dismissed)
     .filter(shouldIncludeInWatchlist)
-    .map((row) => toPanelRow(row, theme))
+    .map((row) => toPanelRow(row, theme, copy))
     .sort(comparePanelRows);
   const cardRows = panelRows.filter((row) => row.displayStatus !== "idle");
   const quietRows = panelRows.filter((row) => row.statusTone === "quiet");
@@ -188,7 +359,7 @@ export function buildStatusPanelModel(
     workingCount: quietRows.filter((row) => row.displayStatus === "working").length,
     idleCount: panelRows.filter((row) => row.displayStatus === "idle").length,
     theme,
-    copy: panelCopy[config.language],
+    copy,
   };
 }
 
@@ -211,6 +382,11 @@ function themeFromConfig(config: StatusPanelConfig): AtomInterventionTheme {
         ...atomInterventionTheme.status.inspect,
         label: statusLabels[config.language].inspect,
         color: config.statusColors.inspect,
+      },
+      stopped: {
+        ...atomInterventionTheme.status.stopped,
+        label: statusLabels[config.language].stopped,
+        color: config.statusColors.stopped,
       },
       needed: {
         ...atomInterventionTheme.status.needed,
@@ -244,7 +420,7 @@ function timestampValue(value?: string) {
   return Number.isNaN(timestamp) ? 0 : timestamp;
 }
 
-function toPanelRow(row: SessionRow, theme: AtomInterventionTheme): StatusPanelRow {
+function toPanelRow(row: SessionRow, theme: AtomInterventionTheme, copy: StatusPanelCopy): StatusPanelRow {
   const displayStatus = displayStatusForRow(row);
   const status = theme.status[displayStatus];
 
@@ -256,13 +432,14 @@ function toPanelRow(row: SessionRow, theme: AtomInterventionTheme): StatusPanelR
     statusColor: status.color,
     statusTone: displayStatus === "working" || displayStatus === "idle" ? "quiet" : "alert",
     interventionReason: interventionReasonForRow(row, displayStatus),
-    evidenceTooltip: evidenceTooltipForRow(row),
+    evidenceTooltip: evidenceTooltipForRow(row, copy),
   };
 }
 
 function displayStatusForRow(row: SessionRow): InterventionStatus {
   if (row.state === "inspect" || row.state === "dismissable") return "inspect";
   if (row.state === "waitingForInput") return "input";
+  if (row.state === "stopped") return "stopped";
   if (row.state === "needsAttention") return "needed";
   if (row.state === "running") return "working";
   if (row.state === "idle") return "idle";
@@ -296,6 +473,8 @@ function interventionReasonForRow(row: SessionRow, status: InterventionStatus) {
       return "waiting for your input";
     case "inspect":
       return "ready to inspect";
+    case "stopped":
+      return "stopped before completion";
     case "needed":
       return "needs your attention";
     case "working":
@@ -305,12 +484,12 @@ function interventionReasonForRow(row: SessionRow, status: InterventionStatus) {
   }
 }
 
-function evidenceTooltipForRow(row: SessionRow) {
+function evidenceTooltipForRow(row: SessionRow, copy: StatusPanelCopy) {
   return [
-    `Status: ${row.statusReason}`,
-    row.evidenceSummary ? `Evidence: ${row.evidenceSummary}` : undefined,
-    row.lastActivityAt ? `Last activity: ${row.lastActivityAt}` : undefined,
-    `Jump target: ${row.jumpTarget}`,
-    `Confidence: ${row.confidence}`,
+    `${copy.statusPrefix}${copy.labelSeparator}${row.statusReason}`,
+    row.evidenceSummary ? `${copy.evidencePrefix}${copy.labelSeparator}${row.evidenceSummary}` : undefined,
+    row.lastActivityAt ? `${copy.lastActivityPrefix}${copy.labelSeparator}${row.lastActivityAt}` : undefined,
+    `${copy.jumpTargetPrefix}${copy.labelSeparator}${copy.jumpTargetLabels[row.jumpTarget]}`,
+    `${copy.confidencePrefix}${copy.labelSeparator}${copy.confidenceLabels[row.confidence]}`,
   ].filter(Boolean).join("\n");
 }

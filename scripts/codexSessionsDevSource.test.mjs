@@ -355,6 +355,73 @@ describe("codexSessionsDevSource", () => {
     expect(result.message).toBe("Focused live iTerm Codex session.");
   });
 
+  it("targets the matching live CLI session when multiple sessions share a workspace", async () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "10");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const workspacePath = "/Users/edy/hose/tmc_symposium/tmc_surprise";
+    const firstId = "019eaa00-0000-7000-8000-000000000001";
+    const secondId = "019eaa00-0000-7000-8000-000000000002";
+    const firstRolloutPath = path.join(sessionDir, `rollout-2026-06-10T12-00-00-${firstId}.jsonl`);
+    const secondRolloutPath = path.join(sessionDir, `rollout-2026-06-10T12-05-00-${secondId}.jsonl`);
+    fs.writeFileSync(
+      firstRolloutPath,
+      [
+        `{"timestamp":"2026-06-10T04:00:00.000Z","type":"session_meta","payload":{"id":"${firstId}","cwd":"${workspacePath}","originator":"Codex CLI","source":"cli"}}`,
+        '{"timestamp":"2026-06-10T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"first\\n"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      secondRolloutPath,
+      [
+        `{"timestamp":"2026-06-10T04:05:00.000Z","type":"session_meta","payload":{"id":"${secondId}","cwd":"${workspacePath}","originator":"Codex CLI","source":"cli"}}`,
+        '{"timestamp":"2026-06-10T04:06:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"second\\n"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: firstId,
+      rolloutPath: firstRolloutPath,
+      cwd: workspacePath,
+      title: "first",
+      source: "cli",
+      threadSource: "user",
+      preview: "first",
+      updatedAtMs: Date.parse("2026-06-10T04:01:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: secondId,
+      rolloutPath: secondRolloutPath,
+      cwd: workspacePath,
+      title: "second",
+      source: "cli",
+      threadSource: "user",
+      preview: "second",
+      updatedAtMs: Date.parse("2026-06-10T04:06:00.000Z"),
+    });
+    const executed = [];
+
+    await jumpToSession(secondId, {
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-10T04:10:00.000Z"),
+      limit: 20,
+      liveCliSessions: [
+        { sessionId: firstId, workspacePath, tty: "ttys001" },
+        { sessionId: secondId, workspacePath, tty: "ttys004" },
+      ],
+      previousITermTtyForWorkspace: () => undefined,
+      executeJump: async (_row, plan) => executed.push(plan),
+    });
+
+    expect(executed).toEqual([{ kind: "iterm", tty: "ttys004", liveCodex: true }]);
+  });
+
   it("excludes archived SQLite threads from discovery", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
@@ -393,6 +460,107 @@ describe("codexSessionsDevSource", () => {
     });
 
     expect(rows).toHaveLength(0);
+  });
+
+  it("adds archived CLI threads back when the exact session is live", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const archivedDir = path.join(temp, "archived_sessions");
+    fs.mkdirSync(archivedDir, { recursive: true });
+    const rolloutPath = path.join(archivedDir, "rollout-2026-06-04T14-30-34-019e9153-943a-7402-8e61-9e89cee5a6f4.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-10T06:54:00.000Z","type":"session_meta","payload":{"id":"019e9153-943a-7402-8e61-9e89cee5a6f4","cwd":"/Users/edy/hose/tmc_symposium/tmc_surprise","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-10T06:55:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"继续\\n"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019e9153-943a-7402-8e61-9e89cee5a6f4",
+      rolloutPath,
+      cwd: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+      title: "commit the changes",
+      source: "cli",
+      threadSource: "user",
+      preview: "commit the changes",
+      updatedAtMs: Date.parse("2026-06-10T06:55:00.000Z"),
+      archived: 1,
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-10T07:00:00.000Z"),
+      limit: 20,
+      liveCliSessions: [{
+        sessionId: "019e9153-943a-7402-8e61-9e89cee5a6f4",
+        workspacePath: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+        tty: "ttys002",
+      }],
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019e9153-943a-7402-8e61-9e89cee5a6f4",
+      label: "commit the changes",
+      state: "running",
+      confidence: "exact",
+      workspacePath: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+      jumpTarget: "cli",
+      jumpAvailability: "approximate",
+      statusReason: "running signal observed",
+    });
+  });
+
+  it("keeps a completed matching live CLI row in inspect instead of marking it running", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "09");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-09T15-55-11-019eab60-da30-7ea3-8b66-b53dd94db260.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-09T07:55:00.000Z","type":"session_meta","payload":{"id":"019eab60-da30-7ea3-8b66-b53dd94db260","cwd":"/Users/edy/hose/tmc_symposium/tmc_surprise","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-09T08:07:25.205Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019eab60-da30-7ea3-8b66-b53dd94db260",
+      rolloutPath,
+      cwd: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+      title: "从master切一个新的workspace",
+      source: "cli",
+      threadSource: "user",
+      preview: "从master切一个新的workspace",
+      updatedAtMs: Date.parse("2026-06-09T08:07:25.205Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-10T07:00:00.000Z"),
+      limit: 20,
+      liveCliSessions: [{
+        sessionId: "019eab60-da30-7ea3-8b66-b53dd94db260",
+        workspacePath: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+        tty: "ttys012",
+      }],
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019eab60-da30-7ea3-8b66-b53dd94db260",
+      state: "inspect",
+      confidence: "exact",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    });
   });
 
   it("treats a newer user message after task_complete as active work", () => {
@@ -543,7 +711,7 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
-  it("does not leave interrupted command approval prompts waiting for input", () => {
+  it("marks interrupted command approval prompts as stopped", () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
     fs.mkdirSync(sessionDir, { recursive: true });
@@ -568,8 +736,8 @@ describe("codexSessionsDevSource", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       sessionId: "019approval-interrupted",
-      state: "running",
-      statusReason: "running signal observed",
+      state: "stopped",
+      statusReason: "stopped before completion; decide whether to continue, inspect, or dismiss",
       evidenceSummary: "local Codex JSONL activity observed",
     });
   });

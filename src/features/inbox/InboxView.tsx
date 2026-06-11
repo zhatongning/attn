@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { SessionRow, SourceHealth } from "../../shared/types/session";
+import type { SessionRow, SessionState, SourceHealth } from "../../shared/types/session";
 import {
   dismissSession as dismissSessionCommand,
   jumpToSession as jumpToSessionCommand,
@@ -108,10 +108,10 @@ export function InboxView({ initialRows, sourceHealth }: InboxViewProps) {
 
       <section className="layout">
         <section className="inbox-panel" aria-label="Codex task inbox">
-          {Object.entries(groups).map(([state, groupRows]) => (
+          {(Object.entries(groups) as Array<[SessionState, SessionRow[]]>).map(([state, groupRows]) => (
             <section className="session-group" key={state}>
               <div className="group-heading">
-                <h2>{groupLabels[state as keyof typeof groupLabels]}</h2>
+                <h2>{groupLabels[state]}</h2>
                 <span>{groupRows.length}</span>
               </div>
               {groupRows.length === 0 ? (

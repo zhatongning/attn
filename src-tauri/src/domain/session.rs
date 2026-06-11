@@ -12,6 +12,7 @@ pub enum ObservationKind {
     Completed,
     CompletedStale,
     Failed,
+    Stopped,
     InsufficientEvidence,
 }
 
@@ -22,6 +23,7 @@ pub enum SessionState {
     WaitingForInput,
     Inspect,
     Running,
+    Stopped,
     Idle,
     Unknown,
     Dismissable,

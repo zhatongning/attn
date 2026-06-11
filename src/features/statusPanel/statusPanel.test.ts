@@ -22,15 +22,17 @@ describe("buildStatusPanelModel", () => {
   it("maps source states to intervention display statuses", () => {
     const model = buildStatusPanelModel([
       row("needs-input", "waitingForInput", "waiting for user input"),
+      row("stopped", "stopped", "stopped before completion; decide whether to continue, inspect, or dismiss"),
       row("active", "running", "running signal observed"),
       row("complete", "dismissable", "completed task ready for inspect; confirm to mark idle"),
       row("unknown", "unknown", "source status unavailable"),
-    ]);
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 4 });
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["unknown", "blocked"],
       ["needs-input", "input"],
       ["complete", "inspect"],
+      ["stopped", "stopped"],
     ]);
     expect(model.hiddenRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["active", "working"],
@@ -54,6 +56,7 @@ describe("buildStatusPanelModel", () => {
   it("defaults to an auto-collapsing panel that stays open for eight seconds after alerts", () => {
     expect(defaultStatusPanelConfig.panelMode).toBe("auto");
     expect(defaultStatusPanelConfig.autoCollapseDelayMs).toBe(8000);
+    expect(defaultStatusPanelConfig.preventAutoCollapseStatuses).toEqual(["inspect"]);
   });
 
   it("uses the configured visible item count from management settings", () => {
@@ -82,7 +85,7 @@ describe("buildStatusPanelModel", () => {
       { ...defaultStatusPanelConfig, language: "zh" },
     );
 
-    expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待输入", "待检查"]);
+    expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待介入", "待检查"]);
     expect(model.hiddenRows.map((item) => item.statusLabel)).toEqual(["待跟进"]);
     expect(model.copy.alertsLabel).toBe("需关注");
     expect(model.copy.workingLabel).toBe("进行中");

@@ -11,7 +11,12 @@ import {
   loadSessions,
   loadSourceHealth,
 } from "../inbox/inboxApi";
-import { buildStatusPanelModel, defaultStatusPanelConfig, type StatusPanelConfig } from "./statusPanel";
+import {
+  buildStatusPanelModel,
+  defaultStatusPanelConfig,
+  type InterventionStatus,
+  type StatusPanelConfig,
+} from "./statusPanel";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
@@ -22,7 +27,18 @@ const PANEL_BASE_HEIGHT = 252;
 const PANEL_BASE_VISIBLE_ITEMS = 3;
 const PANEL_EXTRA_ROW_HEIGHT = 48;
 const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PANEL_EXTRA_ROW_HEIGHT;
+const PANEL_MESSAGE_HEIGHT = 30;
 const PANEL_STRIP_HEIGHT = 60;
+const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "needed", "working"];
+const CONFIGURABLE_STATUSES = new Set<InterventionStatus>([
+  "blocked",
+  "input",
+  "inspect",
+  "stopped",
+  "needed",
+  "working",
+  "idle",
+]);
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
@@ -49,6 +65,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const autoCollapseTimerRef = useRef<number | undefined>(undefined);
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
+  const hasPanelMessage = commandMessage !== null || errorMessage !== null;
+  const shouldKeepPanelOpenForStatus = useMemo(() => {
+    return hasPreventAutoCollapseStatus(model, config);
+  }, [config, model]);
   const alertSignature = useMemo(() => {
     return [...model.visibleRows, ...model.hiddenRows]
       .filter((row) => row.statusTone === "alert")
@@ -137,10 +157,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     const nextHeight = view === "management"
       ? MANAGEMENT_HEIGHT
       : panelOpen
-        ? panelWindowHeight(displayedRows.length)
+        ? panelWindowHeight(displayedRows.length, hasPanelMessage)
         : PANEL_STRIP_HEIGHT;
     void resizePanelWindow(nextHeight);
-  }, [displayedRows.length, panelOpen, view]);
+  }, [displayedRows.length, hasPanelMessage, panelOpen, view]);
 
   useEffect(() => {
     const previousSignature = alertSignatureRef.current;
@@ -151,9 +171,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }
 
     if (alertSignature.length > 0) {
-      openPanelTemporarily();
+      openPanelTemporarily(shouldKeepPanelOpenForStatus);
     }
-  }, [alertSignature]);
+  }, [alertSignature, shouldKeepPanelOpenForStatus]);
 
   useEffect(() => {
     return () => {
@@ -242,21 +262,21 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
       <main className="panel-shell management-shell" data-theme={`${model.theme.styleFamily}-${model.theme.palette}`}>
         <header className="panel-header panel-header--draggable" onPointerDown={startPanelDrag}>
           <div className="panel-title">
-            <h1>management</h1>
+            <h1>{model.copy.managementTitle}</h1>
         </div>
         <button type="button" className="icon-button icon-button--back" data-no-window-drag onClick={() => {
           updateDraftConfig(configRef.current);
           setView("panel");
         }}>
-          Back
+          {model.copy.backLabel}
         </button>
         </header>
 
-        <section className="management-section" aria-label="Status panel settings">
+        <section className="management-section" aria-label={model.copy.managementTitle}>
           <label className="setting-field">
-            <span>Language</span>
+            <span>{model.copy.languageLabel}</span>
             <select
-              aria-label="Language"
+              aria-label={model.copy.languageLabel}
               value={draftConfig.language}
               onChange={(event) =>
                 updateDraftConfig((current) => ({ ...current, language: event.target.value as StatusPanelConfig["language"] }))
@@ -268,9 +288,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           </label>
 
           <label className="setting-field">
-            <span>Style family</span>
+            <span>{model.copy.styleFamilyLabel}</span>
             <select
-              aria-label="Style family"
+              aria-label={model.copy.styleFamilyLabel}
               value={draftConfig.styleFamily}
               onChange={(event) =>
                 updateDraftConfig((current) => ({ ...current, styleFamily: event.target.value as StatusPanelConfig["styleFamily"] }))
@@ -281,9 +301,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           </label>
 
           <label className="setting-field">
-            <span>Palette</span>
+            <span>{model.copy.paletteLabel}</span>
             <select
-              aria-label="Palette"
+              aria-label={model.copy.paletteLabel}
               value={draftConfig.palette}
               onChange={(event) =>
                 updateDraftConfig((current) => ({ ...current, palette: event.target.value as StatusPanelConfig["palette"] }))
@@ -294,9 +314,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           </label>
 
           <label className="setting-field">
-            <span>Visible items</span>
+            <span>{model.copy.visibleItemsLabel}</span>
             <input
-              aria-label="Visible items"
+              aria-label={model.copy.visibleItemsLabel}
               type="number"
               min={1}
               max={8}
@@ -311,23 +331,23 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           </label>
 
           <label className="setting-field">
-            <span>Panel display</span>
+            <span>{model.copy.panelDisplayLabel}</span>
             <select
-              aria-label="Panel display"
+              aria-label={model.copy.panelDisplayLabel}
               value={draftConfig.panelMode}
               onChange={(event) =>
                 updateDraftConfig((current) => ({ ...current, panelMode: event.target.value as StatusPanelConfig["panelMode"] }))
               }
             >
-              <option value="auto">Auto collapse</option>
-              <option value="persistent">Persistent</option>
+              <option value="auto">{model.copy.autoCollapseLabel}</option>
+              <option value="persistent">{model.copy.persistentLabel}</option>
             </select>
           </label>
 
           <label className="setting-field">
-            <span>Alert display seconds</span>
+            <span>{model.copy.alertDisplaySecondsLabel}</span>
             <input
-              aria-label="Alert display seconds"
+              aria-label={model.copy.alertDisplaySecondsLabel}
               type="number"
               min={1}
               max={120}
@@ -342,39 +362,61 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             />
           </label>
 
+          <fieldset className="status-checkbox-settings">
+            <legend>{model.copy.preventAutoCollapseStatusesLabel}</legend>
+            <div className="status-checkbox-grid">
+              {AUTO_COLLAPSE_STATUS_OPTIONS.map((status) => (
+                <label className="status-checkbox-field" key={status}>
+                  <input
+                    aria-label={model.theme.status[status].label}
+                    type="checkbox"
+                    checked={draftConfig.preventAutoCollapseStatuses.includes(status)}
+                    onChange={(event) => setPreventAutoCollapseStatus(status, event.target.checked)}
+                  />
+                  <span>{model.theme.status[status].label}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
           <fieldset className="status-color-settings">
-            <legend>Status colors</legend>
+            <legend>{model.copy.statusColorsLabel}</legend>
             <ColorField
-              label="Blocked color"
+              label={model.copy.blockedColorLabel}
               value={draftConfig.statusColors.blocked}
               onChange={(value) => setStatusColor("blocked", value)}
             />
             <ColorField
-              label="Inspect color"
+              label={model.copy.inspectColorLabel}
               value={draftConfig.statusColors.inspect}
               onChange={(value) => setStatusColor("inspect", value)}
             />
             <ColorField
-              label="Follow-up color"
+              label={model.copy.stoppedColorLabel}
+              value={draftConfig.statusColors.stopped}
+              onChange={(value) => setStatusColor("stopped", value)}
+            />
+            <ColorField
+              label={model.copy.followUpColorLabel}
               value={draftConfig.statusColors.needed}
               onChange={(value) => setStatusColor("needed", value)}
             />
             <ColorField
-              label="Working color"
+              label={model.copy.workingColorLabel}
               value={draftConfig.statusColors.working}
               onChange={(value) => setStatusColor("working", value)}
             />
             <ColorField
-              label="Idle color"
+              label={model.copy.idleColorLabel}
               value={draftConfig.statusColors.idle}
               onChange={(value) => setStatusColor("idle", value)}
             />
           </fieldset>
 
-          <section className="hook-settings" aria-label="Codex hook integration">
+          <section className="hook-settings" aria-label={model.copy.codexHooksLabel}>
             <div>
-              <h2>Codex hooks</h2>
-              <p>{hookStatus?.detail ?? "Checking Codex hook status..."}</p>
+              <h2>{model.copy.codexHooksLabel}</h2>
+              <p>{hookStatus?.detail ?? model.copy.checkingCodexHooksLabel}</p>
               <code>{hookStatus?.hooksPath ?? "~/.codex/hooks.json"}</code>
             </div>
             <button
@@ -382,13 +424,17 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
               disabled={hookInstallPending || hookStatus?.installed === true}
               onClick={installHooks}
             >
-              {hookStatus?.installed ? "Codex hooks installed" : hookInstallPending ? "Installing..." : "Install Codex hooks"}
+              {hookStatus?.installed
+                ? model.copy.codexHooksInstalledLabel
+                : hookInstallPending
+                  ? model.copy.installingLabel
+                  : model.copy.installCodexHooksLabel}
             </button>
           </section>
 
           <div className="management-actions">
             <button type="button" onClick={applyDraftConfig}>
-              Apply settings
+              {model.copy.applySettingsLabel}
             </button>
           </div>
         </section>
@@ -414,7 +460,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           type="button"
           className="strip-toggle"
           data-no-window-drag
-          aria-label={panelOpen ? "Collapse status panel" : "Expand status panel"}
+          aria-label={panelOpen ? model.copy.collapsePanelLabel : model.copy.expandPanelLabel}
           onClick={() => setManualPanelOpen(!panelOpen)}
         >
           {panelOpen ? "-" : "+"}
@@ -428,7 +474,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
             aria-label="Codex status panel"
           >
             {displayedRows.length === 0 ? (
-              <p className="empty-panel">no active Codex sessions</p>
+              <p className="empty-panel">{model.copy.emptyPanelLabel}</p>
             ) : (
               displayedRows.map((row) => (
                 <StatusRow
@@ -436,6 +482,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
                   row={row}
                   pendingAction={pendingActions[row.sessionId]}
                   attentionCue={attentionCues[row.sessionId] === true}
+                  copy={model.copy}
                   onJump={jumpToSession}
                   onDismiss={dismissSession}
                 />
@@ -445,9 +492,9 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
           <footer className="panel-footer">
             <span className={`source-dot source-dot--${health.status}`} />
-            <span>{health.sourceName}</span>
-            <span>{health.status}</span>
-            <span>local data</span>
+            <span>{model.copy.sourceNameLabels[health.sourceName] ?? health.sourceName}</span>
+            <span>{model.copy.sourceStatusLabels[health.status]}</span>
+            <span>{model.copy.localDataLabel}</span>
             {model.hiddenCount > 0 ? (
               <button
                 type="button"
@@ -496,6 +543,16 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }));
   }
 
+  function setPreventAutoCollapseStatus(status: InterventionStatus, checked: boolean) {
+    updateDraftConfig((current) => {
+      const statuses = current.preventAutoCollapseStatuses.filter((item) => item !== status);
+      return {
+        ...current,
+        preventAutoCollapseStatuses: checked ? [...statuses, status] : statuses,
+      };
+    });
+  }
+
   function updateDraftConfig(nextConfig: StatusPanelConfig | ((current: StatusPanelConfig) => StatusPanelConfig)) {
     const resolvedConfig = typeof nextConfig === "function" ? nextConfig(draftConfigRef.current) : nextConfig;
     draftConfigRef.current = resolvedConfig;
@@ -504,8 +561,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
   function applyDraftConfig() {
     const nextConfig = normalizeConfig(draftConfigRef.current);
+    const nextModel = buildStatusPanelModel(rows, nextConfig);
+    clearAutoCollapseTimer();
     setConfig(nextConfig);
-    setPanelOpen(nextConfig.panelMode === "persistent");
+    setPanelOpen(nextConfig.panelMode === "persistent" || hasPreventAutoCollapseStatus(nextModel, nextConfig));
     updateDraftConfig(nextConfig);
     setView("panel");
   }
@@ -541,7 +600,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     setPanelOpen(nextOpen);
   }
 
-  function openPanelTemporarily() {
+  function openPanelTemporarily(keepOpenForStatus: boolean) {
     if (configRef.current.panelMode === "persistent") {
       setPanelOpen(true);
       return;
@@ -549,6 +608,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
     clearAutoCollapseTimer();
     setPanelOpen(true);
+    if (keepOpenForStatus) {
+      return;
+    }
+
     autoCollapseTimerRef.current = window.setTimeout(() => {
       setPanelOpen(false);
     }, configRef.current.autoCollapseDelayMs);
@@ -568,20 +631,22 @@ interface StatusRowProps {
   row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number];
   pendingAction?: "jump" | "dismiss";
   attentionCue?: boolean;
+  copy: ReturnType<typeof buildStatusPanelModel>["copy"];
   onJump: (sessionId: string) => void;
   onDismiss: (sessionId: string) => void;
 }
 
-function StatusRow({ row, pendingAction, attentionCue = false, onJump, onDismiss }: StatusRowProps) {
+function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onDismiss }: StatusRowProps) {
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const evidenceRef = useRef<HTMLSpanElement | null>(null);
-  const jumpTitle = pendingAction === "jump" ? "Opening session" : "Jump back";
-  const dismissTitle = pendingAction === "dismiss" ? "Dismissing session" : "Dismiss";
+  const jumpTitle = pendingAction === "jump" ? copy.openingSessionLabel : copy.jumpBackLabel;
+  const dismissTitle = pendingAction === "dismiss" ? copy.dismissingLabel : copy.dismissLabel;
   const rowClassName = [
     "status-row",
     `status-row--${row.displayStatus}`,
     `status-row--${row.statusTone}`,
     attentionCue ? "status-row--attention-cue" : "",
+    evidenceOpen ? "status-row--evidence-open" : "",
   ].filter(Boolean).join(" ");
 
   useEffect(() => {
@@ -622,12 +687,12 @@ function StatusRow({ row, pendingAction, attentionCue = false, onJump, onDismiss
         <h2>{row.label}</h2>
         <p className="status-meta">
           <span className="status-workspace">{rowSubtitle(row)}</span>
-          <span className="status-confidence">{row.confidence}</span>
+          <span className="status-confidence">{copy.confidenceLabels[row.confidence]}</span>
           <span className="status-evidence-anchor" ref={evidenceRef}>
             <button
               type="button"
               className="status-info"
-              aria-label={`Show status evidence for ${row.label}`}
+              aria-label={copy.showEvidenceLabel(row.label)}
               aria-expanded={evidenceOpen}
               aria-describedby={evidenceOpen ? `status-evidence-${row.sessionId}` : undefined}
               onClick={() => setEvidenceOpen((current) => !current)}
@@ -700,14 +765,16 @@ function PendingIcon() {
   );
 }
 
-function panelWindowHeight(visibleItemCount: number) {
+function panelWindowHeight(visibleItemCount: number, hasMessage = false) {
   const normalizedCount = Math.min(8, Math.max(1, visibleItemCount));
+  const baseHeight = Math.max(
+    PANEL_MIN_HEIGHT,
+    PANEL_BASE_HEIGHT + (normalizedCount - PANEL_BASE_VISIBLE_ITEMS) * PANEL_EXTRA_ROW_HEIGHT,
+  );
+
   return Math.min(
     420,
-    Math.max(
-      PANEL_MIN_HEIGHT,
-      PANEL_BASE_HEIGHT + (normalizedCount - PANEL_BASE_VISIBLE_ITEMS) * PANEL_EXTRA_ROW_HEIGHT,
-    ),
+    baseHeight + (hasMessage ? PANEL_MESSAGE_HEIGHT : 0),
   );
 }
 
@@ -797,6 +864,9 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
   if (!isObject(value)) return defaultStatusPanelConfig;
 
   const statusColors = isObject(value.statusColors) ? value.statusColors : {};
+  const preventAutoCollapseStatuses = Array.isArray(value.preventAutoCollapseStatuses)
+    ? value.preventAutoCollapseStatuses.filter(isConfigurableStatus)
+    : defaultStatusPanelConfig.preventAutoCollapseStatuses;
   const visibleItemCount = typeof value.visibleItemCount === "number"
     ? Math.min(8, Math.max(1, value.visibleItemCount))
     : defaultStatusPanelConfig.visibleItemCount;
@@ -811,15 +881,29 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
     visibleItemCount,
     panelMode: value.panelMode === "persistent" ? "persistent" : "auto",
     autoCollapseDelayMs,
+    preventAutoCollapseStatuses,
     statusColors: {
       blocked: colorValue(statusColors.blocked, defaultStatusPanelConfig.statusColors.blocked),
       input: colorValue(statusColors.input, defaultStatusPanelConfig.statusColors.input),
       inspect: colorValue(statusColors.inspect, defaultStatusPanelConfig.statusColors.inspect),
+      stopped: colorValue(statusColors.stopped, defaultStatusPanelConfig.statusColors.stopped),
       needed: colorValue(statusColors.needed, defaultStatusPanelConfig.statusColors.needed),
       working: colorValue(statusColors.working, defaultStatusPanelConfig.statusColors.working),
       idle: colorValue(statusColors.idle, defaultStatusPanelConfig.statusColors.idle),
     },
   };
+}
+
+function hasPreventAutoCollapseStatus(
+  model: ReturnType<typeof buildStatusPanelModel>,
+  config: StatusPanelConfig,
+) {
+  const statuses = new Set(config.preventAutoCollapseStatuses);
+  return [...model.visibleRows, ...model.hiddenRows].some((row) => statuses.has(row.displayStatus));
+}
+
+function isConfigurableStatus(value: unknown): value is InterventionStatus {
+  return typeof value === "string" && CONFIGURABLE_STATUSES.has(value as InterventionStatus);
 }
 
 function colorValue(value: unknown, fallback: string) {

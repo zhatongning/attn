@@ -17,9 +17,9 @@ The implementation currently has three layers. Keeping them separate prevents mo
 
 | Layer | Examples | Purpose |
 | --- | --- | --- |
-| Source observation | `Running`, `Idle`, `Completed`, `CompletedStale`, `WaitingForInput`, `Failed`, `InsufficientEvidence` | Raw or inferred evidence from SQLite, JSONL, and process checks. |
-| Internal row state | `running`, `idle`, `needsAttention`, `dismissable`, `unknown` | Normalized state used by commands and storage. |
-| UI display key | `working`, `idle`, `needed`, `inspect`, `blocked` | Stable key used for sorting and colors. Labels can be localized, for example `needed` displays as `follow-up` or `待跟进`. |
+| Source observation | `Running`, `Stopped`, `Idle`, `Completed`, `CompletedStale`, `WaitingForInput`, `Failed`, `InsufficientEvidence` | Raw or inferred evidence from SQLite, JSONL, and process checks. |
+| Internal row state | `running`, `stopped`, `idle`, `needsAttention`, `dismissable`, `unknown` | Normalized state used by commands and storage. |
+| UI display key | `working`, `stopped`, `idle`, `needed`, `inspect`, `blocked` | Stable key used for sorting and colors. Labels can be localized, for example `needed` displays as `follow-up` or `待跟进`. |
 
 ## Event Sources
 
@@ -44,6 +44,8 @@ The intended model is:
 | Display status | Marker | Meaning | Should user act? |
 | --- | --- | --- | --- |
 | `working` | `○ working` | The agent is actively executing work now. | No. Keep visible as quiet context. |
+| `input` | `● input` | The agent is waiting for user intervention, such as approval, confirmation, or additional information. | Yes. |
+| `stopped` | `● stopped` | The run was manually stopped or aborted before a completion signal. | Yes. Decide whether to continue, inspect, or dismiss it. |
 | `idle` | `○ idle` | No active work is happening and no user action is required. | No. Count it as quiet context, but do not spend a card on it by default. |
 | `needed` | `● follow-up` | The session was opened recently and may still need a short follow-up before it settles. | Yes. |
 | `inspect` | `● inspect` | The agent just produced a result that should be checked while context is fresh. | Yes. |
@@ -62,9 +64,11 @@ Chinese labels, if the UI becomes localized:
 | English | Recommended Chinese | Rationale |
 | --- | --- | --- |
 | `blocked` | `受阻` | Short and clearly means the agent cannot continue. |
+| `input` | `待介入` | Broader than "typing input"; covers approval, confirmation, permission, or additional information. |
 | `inspect` | `待检查` | Matches the action: open and inspect the result. |
 | `follow-up` | `待跟进` | Matches the post-read window: the user may need to continue, confirm, or take over soon without implying an urgent blocker. |
 | `working` | `进行中` | Clear active-work state. |
+| `stopped` | `已停止` | Clear stopped-before-completion state. |
 | `idle` | `空闲` | Quiet no-action state. |
 
 The UI language is a display configuration, not a state-model change.
@@ -79,6 +83,7 @@ These are the rules implemented today.
 | JSONL evidence | Source observation |
 | --- | --- |
 | Last relevant event is `task_complete` and the signal is unread | `CompletedImmediate` |
+| Last relevant event is `turn_aborted` | `Stopped` |
 | Last relevant event after `task_complete` is `user_message` or `agent_message`, and it is recent | `Running` |
 | Recent activity but no terminal event | `Running` |
 | Old activity with no terminal event | `InsufficientEvidence` |
@@ -108,7 +113,8 @@ Generic non-terminal activity is still considered recent for 2 hours.
 
 ### Live CLI Process Rule
 
-If a CLI row is `unknown` and a live Codex process is found for the same workspace, the row is promoted to `running`.
+If a CLI row is `unknown` or `idle` and a live Codex process is found for the same session, the row can be promoted to `running`.
+Terminal and intervention states such as `inspect`, `stopped`, `waitingForInput`, and `needsAttention` are stronger than process presence and must not be overwritten by a live process scan.
 
 ## Codex Hook Rules
 
@@ -126,7 +132,7 @@ These hooks are the preferred source for live status transitions when the app-ow
 | `Stop` | pending terminal check | A turn ended. Do not classify as `Completed` by itself. |
 
 `Stop` is intentionally not a final state. It can mean success, waiting for input, interruption, tool failure, or a normal turn boundary.
-After `Stop`, the app should consult JSONL and any hook payload to decide whether the row becomes `inspect`, `needed`, `blocked`, or `idle`.
+After `Stop`, the app should consult JSONL and any hook payload to decide whether the row becomes `inspect`, `stopped`, `needed`, `blocked`, or `idle`.
 
 ### Hook Storage
 
@@ -161,6 +167,7 @@ For this app, user-level hooks are likely the right default because the status p
 | Source observation | Internal row state | Confidence | Status reason |
 | --- | --- | --- | --- |
 | `Running` | `running` | `exact` | `running signal observed` |
+| `Stopped` | `stopped` | `exact` | `stopped before completion; decide whether to continue, inspect, or dismiss` |
 | `Idle` | `idle` | `inferred` | `no recent activity observed; idle until the next source signal` |
 | `WaitingForInput` | `needsAttention` | `exact` | `waiting for user input` |
 | `CompletedImmediate` | `inspect` | `exact` | `completed task ready to inspect; open it to mark read` |
@@ -174,7 +181,9 @@ For this app, user-level hooks are likely the right default because the status p
 | Internal row state | UI display status |
 | --- | --- |
 | `running` | `working` |
+| `stopped` | `stopped` |
 | `idle` | `idle` |
+| `waitingForInput` | `input` |
 | `needsAttention` | `needed` |
 | `inspect` | `inspect` |
 | legacy `dismissable` | `inspect` |
@@ -191,7 +200,7 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 | Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `working` or `idle` | No state transition. |
-| Dismiss an `inspect` or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
+| Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
 | Dismiss a `working` or `needed` row | It is restored immediately on next list because active/intervention rows should not stay hidden. |
 
 Read acknowledgement is keyed by `sessionId + lastActivityAt` and stores `acknowledgedAt`.
@@ -221,6 +230,9 @@ These are the areas that currently feel wrong or need product decisions.
 
 7. TODO: Find a reliable read/open evidence source for Codex Desktop history navigation.
    Current local evidence is insufficient to prove an `inspect` row was read when the user opens that thread directly inside Codex Desktop. `threads.updated_at_ms` does not always advance, `threads` has no `read_at`/`seen_at` field, `logs_2.sqlite` has execution logs but no reliable post-completion read event, and generic UI click/Sentry data is not safely attributable to a specific session. Hooks are useful for execution lifecycle state, but they do not currently prove UI-level read/open actions.
+
+8. TODO: Evaluate natural-language confirmation requests as weak `input` evidence.
+   Assistant text such as "if you agree, I will..." or "please confirm before I continue" may indicate the session is waiting for user intervention. This should be treated as inferred evidence only, not as strong as tool approval or structured Codex events. Any implementation needs conservative wording rules to avoid confusing optional offers such as "if you want, I can also..." with true blockers.
 
 ## Open Product Decisions
 
@@ -264,7 +276,7 @@ stateDiagram-v2
     Needed --> Idle: read window exceeds 30 minutes
     Working --> Idle: migrated old task_complete
     Working --> Idle: old activity without intervention signal
-    Working --> Needed: waiting for user input
+    Working --> Input: waiting for user intervention
     Working --> Blocked: actionable failure/source issue
     Blocked --> Idle: user confirms or issue clears
     Idle --> Working: new user_message or agent_message

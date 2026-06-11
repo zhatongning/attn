@@ -43,6 +43,11 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
             Confidence::Exact,
             "failed task can be manually reviewed and cleared".to_string(),
         ),
+        ObservationKind::Stopped => (
+            SessionState::Stopped,
+            Confidence::Exact,
+            "stopped before completion; decide whether to continue, inspect, or dismiss".to_string(),
+        ),
         ObservationKind::InsufficientEvidence => (
             SessionState::Unknown,
             Confidence::Unknown,
@@ -148,5 +153,16 @@ mod tests {
         assert_eq!(row.state, SessionState::Inspect);
         assert_eq!(row.confidence, Confidence::Exact);
         assert!(row.status_reason.contains("failed"));
+    }
+
+    #[test]
+    fn classifies_stopped_observation_as_stopped() {
+        let observation = SourceObservation::new("s8", ObservationKind::Stopped);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.state, SessionState::Stopped);
+        assert_eq!(row.confidence, Confidence::Exact);
+        assert!(row.status_reason.contains("stopped before completion"));
     }
 }
