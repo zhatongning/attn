@@ -467,6 +467,76 @@ describe("codexSessionsDevSource", () => {
     expect(executed).toEqual([{ kind: "iterm", tty: "ttys004", liveCodex: true }]);
   });
 
+  it("focuses the live parent CLI tty when the process also has subagent files open", async () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "11");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const workspacePath = "/Users/edy/hose/tmc_symposium/tmc_surprise";
+    const parentId = "019eaa00-0000-7000-8000-000000000010";
+    const childId = "019eaa00-0000-7000-8000-000000000011";
+    const parentRolloutPath = path.join(sessionDir, `rollout-2026-06-11T12-00-00-${parentId}.jsonl`);
+    const childRolloutPath = path.join(sessionDir, `rollout-2026-06-11T12-05-00-${childId}.jsonl`);
+    fs.writeFileSync(
+      parentRolloutPath,
+      [
+        `{"timestamp":"2026-06-11T04:00:00.000Z","type":"session_meta","payload":{"id":"${parentId}","cwd":"${workspacePath}","originator":"Codex CLI","source":"cli"}}`,
+        '{"timestamp":"2026-06-11T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"parent\\n"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      childRolloutPath,
+      [
+        `{"timestamp":"2026-06-11T04:05:00.000Z","type":"session_meta","payload":{"id":"${childId}","parent_thread_id":"${parentId}","cwd":"${workspacePath}","originator":"Codex CLI","source":"cli","thread_source":"subagent"}}`,
+        '{"timestamp":"2026-06-11T04:06:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"child\\n"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: parentId,
+      rolloutPath: parentRolloutPath,
+      cwd: workspacePath,
+      title: "Parent task",
+      source: "cli",
+      threadSource: "user",
+      preview: "Parent task",
+      updatedAtMs: Date.parse("2026-06-11T04:01:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: childId,
+      rolloutPath: childRolloutPath,
+      cwd: workspacePath,
+      title: "Child task",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "Child task",
+      updatedAtMs: Date.parse("2026-06-11T04:06:00.000Z"),
+    });
+    const executed = [];
+
+    const result = await jumpToSession(parentId, {
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-11T04:10:00.000Z"),
+      limit: 20,
+      liveCliSessions: [{
+        sessionId: childId,
+        sessionIds: [childId, parentId],
+        workspacePath,
+        tty: "ttys002",
+      }],
+      previousITermTtyForWorkspace: () => "ttys003",
+      executeJump: async (_row, plan) => executed.push(plan),
+    });
+
+    expect(executed).toEqual([{ kind: "iterm", tty: "ttys002", liveCodex: true }]);
+    expect(result.message).toBe("Focused live iTerm Codex session.");
+  });
+
   it("excludes archived SQLite threads from discovery", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");

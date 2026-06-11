@@ -497,7 +497,7 @@ fn live_cli_tty_for_row_from_sessions(
 
     if let Some(session) = live_sessions
         .iter()
-        .find(|session| session.session_id.as_deref() == Some(row.session_id.as_str()))
+        .find(|session| live_session_has_session_id(session, &row.session_id))
     {
         return Some(session.tty.clone());
     }
@@ -508,6 +508,11 @@ fn live_cli_tty_for_row_from_sessions(
             .find(|session| session.session_id.is_none() && session.workspace_path == workspace_path)
             .map(|session| session.tty.clone())
     })
+}
+
+fn live_session_has_session_id(session: &LiveCliSession, session_id: &str) -> bool {
+    session.session_id.as_deref() == Some(session_id)
+        || session.session_ids.iter().any(|value| value == session_id)
 }
 
 fn apply_live_cli_activity_signal(
@@ -553,6 +558,7 @@ fn apply_live_cli_activity_signal(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveCliSession {
     session_id: Option<String>,
+    session_ids: Vec<String>,
     workspace_path: String,
     tty: String,
 }
@@ -715,7 +721,7 @@ fn live_cli_tty_for_jump_plan(
 ) -> Option<String> {
     if let Some(session) = live_sessions
         .iter()
-        .find(|session| session.session_id.as_deref() == Some(row.session_id.as_str()))
+        .find(|session| live_session_has_session_id(session, &row.session_id))
     {
         return Some(session.tty.clone());
     }
@@ -820,6 +826,12 @@ fn find_live_codex_cli_sessions() -> Vec<LiveCliSession> {
         };
         let session_id = live_cli_session_id_from_args(args)
             .or_else(|| live_cli_session_id_from_open_files(pid));
+        let session_ids = unique_session_ids(
+            live_cli_session_ids_from_args(args)
+                .into_iter()
+                .chain(live_cli_session_ids_from_open_files(pid))
+                .collect(),
+        );
         let key = (cwd.clone(), tty.to_string());
         sessions_by_terminal
             .entry(key)
@@ -827,9 +839,18 @@ fn find_live_codex_cli_sessions() -> Vec<LiveCliSession> {
                 if existing.session_id.is_none() {
                     existing.session_id = session_id.clone();
                 }
+                existing.session_ids = unique_session_ids(
+                    existing
+                        .session_ids
+                        .iter()
+                        .cloned()
+                        .chain(session_ids.clone())
+                        .collect(),
+                );
             })
             .or_insert_with(|| LiveCliSession {
                 session_id,
+                session_ids,
                 workspace_path: cwd,
                 tty: tty.to_string(),
             });
@@ -943,36 +964,59 @@ fn parse_codex_process_line(line: &str) -> Option<(&str, &str, &str)> {
 }
 
 fn live_cli_session_id_from_args(args: &str) -> Option<String> {
+    live_cli_session_ids_from_args(args).into_iter().next()
+}
+
+fn live_cli_session_ids_from_args(args: &str) -> Vec<String> {
     let parts = args.split_whitespace().collect::<Vec<_>>();
+    let mut session_ids = Vec::new();
     for (index, part) in parts.iter().enumerate() {
         if matches!(*part, "resume" | "--resume") {
-            let candidate = parts.get(index + 1)?;
+            let Some(candidate) = parts.get(index + 1) else {
+                continue;
+            };
             if looks_like_codex_session_id(candidate) {
-                return Some((*candidate).to_string());
+                session_ids.push((*candidate).to_string());
             }
         }
 
         if let Some(candidate) = part.strip_prefix("--resume=") {
             if looks_like_codex_session_id(candidate) {
-                return Some(candidate.to_string());
+                session_ids.push(candidate.to_string());
             }
         }
     }
 
-    None
+    unique_session_ids(session_ids)
 }
 
 fn live_cli_session_id_from_open_files(pid: &str) -> Option<String> {
-    let output = Command::new("lsof").arg("-p").arg(pid).output().ok()?;
+    live_cli_session_ids_from_open_files(pid).into_iter().next()
+}
+
+fn live_cli_session_ids_from_open_files(pid: &str) -> Vec<String> {
+    let Ok(output) = Command::new("lsof").arg("-p").arg(pid).output() else {
+        return Vec::new();
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    unique_session_ids(stdout
         .lines()
         .filter_map(|line| {
             line.split_whitespace()
                 .find(|part| part.contains("rollout-") && part.ends_with(".jsonl"))
         })
         .filter_map(session_id_from_jsonl_path)
-        .next()
+        .collect())
+}
+
+fn unique_session_ids(session_ids: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for session_id in session_ids {
+        if !unique.contains(&session_id) {
+            unique.push(session_id);
+        }
+    }
+    unique
 }
 
 fn session_id_from_jsonl_path(path: &str) -> Option<String> {
@@ -1399,11 +1443,13 @@ mod tests {
         let live_sessions = vec![
             super::LiveCliSession {
                 session_id: Some("019eaa00-0000-7000-8000-000000000001".to_string()),
+                session_ids: vec!["019eaa00-0000-7000-8000-000000000001".to_string()],
                 workspace_path: "/Users/edy/hose/tmc_symposium/tmc_surprise".to_string(),
                 tty: "ttys001".to_string(),
             },
             super::LiveCliSession {
                 session_id: Some("019eaa00-0000-7000-8000-000000000002".to_string()),
+                session_ids: vec!["019eaa00-0000-7000-8000-000000000002".to_string()],
                 workspace_path: "/Users/edy/hose/tmc_symposium/tmc_surprise".to_string(),
                 tty: "ttys004".to_string(),
             },
@@ -1419,6 +1465,42 @@ mod tests {
             plan,
             Some(super::JumpCommandPlan::ITermActivate {
                 tty: "ttys004".to_string(),
+                live_codex: true
+            })
+        );
+    }
+
+    #[test]
+    fn cli_jump_plan_targets_parent_tty_when_live_process_also_has_subagent_files() {
+        let row = SessionRow::new(
+            "019eaa00-0000-7000-8000-000000000010",
+            "CLI parent row",
+            SessionState::Running,
+            Confidence::Inferred,
+        )
+        .with_workspace(Some("/Users/edy/hose/tmc_symposium/tmc_surprise".to_string()))
+        .with_jump_availability(JumpAvailability::Approximate)
+        .with_jump_target(JumpTarget::Cli);
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("019eaa00-0000-7000-8000-000000000011".to_string()),
+            session_ids: vec![
+                "019eaa00-0000-7000-8000-000000000011".to_string(),
+                "019eaa00-0000-7000-8000-000000000010".to_string(),
+            ],
+            workspace_path: "/Users/edy/hose/tmc_symposium/tmc_surprise".to_string(),
+            tty: "ttys002".to_string(),
+        }];
+
+        let plan = super::build_jump_command_plan_with_live_sessions(
+            &row,
+            &live_sessions,
+            |_| Some("ttys003".to_string()),
+        );
+
+        assert_eq!(
+            plan,
+            Some(super::JumpCommandPlan::ITermActivate {
+                tty: "ttys002".to_string(),
                 live_codex: true
             })
         );
@@ -1582,6 +1664,7 @@ mod tests {
         .with_jump_target(JumpTarget::Cli)];
         let live_sessions = vec![super::LiveCliSession {
             session_id: Some("live-session".to_string()),
+            session_ids: vec!["live-session".to_string()],
             workspace_path: "/repo".to_string(),
             tty: "ttys008".to_string(),
         }];
@@ -1617,6 +1700,7 @@ mod tests {
         .with_jump_target(JumpTarget::Cli)];
         let live_sessions = vec![super::LiveCliSession {
             session_id: Some("live-session".to_string()),
+            session_ids: vec!["live-session".to_string()],
             workspace_path: "/repo".to_string(),
             tty: "ttys008".to_string(),
         }];
@@ -1641,6 +1725,7 @@ mod tests {
         .with_jump_target(JumpTarget::Cli)];
         let live_sessions = vec![super::LiveCliSession {
             session_id: Some("live-session".to_string()),
+            session_ids: vec!["live-session".to_string()],
             workspace_path: "/repo".to_string(),
             tty: "ttys008".to_string(),
         }];

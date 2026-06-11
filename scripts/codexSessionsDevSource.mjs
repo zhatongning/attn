@@ -800,7 +800,7 @@ function buildJumpPlan(row, options = {}) {
 }
 
 function liveCliTtyForJumpPlan(row, liveCliSessions, liveCliTtyForWorkspace) {
-  const exactSessionTty = liveCliSessions.find((session) => session.sessionId === row.sessionId)?.tty;
+  const exactSessionTty = liveCliSessions.find((session) => liveSessionHasSessionId(session, row.sessionId))?.tty;
   if (exactSessionTty) return exactSessionTty;
 
   if (row.jumpTarget === "cli") {
@@ -808,6 +808,10 @@ function liveCliTtyForJumpPlan(row, liveCliSessions, liveCliTtyForWorkspace) {
   }
 
   return row.workspacePath && liveCliTtyForWorkspace ? liveCliTtyForWorkspace(row.workspacePath) : undefined;
+}
+
+function liveSessionHasSessionId(session, sessionId) {
+  return session.sessionId === sessionId || session.sessionIds?.includes(sessionId);
 }
 
 function jumpMessage(plan) {
@@ -847,14 +851,20 @@ function findLiveCodexCliSessions() {
     if (!cwd) continue;
     const sessionId = liveCliSessionIdFromArgs(processInfo.args)
       ?? liveCliSessionIdFromOpenFiles(processInfo.pid);
+    const sessionIds = unique([
+      ...liveCliSessionIdsFromArgs(processInfo.args),
+      ...liveCliSessionIdsFromOpenFiles(processInfo.pid),
+    ]);
     const key = `${cwd}\0${processInfo.tty}`;
     const existing = sessionsByTerminal.get(key);
     if (existing) {
       if (!existing.sessionId) existing.sessionId = sessionId;
+      existing.sessionIds = unique([...existing.sessionIds, ...sessionIds]);
       continue;
     }
     sessionsByTerminal.set(key, {
       sessionId,
+      sessionIds,
       workspacePath: cwd,
       tty: processInfo.tty,
     });
@@ -932,27 +942,36 @@ function parseCodexProcessLine(line) {
 }
 
 function liveCliSessionIdFromArgs(args) {
+  return liveCliSessionIdsFromArgs(args)[0];
+}
+
+function liveCliSessionIdsFromArgs(args) {
   const parts = args.split(/\s+/).filter(Boolean);
+  const sessionIds = [];
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
     if (part === "resume" || part === "--resume") {
       const candidate = parts[index + 1];
-      if (looksLikeCodexSessionId(candidate)) return candidate;
+      if (looksLikeCodexSessionId(candidate)) sessionIds.push(candidate);
     }
     if (part.startsWith("--resume=")) {
       const candidate = part.slice("--resume=".length);
-      if (looksLikeCodexSessionId(candidate)) return candidate;
+      if (looksLikeCodexSessionId(candidate)) sessionIds.push(candidate);
     }
   }
-  return undefined;
+  return unique(sessionIds);
 }
 
 function liveCliSessionIdFromOpenFiles(pid) {
+  return liveCliSessionIdsFromOpenFiles(pid)[0];
+}
+
+function liveCliSessionIdsFromOpenFiles(pid) {
   let output = "";
   try {
     output = execFileSync("lsof", ["-p", pid], { encoding: "utf8" });
   } catch {
-    return undefined;
+    return [];
   }
 
   return output
@@ -960,7 +979,8 @@ function liveCliSessionIdFromOpenFiles(pid) {
     .flatMap((line) => line.split(/\s+/))
     .filter((part) => part.includes("rollout-") && part.endsWith(".jsonl"))
     .map(sessionIdFromJsonlPath)
-    .find(Boolean);
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index);
 }
 
 function sessionIdFromJsonlPath(filePath) {
@@ -978,6 +998,10 @@ function looksLikeCodexSessionId(value) {
     && value.length >= 20
     && value.includes("-")
     && /^[0-9a-f-]+$/i.test(value);
+}
+
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function parseShellProcessLine(line) {
