@@ -186,6 +186,7 @@ fn parse_session_content(
     now: SystemTime,
 ) -> Result<Option<ParsedSessionObservation>, std::io::Error> {
     let mut session_id = None;
+    let mut parent_session_id = None;
     let mut cwd = None;
     let mut agent_name = None;
     let mut session_name = None;
@@ -216,6 +217,8 @@ fn parse_session_content(
                         .and_then(Value::as_str)
                         .map(ToString::to_string)
                         .or(session_id);
+                    parent_session_id =
+                        parent_thread_id_from_session_meta(payload).or(parent_session_id);
                     cwd = payload
                         .get("cwd")
                         .and_then(Value::as_str)
@@ -343,6 +346,10 @@ fn parse_session_content(
 
     if let Some(agent_name) = agent_name {
         observation = observation.with_agent_name(agent_name);
+    }
+
+    if let Some(parent_session_id) = parent_session_id {
+        observation = observation.with_parent_session_id(parent_session_id);
     }
 
     if let Some(project_name) = project_name {
@@ -890,6 +897,22 @@ fn jump_target_from_session_meta(payload: &Value) -> Option<JumpTarget> {
     }
 }
 
+fn parent_thread_id_from_session_meta(payload: &Value) -> Option<String> {
+    payload
+        .get("parent_thread_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("source")
+                .and_then(|source| source.get("subagent"))
+                .and_then(|subagent| subagent.get("thread_spawn"))
+                .and_then(|thread_spawn| thread_spawn.get("parent_thread_id"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     stem.rsplit('-').next().map(ToString::to_string)
@@ -1027,6 +1050,32 @@ mod tests {
         );
         assert_eq!(rows[0].kind, ObservationKind::Running);
         assert_eq!(rows[0].jump_target, JumpTarget::Desktop);
+    }
+
+    #[test]
+    fn reads_parent_thread_id_from_subagent_session_metadata() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/11");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-11T17-00-00-019child.jsonl"),
+            r#"{"timestamp":"2026-06-11T09:00:00.000Z","type":"session_meta","payload":{"id":"019child","parent_thread_id":"019parent","cwd":"/Users/edy/project-a","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019parent","depth":1}}},"thread_source":"subagent"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-11T09:10:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"working","phase":"commentary"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_168_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "019child");
+        assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
     }
 
     #[test]

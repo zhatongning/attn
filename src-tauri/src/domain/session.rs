@@ -53,6 +53,7 @@ pub struct SourceObservation {
     pub label: Option<String>,
     pub agent_name: Option<String>,
     pub thread_source: Option<String>,
+    pub parent_session_id: Option<String>,
     pub project_name: Option<String>,
     pub workspace_path: Option<String>,
     pub last_activity_at: Option<String>,
@@ -68,6 +69,7 @@ impl SourceObservation {
             label: None,
             agent_name: None,
             thread_source: None,
+            parent_session_id: None,
             project_name: None,
             workspace_path: None,
             last_activity_at: None,
@@ -88,6 +90,11 @@ impl SourceObservation {
 
     pub fn with_thread_source(mut self, thread_source: impl Into<String>) -> Self {
         self.thread_source = Some(thread_source.into());
+        self
+    }
+
+    pub fn with_parent_session_id(mut self, parent_session_id: impl Into<String>) -> Self {
+        self.parent_session_id = Some(parent_session_id.into());
         self
     }
 
@@ -119,6 +126,7 @@ pub struct SessionRow {
     pub label: String,
     pub agent_name: Option<String>,
     pub thread_source: Option<String>,
+    pub parent_session_id: Option<String>,
     pub project_name: Option<String>,
     pub state: SessionState,
     pub confidence: Confidence,
@@ -145,6 +153,7 @@ impl SessionRow {
             label: label.into(),
             agent_name: None,
             thread_source: None,
+            parent_session_id: None,
             project_name: None,
             state,
             confidence,
@@ -167,6 +176,11 @@ impl SessionRow {
 
     pub fn with_thread_source(mut self, thread_source: Option<String>) -> Self {
         self.thread_source = thread_source.filter(|value| !value.is_empty());
+        self
+    }
+
+    pub fn with_parent_session_id(mut self, parent_session_id: Option<String>) -> Self {
+        self.parent_session_id = parent_session_id.filter(|value| !value.is_empty());
         self
     }
 

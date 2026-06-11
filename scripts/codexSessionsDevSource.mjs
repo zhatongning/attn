@@ -266,6 +266,7 @@ function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliS
       thread.source,
     ),
     threadSource: emptyToUndefined(thread.thread_source),
+    parentSessionId: jsonlObservation?.parentSessionId,
     projectName: workspaceName,
     workspacePath,
     lastActivityAt,
@@ -308,6 +309,7 @@ function parseSessionFile(filePath, {
   if (!fs.existsSync(filePath)) return null;
 
   let sessionId;
+  let parentSessionId;
   let workspacePath;
   let agentName;
   let sessionName;
@@ -334,6 +336,7 @@ function parseSessionFile(filePath, {
 
     if (value.type === "session_meta") {
       sessionId = value.payload?.id ?? sessionId;
+      parentSessionId = parentThreadIdFromSessionMeta(value.payload) ?? parentSessionId;
       workspacePath = value.payload?.cwd ?? workspacePath;
       agentName = firstNonEmpty(value.payload?.agent_nickname, value.payload?.originator, agentName);
       jumpTarget = jumpTargetFromSessionMeta(value.payload) ?? jumpTarget;
@@ -398,6 +401,7 @@ function parseSessionFile(filePath, {
 
   return {
     sessionId,
+    parentSessionId,
     kind,
     label,
     agentName,
@@ -437,6 +441,13 @@ function pendingToolApprovalFromResponseItem(value) {
   };
 }
 
+function parentThreadIdFromSessionMeta(payload) {
+  return firstNonEmpty(
+    payload?.parent_thread_id,
+    payload?.source?.subagent?.thread_spawn?.parent_thread_id,
+  );
+}
+
 function toSessionRow(observation, { liveCliSessions = [], liveCliTtyForWorkspace, nowMs = Date.now() }) {
   const classified = classifyObservation(observation);
   const row = applyLiveCliActivitySignal(classified, liveCliSessions, liveCliTtyForWorkspace, nowMs);
@@ -456,6 +467,7 @@ function classifyObservation(observation) {
     label: observation.label ?? `Codex session ${observation.sessionId}`,
     agentName: emptyToUndefined(observation.agentName),
     threadSource: emptyToUndefined(observation.threadSource),
+    parentSessionId: emptyToUndefined(observation.parentSessionId),
     projectName: emptyToUndefined(observation.projectName),
     workspacePath: observation.workspacePath,
     lastActivityAt: emptyToUndefined(observation.lastActivityAt),

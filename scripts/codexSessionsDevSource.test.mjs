@@ -68,6 +68,50 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
+  it("reads parent thread ids from subagent session metadata", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "11");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-11T17-00-00-019child.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-11T09:00:00.000Z","type":"session_meta","payload":{"id":"019child","parent_thread_id":"019parent","cwd":"/Users/edy/project","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019parent","depth":1}}},"thread_source":"subagent"}}',
+        '{"timestamp":"2026-06-11T09:10:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019child",
+      rolloutPath,
+      cwd: "/Users/edy/project",
+      title: "Child task",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "Child task",
+      updatedAtMs: Date.parse("2026-06-11T09:10:00.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-11T09:20:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019child",
+      threadSource: "subagent",
+      parentSessionId: "019parent",
+    });
+  });
+
   it("keeps unread completed sessions in inspect even after the old inspect window", () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");

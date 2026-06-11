@@ -206,6 +206,39 @@ describe("buildStatusPanelModel", () => {
     );
     expect(model.hiddenCount).toBe(0);
   });
+
+  it("uses explicit parent session ids before falling back to workspace grouping", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("newer-parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          lastActivityAt: "2026-06-11T10:10:00.000Z",
+          threadSource: "user",
+        },
+        {
+          ...row("actual-parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          lastActivityAt: "2026-06-11T10:00:00.000Z",
+          threadSource: "user",
+        },
+        {
+          ...row("child-working", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          lastActivityAt: "2026-06-11T10:20:00.000Z",
+          threadSource: "subagent",
+          parentSessionId: "actual-parent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    expect(model.visibleRows.find((item) => item.sessionId === "actual-parent")?.subtaskSummary).toBe(
+      "1 subtask: 1 working",
+    );
+    expect(model.visibleRows.find((item) => item.sessionId === "newer-parent")?.subtaskSummary).toBeUndefined();
+    expect(model.visibleRows.map((item) => item.sessionId)).not.toContain("child-working");
+  });
 });
 
 function row(

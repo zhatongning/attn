@@ -387,13 +387,14 @@ export function buildStatusPanelModel(
 }
 
 function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
+  const parentBySessionId = new Map(rows.filter((row) => !isSubagentRow(row)).map((row) => [row.sessionId, row]));
   const parentByWorkspace = parentRowsByWorkspace(rows);
   const summaries = new Map<string, SubtaskSummary>();
   const visibleRows: StatusPanelRow[] = [];
 
   for (const row of rows) {
-    const parent = isSubagentRow(row) && row.workspacePath
-      ? parentByWorkspace.get(row.workspacePath)
+    const parent = isSubagentRow(row)
+      ? parentForSubagentRow(row, parentBySessionId, parentByWorkspace)
       : undefined;
     if (!parent) {
       visibleRows.push(row);
@@ -419,6 +420,19 @@ function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
       subtaskSummary: copy.subtaskSummaryLabel(summary),
     };
   });
+}
+
+function parentForSubagentRow(
+  row: StatusPanelRow,
+  parentBySessionId: Map<string, StatusPanelRow>,
+  parentByWorkspace: Map<string, StatusPanelRow>,
+) {
+  if (row.parentSessionId) {
+    const parent = parentBySessionId.get(row.parentSessionId);
+    if (parent) return parent;
+  }
+
+  return row.workspacePath ? parentByWorkspace.get(row.workspacePath) : undefined;
 }
 
 function parentRowsByWorkspace(rows: StatusPanelRow[]) {
