@@ -596,6 +596,14 @@ p {
   min-width: 0;
 }
 
+.status-subtasks {
+  color: #abb2bf;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .setting-field span {
   overflow: hidden;
   text-overflow: ellipsis;

@@ -868,6 +868,57 @@ describe("StatusPanelView", () => {
     expect(statusTexts).toEqual(["● blocked", "● input", "● inspect"]);
   });
 
+  it("shows a parent subtask summary while only promoting intervention subagents", () => {
+    const rows: SessionRow[] = [
+      {
+        ...initialSessions[0],
+        sessionId: "parent",
+        label: "Parent task",
+        state: "running",
+        workspacePath: "/Users/edy/project",
+        threadSource: "user",
+        statusReason: "running signal observed",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-working",
+        label: "Quiet child task",
+        state: "running",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        statusReason: "running signal observed",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-inspect",
+        label: "Inspect child task",
+        state: "inspect",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-input",
+        label: "Input child task",
+        state: "waitingForInput",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        statusReason: "waiting for user input",
+      },
+    ];
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    expect(screen.getByText("Parent task")).toBeTruthy();
+    expect(screen.getByText("2 subtasks: 1 inspect, 1 working")).toBeTruthy();
+    expect(screen.getByText("Input child task")).toBeTruthy();
+    expect(screen.queryByText("Quiet child task")).toBeNull();
+    expect(screen.queryByText("Inspect child task")).toBeNull();
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+  });
+
   it("keeps an opened intervention row as needed during the read window", async () => {
     const attentionRow: SessionRow = {
       ...initialSessions[0],

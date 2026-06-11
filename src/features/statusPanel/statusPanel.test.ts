@@ -172,6 +172,40 @@ describe("buildStatusPanelModel", () => {
       "Confidence: exact",
     ].join("\n"));
   });
+
+  it("rolls quiet subagent rows into a parent summary and promotes intervention subagents", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child-working", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+        },
+        {
+          ...row("child-inspect", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+        },
+        {
+          ...row("child-input", "waitingForInput", "waiting for user input"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["child-input", "parent"]);
+    expect(model.visibleRows.find((item) => item.sessionId === "parent")?.subtaskSummary).toBe(
+      "2 subtasks: 1 inspect, 1 working",
+    );
+    expect(model.hiddenCount).toBe(0);
+  });
 });
 
 function row(

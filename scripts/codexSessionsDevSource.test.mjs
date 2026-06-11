@@ -56,6 +56,7 @@ describe("codexSessionsDevSource", () => {
       sessionId: "019desktop",
       label: "SQLite preview should be second choice",
       agentName: "Averroes",
+      threadSource: "user",
       projectName: "wmhcar",
       workspacePath: "/Users/edy/wmhcar",
       lastActivityAt: "2026-06-03T02:20:00.000Z",

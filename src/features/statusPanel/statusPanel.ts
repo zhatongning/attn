@@ -33,6 +33,7 @@ export interface StatusPanelRow extends SessionRow {
   statusTone: "alert" | "quiet";
   interventionReason: string;
   evidenceTooltip: string;
+  subtaskSummary?: string;
 }
 
 export interface StatusPanelModel {
@@ -89,6 +90,7 @@ export interface StatusPanelCopy {
   dismissLabel: string;
   dismissingLabel: string;
   showEvidenceLabel: (label: string) => string;
+  subtaskSummaryLabel: (summary: SubtaskSummary) => string;
   statusPrefix: string;
   evidencePrefix: string;
   lastActivityPrefix: string;
@@ -99,6 +101,11 @@ export interface StatusPanelCopy {
   jumpTargetLabels: Record<SessionRow["jumpTarget"], string>;
   sourceStatusLabels: Record<"available" | "degraded" | "unknown", string>;
   sourceNameLabels: Record<string, string>;
+}
+
+interface SubtaskSummary {
+  total: number;
+  counts: Partial<Record<InterventionStatus, number>>;
 }
 
 export const defaultStatusPanelConfig: StatusPanelConfig = {
@@ -234,6 +241,18 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     dismissLabel: "Dismiss",
     dismissingLabel: "Dismissing session",
     showEvidenceLabel: (label) => `Show status evidence for ${label}`,
+    subtaskSummaryLabel: (summary) => {
+      const parts = subtaskSummaryParts(summary, {
+        blocked: "blocked",
+        input: "input",
+        inspect: "inspect",
+        stopped: "stopped",
+        needed: "follow-up",
+        working: "working",
+        idle: "idle",
+      });
+      return `${summary.total} ${summary.total === 1 ? "subtask" : "subtasks"}${parts.length > 0 ? `: ${parts.join(", ")}` : ""}`;
+    },
     statusPrefix: "Status",
     evidencePrefix: "Evidence",
     lastActivityPrefix: "Last activity",
@@ -300,6 +319,10 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     dismissLabel: "忽略",
     dismissingLabel: "正在忽略",
     showEvidenceLabel: (label) => `查看 ${label} 的状态依据`,
+    subtaskSummaryLabel: (summary) => {
+      const parts = subtaskSummaryParts(summary, statusLabels.zh);
+      return `${summary.total} 个子任务${parts.length > 0 ? `：${parts.join("，")}` : ""}`;
+    },
     statusPrefix: "状态",
     evidencePrefix: "依据",
     lastActivityPrefix: "最后活动",
@@ -338,15 +361,15 @@ export function buildStatusPanelModel(
     .filter((row) => !row.dismissed)
     .filter(shouldIncludeInWatchlist)
     .map((row) => toPanelRow(row, theme, copy))
-    .sort(comparePanelRows);
-  const cardRows = panelRows.filter((row) => row.displayStatus !== "idle");
-  const quietRows = panelRows.filter((row) => row.statusTone === "quiet");
+  const rolledUpRows = rollUpSubagentRows(panelRows, copy).sort(comparePanelRows);
+  const cardRows = rolledUpRows.filter((row) => row.displayStatus !== "idle");
+  const quietRows = rolledUpRows.filter((row) => row.statusTone === "quiet");
   const visibleRows = cardRows.slice(0, config.visibleItemCount);
   const hiddenRows = cardRows.slice(config.visibleItemCount);
   const expandableHiddenRows = hiddenRows.filter((row) => row.statusTone === "alert");
-  const hiddenCount = hiddenRows.length + panelRows.filter((row) => row.displayStatus === "idle").length;
+  const hiddenCount = hiddenRows.length + rolledUpRows.filter((row) => row.displayStatus === "idle").length;
   const quietHiddenCount = hiddenRows.filter((row) => row.statusTone === "quiet").length
-    + panelRows.filter((row) => row.displayStatus === "idle").length;
+    + rolledUpRows.filter((row) => row.displayStatus === "idle").length;
 
   return {
     visibleRows,
@@ -355,12 +378,79 @@ export function buildStatusPanelModel(
     hiddenCount,
     quietHiddenCount,
     expandableHiddenCount: expandableHiddenRows.length,
-    interventionCount: panelRows.filter((row) => row.statusTone === "alert").length,
+    interventionCount: rolledUpRows.filter((row) => row.statusTone === "alert").length,
     workingCount: quietRows.filter((row) => row.displayStatus === "working").length,
-    idleCount: panelRows.filter((row) => row.displayStatus === "idle").length,
+    idleCount: rolledUpRows.filter((row) => row.displayStatus === "idle").length,
     theme,
     copy,
   };
+}
+
+function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
+  const parentByWorkspace = parentRowsByWorkspace(rows);
+  const summaries = new Map<string, SubtaskSummary>();
+  const visibleRows: StatusPanelRow[] = [];
+
+  for (const row of rows) {
+    const parent = isSubagentRow(row) && row.workspacePath
+      ? parentByWorkspace.get(row.workspacePath)
+      : undefined;
+    if (!parent) {
+      visibleRows.push(row);
+      continue;
+    }
+
+    if (shouldPromoteSubagentRow(row)) {
+      visibleRows.push(row);
+      continue;
+    }
+
+    const summary = summaries.get(parent.sessionId) ?? { total: 0, counts: {} };
+    summary.total += 1;
+    summary.counts[row.displayStatus] = (summary.counts[row.displayStatus] ?? 0) + 1;
+    summaries.set(parent.sessionId, summary);
+  }
+
+  return visibleRows.map((row) => {
+    const summary = summaries.get(row.sessionId);
+    if (!summary) return row;
+    return {
+      ...row,
+      subtaskSummary: copy.subtaskSummaryLabel(summary),
+    };
+  });
+}
+
+function parentRowsByWorkspace(rows: StatusPanelRow[]) {
+  const parentByWorkspace = new Map<string, StatusPanelRow>();
+  for (const row of rows) {
+    if (isSubagentRow(row) || !row.workspacePath) continue;
+    const current = parentByWorkspace.get(row.workspacePath);
+    if (!current || timestampValue(row.lastActivityAt) > timestampValue(current.lastActivityAt)) {
+      parentByWorkspace.set(row.workspacePath, row);
+    }
+  }
+  return parentByWorkspace;
+}
+
+function isSubagentRow(row: SessionRow) {
+  return row.threadSource === "subagent";
+}
+
+function shouldPromoteSubagentRow(row: StatusPanelRow) {
+  return row.displayStatus === "blocked" || row.displayStatus === "input" || row.displayStatus === "stopped";
+}
+
+function subtaskSummaryParts(
+  summary: SubtaskSummary,
+  labels: Record<InterventionStatus, string>,
+) {
+  const statuses: InterventionStatus[] = ["blocked", "input", "stopped", "inspect", "needed", "working", "idle"];
+  return statuses
+    .flatMap((status) => {
+      const count = summary.counts[status] ?? 0;
+      return count > 0 ? [`${count} ${labels[status]}`] : [];
+    });
 }
 
 function themeFromConfig(config: StatusPanelConfig): AtomInterventionTheme {

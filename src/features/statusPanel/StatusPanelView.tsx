@@ -687,6 +687,9 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onD
         <h2>{row.label}</h2>
         <p className="status-meta">
           <span className="status-workspace">{rowSubtitle(row)}</span>
+          {row.subtaskSummary ? (
+            <span className="status-subtasks">{row.subtaskSummary}</span>
+          ) : null}
           <span className="status-confidence">{copy.confidenceLabels[row.confidence]}</span>
           <span className="status-evidence-anchor" ref={evidenceRef}>
             <button

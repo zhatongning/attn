@@ -688,8 +688,13 @@ fn observation_from_thread(
         .with_workspace(thread.cwd)
         .with_jump_target(jump_target);
 
-    if let Some(agent_name) = thread.agent_nickname.or(thread.thread_source).or(Some(thread.source)) {
+    let thread_source = thread.thread_source.clone();
+    if let Some(agent_name) = thread.agent_nickname.or(thread_source.clone()).or(Some(thread.source)) {
         observation = observation.with_agent_name(agent_name);
+    }
+
+    if let Some(thread_source) = thread_source {
+        observation = observation.with_thread_source(thread_source);
     }
 
     if let Some(project_name) = project_name {
@@ -1398,6 +1403,7 @@ mod tests {
         assert_eq!(rows[0].label.as_deref(), Some("排查用车详情地图卡顿"));
         assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
         assert_eq!(rows[0].jump_target, JumpTarget::Desktop);
+        assert_eq!(rows[0].thread_source.as_deref(), Some("user"));
     }
 
     #[test]

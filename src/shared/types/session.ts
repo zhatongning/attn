@@ -7,6 +7,7 @@ export interface SessionRow {
   sessionId: string;
   label: string;
   agentName?: string;
+  threadSource?: string;
   projectName?: string;
   workspacePath?: string;
   lastActivityAt?: string;

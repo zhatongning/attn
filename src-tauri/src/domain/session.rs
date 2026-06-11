@@ -52,6 +52,7 @@ pub struct SourceObservation {
     pub kind: ObservationKind,
     pub label: Option<String>,
     pub agent_name: Option<String>,
+    pub thread_source: Option<String>,
     pub project_name: Option<String>,
     pub workspace_path: Option<String>,
     pub last_activity_at: Option<String>,
@@ -66,6 +67,7 @@ impl SourceObservation {
             kind,
             label: None,
             agent_name: None,
+            thread_source: None,
             project_name: None,
             workspace_path: None,
             last_activity_at: None,
@@ -81,6 +83,11 @@ impl SourceObservation {
 
     pub fn with_agent_name(mut self, agent_name: impl Into<String>) -> Self {
         self.agent_name = Some(agent_name.into());
+        self
+    }
+
+    pub fn with_thread_source(mut self, thread_source: impl Into<String>) -> Self {
+        self.thread_source = Some(thread_source.into());
         self
     }
 
@@ -111,6 +118,7 @@ pub struct SessionRow {
     pub session_id: String,
     pub label: String,
     pub agent_name: Option<String>,
+    pub thread_source: Option<String>,
     pub project_name: Option<String>,
     pub state: SessionState,
     pub confidence: Confidence,
@@ -136,6 +144,7 @@ impl SessionRow {
             session_id: session_id.into(),
             label: label.into(),
             agent_name: None,
+            thread_source: None,
             project_name: None,
             state,
             confidence,
@@ -153,6 +162,11 @@ impl SessionRow {
 
     pub fn with_agent_name(mut self, agent_name: Option<String>) -> Self {
         self.agent_name = agent_name.filter(|value| !value.is_empty());
+        self
+    }
+
+    pub fn with_thread_source(mut self, thread_source: Option<String>) -> Self {
+        self.thread_source = thread_source.filter(|value| !value.is_empty());
         self
     }
 

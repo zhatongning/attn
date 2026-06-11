@@ -57,6 +57,7 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
 
     SessionRow::new(observation.session_id, label, state, confidence)
         .with_agent_name(observation.agent_name)
+        .with_thread_source(observation.thread_source)
         .with_project_name(observation.project_name)
         .with_workspace(observation.workspace_path)
         .with_reason(reason)

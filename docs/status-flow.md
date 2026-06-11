@@ -11,6 +11,8 @@ The status model should answer one question:
 
 > Do I need to do anything with this agent session right now?
 
+Subagent sessions follow the same rule. They should be discovered and preserved, but the panel should not become a flat list of every internal worker session. When a user-facing parent session exists in the same workspace, normal subagent rows are summarized on the parent row. Subagent rows are promoted back into the top-level list only when they need direct intervention, currently `input`, `stopped`, or `blocked`.
+
 ## State Layers
 
 The implementation currently has three layers. Keeping them separate prevents most confusion.
