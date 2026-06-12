@@ -786,9 +786,10 @@ function truncate(value, maxLength) {
 }
 
 function buildJumpPlan(row, options = {}) {
+  const liveCliSessions = options.liveCliSessions ?? (options.liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions());
   const liveTty = liveCliTtyForJumpPlan(
     row,
-    options.liveCliSessions ?? findLiveCodexCliSessions(),
+    liveCliSessions,
     options.liveCliTtyForWorkspace ?? findLiveCodexTtyForWorkspace,
   );
   if (liveTty) return { kind: "iterm", tty: liveTty, liveCodex: true };
@@ -857,12 +858,11 @@ function findLiveCodexCliSessions() {
     if (!processInfo) continue;
     const cwd = processCwd(processInfo.pid);
     if (!cwd) continue;
-    const sessionId = liveCliSessionIdFromArgs(processInfo.args)
-      ?? liveCliSessionIdFromOpenFiles(processInfo.pid);
     const sessionIds = unique([
       ...liveCliSessionIdsFromArgs(processInfo.args),
       ...liveCliSessionIdsFromOpenFiles(processInfo.pid),
     ]);
+    const sessionId = selectLiveCliPrimarySessionId(processInfo.args, sessionIds);
     const key = `${cwd}\0${processInfo.tty}`;
     const existing = sessionsByTerminal.get(key);
     if (existing) {
@@ -941,12 +941,19 @@ return rows as text`;
   }
 }
 
-function parseCodexProcessLine(line) {
+export function parseCodexProcessLine(line) {
   const match = line.trim().match(/^(\d+)\s+(ttys\d+)\s+\S+\s+(.+)$/);
   if (!match) return undefined;
   const [, pid, tty, args] = match;
-  if (!args.includes("codex") || args.includes(" app-server ")) return undefined;
+  if (!isCodexCliArgs(args)) return undefined;
   return { pid, tty, args };
+}
+
+function isCodexCliArgs(args) {
+  if (args.includes(" app-server ")) return false;
+  const executable = args.split(/\s+/).find(Boolean);
+  if (!executable) return false;
+  return path.basename(executable) === "codex";
 }
 
 function liveCliSessionIdFromArgs(args) {
@@ -970,8 +977,10 @@ function liveCliSessionIdsFromArgs(args) {
   return unique(sessionIds);
 }
 
-function liveCliSessionIdFromOpenFiles(pid) {
-  return liveCliSessionIdsFromOpenFiles(pid)[0];
+export function selectLiveCliPrimarySessionId(args, sessionIds) {
+  const argsSessionId = liveCliSessionIdFromArgs(args);
+  if (argsSessionId) return argsSessionId;
+  return sessionIds.length === 1 ? sessionIds[0] : undefined;
 }
 
 function liveCliSessionIdsFromOpenFiles(pid) {

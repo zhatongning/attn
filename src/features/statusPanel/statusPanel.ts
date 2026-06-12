@@ -34,6 +34,7 @@ export interface StatusPanelRow extends SessionRow {
   interventionReason: string;
   evidenceTooltip: string;
   subtaskSummary?: string;
+  jumpSessionId?: string;
 }
 
 export interface StatusPanelModel {
@@ -106,6 +107,7 @@ export interface StatusPanelCopy {
 interface SubtaskSummary {
   total: number;
   counts: Partial<Record<InterventionStatus, number>>;
+  jumpRow?: StatusPanelRow;
 }
 
 export const defaultStatusPanelConfig: StatusPanelConfig = {
@@ -409,17 +411,46 @@ function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
     const summary = summaries.get(parent.sessionId) ?? { total: 0, counts: {} };
     summary.total += 1;
     summary.counts[row.displayStatus] = (summary.counts[row.displayStatus] ?? 0) + 1;
+    summary.jumpRow = betterRollupJumpRow(summary.jumpRow, row);
     summaries.set(parent.sessionId, summary);
   }
 
   return visibleRows.map((row) => {
     const summary = summaries.get(row.sessionId);
     if (!summary) return row;
+    const jumpRow = shouldUseRollupJumpRow(row, summary.jumpRow) ? summary.jumpRow : undefined;
     return {
       ...row,
       subtaskSummary: copy.subtaskSummaryLabel(summary),
+      ...(jumpRow ? {
+        jumpSessionId: jumpRow.sessionId,
+        jumpTarget: jumpRow.jumpTarget,
+        jumpAvailability: jumpRow.jumpAvailability,
+      } : {}),
     };
   });
+}
+
+function shouldUseRollupJumpRow(parent: StatusPanelRow, child: StatusPanelRow | undefined) {
+  if (!child) return false;
+  return !(parent.jumpTarget === "desktop" && parent.jumpAvailability === "exact");
+}
+
+function betterRollupJumpRow(current: StatusPanelRow | undefined, candidate: StatusPanelRow) {
+  if (!current) return candidate;
+  return compareRollupJumpRows(candidate, current) < 0 ? candidate : current;
+}
+
+function compareRollupJumpRows(left: StatusPanelRow, right: StatusPanelRow) {
+  return jumpTargetPriority(left.jumpTarget)
+    - jumpTargetPriority(right.jumpTarget)
+    || timestampValue(right.lastActivityAt) - timestampValue(left.lastActivityAt);
+}
+
+function jumpTargetPriority(jumpTarget: SessionRow["jumpTarget"]) {
+  if (jumpTarget === "desktop") return 0;
+  if (jumpTarget === "cli") return 1;
+  return 2;
 }
 
 function parentForSubagentRow(

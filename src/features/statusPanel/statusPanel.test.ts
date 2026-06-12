@@ -239,6 +239,78 @@ describe("buildStatusPanelModel", () => {
     expect(model.visibleRows.find((item) => item.sessionId === "newer-parent")?.subtaskSummary).toBeUndefined();
     expect(model.visibleRows.map((item) => item.sessionId)).not.toContain("child-working");
   });
+
+  it("uses a rolled-up desktop child as the jump target for a cli parent summary", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("cli-parent", "running", "running signal observed"),
+          label: "https://wiki.hosecloud.com/pages/viewpage.action?pageId=580026375",
+          workspacePath: "/Users/edy/hose/tmc/wmhcar.feat-SCRD-19749",
+          threadSource: "user",
+          jumpTarget: "cli",
+          jumpAvailability: "approximate",
+          lastActivityAt: "2026-06-12T09:53:13.972Z",
+        },
+        {
+          ...row("desktop-child", "running", "running signal observed"),
+          workspacePath: "/Users/edy/hose/tmc/wmhcar.feat-SCRD-19749",
+          threadSource: "subagent",
+          parentSessionId: "cli-parent",
+          jumpTarget: "desktop",
+          jumpAvailability: "exact",
+          lastActivityAt: "2026-06-12T10:02:27.864Z",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    expect(model.visibleRows).toHaveLength(1);
+    expect(model.visibleRows[0]).toMatchObject({
+      sessionId: "cli-parent",
+      label: "https://wiki.hosecloud.com/pages/viewpage.action?pageId=580026375",
+      subtaskSummary: "1 subtask: 1 working",
+      jumpSessionId: "desktop-child",
+      jumpTarget: "desktop",
+      jumpAvailability: "exact",
+    });
+  });
+
+  it("keeps an exact desktop parent as the jump target when desktop subagents roll up", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("desktop-parent", "running", "running signal observed"),
+          label: "使用hotfix构建发布分支",
+          workspacePath: "/Users/edy/hose/tmc/MOS",
+          threadSource: "user",
+          jumpTarget: "desktop",
+          jumpAvailability: "exact",
+          lastActivityAt: "2026-06-12T10:34:51.872Z",
+        },
+        {
+          ...row("desktop-child", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/hose/tmc/MOS",
+          threadSource: "subagent",
+          parentSessionId: "desktop-parent",
+          jumpTarget: "desktop",
+          jumpAvailability: "exact",
+          lastActivityAt: "2026-06-12T10:34:52.140Z",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    expect(model.visibleRows).toHaveLength(1);
+    expect(model.visibleRows[0]).toMatchObject({
+      sessionId: "desktop-parent",
+      label: "使用hotfix构建发布分支",
+      subtaskSummary: "1 subtask: 1 inspect",
+      jumpTarget: "desktop",
+      jumpAvailability: "exact",
+    });
+    expect(model.visibleRows[0].jumpSessionId).toBeUndefined();
+  });
 });
 
 function row(

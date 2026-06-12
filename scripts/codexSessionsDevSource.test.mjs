@@ -3,7 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createCodexSessionsDevSource, discoverCodexSessions, jumpToSession } from "./codexSessionsDevSource.mjs";
+import {
+  createCodexSessionsDevSource,
+  discoverCodexSessions,
+  jumpToSession,
+  parseCodexProcessLine,
+  selectLiveCliPrimarySessionId,
+} from "./codexSessionsDevSource.mjs";
 
 const tempDirs = [];
 const earlyTrackingStartMs = Date.parse("2026-06-01T00:00:00.000Z");
@@ -15,6 +21,34 @@ afterEach(() => {
 });
 
 describe("codexSessionsDevSource", () => {
+  it("only treats the actual codex CLI executable as a live CLI process", () => {
+    const helperLine =
+      '4576 ttys002 /Users/edy/.code /Users/edy/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient turn-ended {"client":"codex-tui","thread-id":"019eb47b-a10e-7931-aae7-6a6118962db0"}';
+    const appServerLine =
+      "14279 ttys002 /Applications/Co /Applications/Codex.app/Contents/Resources/codex app-server --listen stdio://";
+    const cliResumeLine =
+      "29457 ttys016 /Applications/Co /Applications/Codex.app/Contents/Resources/codex resume 019e9153-943a-7402-8e61-9e89cee5a6f4 --cd /Users/edy/hose/tmc_symposium/tmc_surprise";
+
+    expect(parseCodexProcessLine(helperLine)).toBeUndefined();
+    expect(parseCodexProcessLine(appServerLine)).toBeUndefined();
+    expect(parseCodexProcessLine(cliResumeLine)).toMatchObject({
+      pid: "29457",
+      tty: "ttys016",
+      args: expect.stringContaining("/Applications/Codex.app/Contents/Resources/codex resume"),
+    });
+  });
+
+  it("only chooses an open rollout file as the primary live session when it is unique", () => {
+    const childId = "019eb66b-7687-7d33-9509-c3a024bab50e";
+    const parentId = "019eb47b-a10e-7931-aae7-6a6118962db0";
+    const cliArgs =
+      "/Users/edy/.nvm/versions/node/v22.12.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
+
+    expect(selectLiveCliPrimarySessionId(cliArgs, [childId, parentId])).toBeUndefined();
+    expect(selectLiveCliPrimarySessionId(cliArgs, [childId])).toBe(childId);
+    expect(selectLiveCliPrimarySessionId(`${cliArgs} resume ${parentId}`, [childId])).toBe(parentId);
+  });
+
   it("uses immediate SQLite threads and JSONL completion evidence like the Tauri source", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");

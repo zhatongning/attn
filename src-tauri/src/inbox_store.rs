@@ -824,14 +824,13 @@ fn find_live_codex_cli_sessions() -> Vec<LiveCliSession> {
         let Some(cwd) = process_cwd(pid) else {
             continue;
         };
-        let session_id = live_cli_session_id_from_args(args)
-            .or_else(|| live_cli_session_id_from_open_files(pid));
         let session_ids = unique_session_ids(
             live_cli_session_ids_from_args(args)
                 .into_iter()
                 .chain(live_cli_session_ids_from_open_files(pid))
                 .collect(),
         );
+        let session_id = select_live_cli_primary_session_id(args, &session_ids);
         let key = (cwd.clone(), tty.to_string());
         sessions_by_terminal
             .entry(key)
@@ -956,15 +955,36 @@ fn parse_codex_process_line(line: &str) -> Option<(&str, &str, &str)> {
     let args_start = line.find(_comm)? + _comm.len();
     let args = line[args_start..].trim();
 
-    if !tty.starts_with("ttys") || args.contains(" app-server ") || !args.contains("codex") {
+    if !tty.starts_with("ttys") || !is_codex_cli_args(args) {
         return None;
     }
 
     Some((pid, tty, args))
 }
 
+fn is_codex_cli_args(args: &str) -> bool {
+    if args.contains(" app-server ") {
+        return false;
+    }
+
+    let Some(executable) = args.split_whitespace().next() else {
+        return false;
+    };
+    executable.rsplit('/').next().unwrap_or(executable) == "codex"
+}
+
 fn live_cli_session_id_from_args(args: &str) -> Option<String> {
     live_cli_session_ids_from_args(args).into_iter().next()
+}
+
+fn select_live_cli_primary_session_id(args: &str, session_ids: &[String]) -> Option<String> {
+    live_cli_session_id_from_args(args).or_else(|| {
+        if session_ids.len() == 1 {
+            session_ids.first().cloned()
+        } else {
+            None
+        }
+    })
 }
 
 fn live_cli_session_ids_from_args(args: &str) -> Vec<String> {
@@ -988,10 +1008,6 @@ fn live_cli_session_ids_from_args(args: &str) -> Vec<String> {
     }
 
     unique_session_ids(session_ids)
-}
-
-fn live_cli_session_id_from_open_files(pid: &str) -> Option<String> {
-    live_cli_session_ids_from_open_files(pid).into_iter().next()
 }
 
 fn live_cli_session_ids_from_open_files(pid: &str) -> Vec<String> {
@@ -1503,6 +1519,51 @@ mod tests {
                 tty: "ttys002".to_string(),
                 live_codex: true
             })
+        );
+    }
+
+    #[test]
+    fn parse_codex_process_line_only_accepts_actual_cli_executable() {
+        let helper_line =
+            "4576 ttys002 /Users/edy/.code /Users/edy/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient turn-ended {\"client\":\"codex-tui\",\"thread-id\":\"019eb47b-a10e-7931-aae7-6a6118962db0\"}";
+        let app_server_line =
+            "14279 ttys002 /Applications/Co /Applications/Codex.app/Contents/Resources/codex app-server --listen stdio://";
+        let cli_resume_line =
+            "29457 ttys016 /Applications/Co /Applications/Codex.app/Contents/Resources/codex resume 019e9153-943a-7402-8e61-9e89cee5a6f4 --cd /Users/edy/hose/tmc_symposium/tmc_surprise";
+
+        assert!(super::parse_codex_process_line(helper_line).is_none());
+        assert!(super::parse_codex_process_line(app_server_line).is_none());
+        assert_eq!(
+            super::parse_codex_process_line(cli_resume_line),
+            Some((
+                "29457",
+                "ttys016",
+                "/Applications/Codex.app/Contents/Resources/codex resume 019e9153-943a-7402-8e61-9e89cee5a6f4 --cd /Users/edy/hose/tmc_symposium/tmc_surprise"
+            ))
+        );
+    }
+
+    #[test]
+    fn live_cli_primary_session_from_open_files_requires_unique_rollout() {
+        let child_id = "019eb66b-7687-7d33-9509-c3a024bab50e";
+        let parent_id = "019eb47b-a10e-7931-aae7-6a6118962db0";
+        let cli_args =
+            "/Users/edy/.nvm/versions/node/v22.12.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
+
+        assert_eq!(
+            super::select_live_cli_primary_session_id(cli_args, &[child_id.to_string(), parent_id.to_string()]),
+            None
+        );
+        assert_eq!(
+            super::select_live_cli_primary_session_id(cli_args, &[child_id.to_string()]),
+            Some(child_id.to_string())
+        );
+        assert_eq!(
+            super::select_live_cli_primary_session_id(
+                &format!("{cli_args} resume {parent_id}"),
+                &[child_id.to_string()]
+            ),
+            Some(parent_id.to_string())
         );
     }
 

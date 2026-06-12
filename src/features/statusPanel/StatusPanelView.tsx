@@ -724,7 +724,7 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onD
           className="status-action status-action--jump"
           title={jumpTitle}
           disabled={pendingAction === "jump"}
-          onClick={() => onJump(row.sessionId)}
+          onClick={() => onJump(row.jumpSessionId ?? row.sessionId)}
         >
           {pendingAction === "jump" ? <PendingIcon /> : <JumpIcon />}
         </button>
