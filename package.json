@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "clean:debug": "bash skills/attn-debug-cleanup/scripts/clean-debug-artifacts.sh",
     "explain:session": "node scripts/explainCodexSession.mjs",
     "tauri": "tauri"
   },
