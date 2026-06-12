@@ -144,6 +144,41 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
+  it("treats external import completion as stale history", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "12");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-12T10-31-55-019imported.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-12T02:31:55.949Z","type":"session_meta","payload":{"id":"019imported","cwd":"/Users/edy/project-b","originator":"codex-tui","source":"cli"}}',
+        '{"timestamp":"2026-06-12T02:31:55.950Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1","started_at":1779083012}}',
+        '{"timestamp":"2026-06-12T02:31:55.951Z","type":"event_msg","payload":{"type":"user_message","message":"old imported prompt"}}',
+        '{"timestamp":"2026-06-12T02:31:55.952Z","type":"event_msg","payload":{"type":"agent_message","message":"<EXTERNAL SESSION IMPORTED>","phase":null}}',
+        '{"timestamp":"2026-06-12T02:31:55.953Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1","last_agent_message":null,"completed_at":1779083012}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-12T03:00:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019imported",
+      state: "idle",
+      confidence: "inferred",
+      statusReason: "completed task is no longer recent; idle until the next source signal",
+      lastActivityAt: "2026-06-12T02:31:55.953Z",
+    });
+  });
+
   it("uses sqlite update after task_complete as a read signal", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");

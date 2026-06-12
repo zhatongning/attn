@@ -319,6 +319,7 @@ function parseSessionFile(filePath, {
   let lastMessage;
   let pendingToolApproval;
   let taskCompleteAt;
+  let externalImportSession = false;
 
   for (const line of fs.readFileSync(filePath, "utf8").split("\n")) {
     if (!line.trim()) continue;
@@ -344,6 +345,10 @@ function parseSessionFile(filePath, {
 
     if (value.type === "event_msg") {
       const eventType = value.payload?.type;
+      const turnId = typeof value.payload?.turn_id === "string" ? value.payload.turn_id : "";
+      if (turnId.startsWith("external-import-turn-")) {
+        externalImportSession = true;
+      }
       if (eventType === "task_complete") {
         lastActivityKind = "completed";
         pendingToolApproval = undefined;
@@ -355,6 +360,9 @@ function parseSessionFile(filePath, {
         lastActivityKind = "running";
       }
       if (typeof value.payload?.message === "string") {
+        if (value.payload.message === "<EXTERNAL SESSION IMPORTED>") {
+          externalImportSession = true;
+        }
         if (eventType === "user_message" && !sessionName) {
           sessionName = truncate(value.payload.message.trim(), 120);
         } else {
@@ -386,7 +394,7 @@ function parseSessionFile(filePath, {
   const kind = pendingToolApproval
     ? "waitingForInput"
     : lastActivityKind === "completed"
-    ? lastActivityAt && Date.parse(lastActivityAt) >= unreadCompletionTrackingStartMs
+    ? !externalImportSession && lastActivityAt && Date.parse(lastActivityAt) >= unreadCompletionTrackingStartMs
       ? "completedImmediate"
       : "completedStale"
     : lastActivityKind === "stopped"

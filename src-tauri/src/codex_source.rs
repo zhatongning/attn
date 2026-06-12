@@ -196,6 +196,7 @@ fn parse_session_content(
     let mut last_activity_kind = ObservationKind::InsufficientEvidence;
     let mut last_agent_message = None;
     let mut pending_tool_approval = None;
+    let mut external_import_session = false;
 
     for line in content
         .lines()
@@ -238,6 +239,14 @@ fn parse_session_content(
                     .get("payload")
                     .and_then(|payload| payload.get("type"))
                     .and_then(Value::as_str);
+                if value
+                    .get("payload")
+                    .and_then(|payload| payload.get("turn_id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|turn_id| turn_id.starts_with("external-import-turn-"))
+                {
+                    external_import_session = true;
+                }
 
                 if event_type == Some("task_complete") {
                     last_activity_kind = ObservationKind::Completed;
@@ -258,6 +267,9 @@ fn parse_session_content(
                     .and_then(|payload| payload.get("message"))
                     .and_then(Value::as_str)
                 {
+                    if message == "<EXTERNAL SESSION IMPORTED>" {
+                        external_import_session = true;
+                    }
                     if event_type == Some("user_message") && session_name.is_none() {
                         let trimmed = message.trim();
                         if !trimmed.is_empty() {
@@ -309,7 +321,7 @@ fn parse_session_content(
     let kind = if pending_tool_approval.is_some() {
         ObservationKind::WaitingForInput
     } else if matches!(last_activity_kind, ObservationKind::Completed) {
-        if is_tracked_unread_completion {
+        if !external_import_session && is_tracked_unread_completion {
             ObservationKind::CompletedImmediate
         } else {
             ObservationKind::CompletedStale
@@ -1208,6 +1220,41 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
+    }
+
+    #[test]
+    fn treats_external_import_completion_as_stale_history() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/12");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-12T10-31-55-019imported.jsonl"),
+            r#"{"timestamp":"2026-06-12T02:31:55.949Z","type":"session_meta","payload":{"id":"019imported","cwd":"/Users/edy/project-b","originator":"codex-tui","source":"cli"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-12T02:31:55.950Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1","started_at":1779083012}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-12T02:31:55.951Z","type":"event_msg","payload":{"type":"user_message","message":"old imported prompt"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-12T02:31:55.952Z","type":"event_msg","payload":{"type":"agent_message","message":"<EXTERNAL SESSION IMPORTED>","phase":null}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-12T02:31:55.953Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1","last_agent_message":null,"completed_at":1779083012}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_232_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedStale);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-12T02:31:55.953Z")
+        );
     }
 
     #[test]
