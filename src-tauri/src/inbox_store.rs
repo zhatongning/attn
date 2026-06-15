@@ -1295,11 +1295,22 @@ fn codex_sessions_root() -> PathBuf {
 }
 
 fn codex_state_db_path() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."));
+    codex_state_db_path_from_home(&home)
+}
+
+fn codex_state_db_path_from_home(home: &std::path::Path) -> PathBuf {
+    let current_path = home
         .join(".codex")
-        .join("state_5.sqlite")
+        .join("sqlite")
+        .join("state_5.sqlite");
+    if current_path.exists() {
+        return current_path;
+    }
+
+    home.join(".codex").join("state_5.sqlite")
 }
 
 fn acknowledged_signals_path() -> PathBuf {
@@ -1908,30 +1919,53 @@ mod tests {
     }
 
     #[test]
-    fn current_completed_threads_are_quiet_rows() {
-        let store = InboxStore::default();
-        let Some(row) = store
-            .list_sessions()
-            .into_iter()
-            .find(|row| row.workspace_path.as_deref() == Some("/Users/edy/sofdev/agent-session-inbox"))
-        else {
-            return;
-        };
+    fn completed_threads_are_sorted_as_quiet_rows() {
+        let acknowledged_signals = HashSet::new();
+        let dismissed_session_ids = HashSet::new();
+        let mut rows = vec![
+            SessionRow::new("idle", "Completed", SessionState::Idle, Confidence::Inferred)
+                .with_workspace(Some("/repo".to_string()))
+                .with_jump_target(JumpTarget::Desktop)
+                .with_reason("completed task observed; idle until the next source signal")
+                .with_last_activity("2026-06-06T04:00:00.000Z"),
+            SessionRow::new("running", "Active", SessionState::Running, Confidence::Exact)
+                .with_workspace(Some("/repo".to_string()))
+                .with_jump_target(JumpTarget::Desktop)
+                .with_reason("running signal observed")
+                .with_last_activity("2026-06-06T04:01:00.000Z"),
+            SessionRow::new("inspect", "Inspect", SessionState::Inspect, Confidence::Exact)
+                .with_workspace(Some("/repo".to_string()))
+                .with_jump_target(JumpTarget::Desktop)
+                .with_reason("completed task ready to inspect; open it to mark read")
+                .with_last_activity("2026-06-06T04:02:00.000Z"),
+        ]
+        .into_iter()
+        .map(|row| {
+            super::finalize_session_row(
+                row,
+                &acknowledged_signals,
+                &dismissed_session_ids,
+                1_780_000_000_000,
+            )
+        })
+        .collect::<Vec<_>>();
 
-        match row.state {
-            SessionState::Idle => {
-                assert_eq!(row.confidence, Confidence::Inferred);
-                assert!(row.status_reason.contains("completed task observed"));
-            }
-            SessionState::Running => {
-                assert!(matches!(row.confidence, Confidence::Exact | Confidence::Inferred));
-                assert!(
-                    row.status_reason.contains("running signal observed")
-                        || row.status_reason.contains("Live Codex CLI process")
-                );
-            }
-            _ => panic!("current project row should be active or idle"),
-        }
+        rows.sort_by(super::compare_session_rows_for_store);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["inspect", "running", "idle"]
+        );
+        let idle_row = rows
+            .iter()
+            .find(|row| row.session_id == "idle")
+            .expect("idle row");
+        assert_eq!(idle_row.state, SessionState::Idle);
+        assert_eq!(idle_row.confidence, Confidence::Inferred);
+        assert!(!idle_row.dismissed);
+        assert_eq!(idle_row.jump_availability, JumpAvailability::Exact);
     }
 
     #[test]
@@ -2020,6 +2054,21 @@ mod tests {
         assert_eq!(confirmed_row.state, SessionState::WaitingForInput);
         assert_eq!(confirmed_row.status_reason, "waiting for user input");
         assert!(!confirmed_row.handled);
+    }
+
+    #[test]
+    fn default_state_db_path_prefers_current_sqlite_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let legacy_db = temp.path().join(".codex/state_5.sqlite");
+        let current_db = temp.path().join(".codex/sqlite/state_5.sqlite");
+        fs::create_dir_all(current_db.parent().expect("current db parent")).expect("current db dir");
+        fs::create_dir_all(legacy_db.parent().expect("legacy db parent")).expect("legacy db dir");
+        fs::write(&legacy_db, "").expect("legacy db");
+        fs::write(&current_db, "").expect("current db");
+
+        let selected = super::codex_state_db_path_from_home(temp.path());
+
+        assert_eq!(selected, current_db);
     }
 
     #[test]

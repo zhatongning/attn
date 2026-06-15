@@ -850,7 +850,7 @@ describe("StatusPanelView", () => {
     });
   });
 
-  it("uses small Atom status markers", () => {
+  it("uses small Atom status markers for visible rows", () => {
     const rows: SessionRow[] = [
       { ...initialSessions[0], sessionId: "blocked", state: "unknown", statusReason: "source status unavailable" },
       { ...initialSessions[0], sessionId: "input", state: "waitingForInput", statusReason: "waiting for user input" },
@@ -865,7 +865,7 @@ describe("StatusPanelView", () => {
       element.textContent?.replace(/\s+/g, " ").trim(),
     );
 
-    expect(statusTexts).toEqual(["● blocked", "● input", "● inspect"]);
+    expect(statusTexts).toEqual(["● blocked", "● input", "○ working"]);
   });
 
   it("shows a parent subtask summary while only promoting intervention subagents", () => {

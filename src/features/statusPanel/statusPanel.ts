@@ -174,9 +174,9 @@ export const atomInterventionTheme: AtomInterventionTheme = {
 const statusPriority: Record<InterventionStatus, number> = {
   blocked: 0,
   input: 1,
-  inspect: 2,
-  stopped: 3,
-  working: 4,
+  stopped: 2,
+  working: 3,
+  inspect: 4,
   needed: 5,
   idle: 6,
 };

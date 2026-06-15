@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createCodexSessionsDevSource,
+  defaultCodexStateDbPath,
   discoverCodexSessions,
   jumpToSession,
   parseCodexProcessLine,
@@ -21,6 +22,19 @@ afterEach(() => {
 });
 
 describe("codexSessionsDevSource", () => {
+  it("prefers the current Codex sqlite state DB over the legacy root DB", () => {
+    const temp = tempDir();
+    const home = path.join(temp, "home");
+    const legacyDb = path.join(home, ".codex", "state_5.sqlite");
+    const currentDb = path.join(home, ".codex", "sqlite", "state_5.sqlite");
+    fs.mkdirSync(path.dirname(legacyDb), { recursive: true });
+    fs.mkdirSync(path.dirname(currentDb), { recursive: true });
+    fs.writeFileSync(legacyDb, "");
+    fs.writeFileSync(currentDb, "");
+
+    expect(defaultCodexStateDbPath(home)).toBe(currentDb);
+  });
+
   it("only treats the actual codex CLI executable as a live CLI process", () => {
     const helperLine =
       '4576 ttys002 /Users/edy/.code /Users/edy/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient turn-ended {"client":"codex-tui","thread-id":"019eb47b-a10e-7931-aae7-6a6118962db0"}';
@@ -923,6 +937,52 @@ describe("codexSessionsDevSource", () => {
       state: "stopped",
       statusReason: "stopped before completion; decide whether to continue, inspect, or dismiss",
       evidenceSummary: "local Codex JSONL activity observed",
+    });
+  });
+
+  it("keeps manually paused Desktop sessions stopped despite recent sqlite updates", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "15");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-15T11-07-35-019paused.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-15T03:07:36.032Z","type":"session_meta","payload":{"id":"019paused","cwd":"/Users/edy/hose/tmc/wmhcar","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-15T03:30:56.909Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\\nThe user interrupted the previous turn on purpose.\\n</turn_aborted>"}]}}',
+        '{"timestamp":"2026-06-15T03:30:56.989Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019paused",
+      rolloutPath,
+      cwd: "/Users/edy/hose/tmc/wmhcar",
+      title: "调整 IM 接口实现",
+      source: "vscode",
+      threadSource: "user",
+      preview: "调整 IM 接口实现",
+      updatedAtMs: Date.parse("2026-06-15T03:30:56.989Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-15T03:40:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019paused",
+      state: "stopped",
+      statusReason: "stopped before completion; decide whether to continue, inspect, or dismiss",
+      jumpTarget: "desktop",
+      jumpAvailability: "exact",
     });
   });
 

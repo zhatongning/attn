@@ -11,8 +11,11 @@ export function defaultCodexSessionsRoot() {
   return path.join(os.homedir(), ".codex", "sessions");
 }
 
-export function defaultCodexStateDbPath() {
-  return path.join(os.homedir(), ".codex", "state_5.sqlite");
+export function defaultCodexStateDbPath(homeDir = os.homedir()) {
+  const currentPath = path.join(homeDir, ".codex", "sqlite", "state_5.sqlite");
+  if (fs.existsSync(currentPath)) return currentPath;
+
+  return path.join(homeDir, ".codex", "state_5.sqlite");
 }
 
 export function sourceHealth({
@@ -292,6 +295,7 @@ function terminalOrInputKind(kind) {
     || kind === "completed"
     || kind === "completedStale"
     || kind === "failed"
+    || kind === "stopped"
     || kind === "waitingForInput";
 }
 

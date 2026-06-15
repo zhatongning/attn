@@ -31,11 +31,11 @@ describe("buildStatusPanelModel", () => {
     expect(model.visibleRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["unknown", "blocked"],
       ["needs-input", "input"],
-      ["complete", "inspect"],
       ["stopped", "stopped"],
+      ["active", "working"],
     ]);
     expect(model.hiddenRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
-      ["active", "working"],
+      ["complete", "inspect"],
     ]);
   });
 
@@ -135,14 +135,31 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
       "blocked",
-      "inspect",
       "working",
+      "inspect",
       "needed",
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
     expect(model.idleCount).toBe(1);
     expect(model.quietHiddenCount).toBe(1);
     expect(model.hiddenCount).toBe(1);
+  });
+
+  it("keeps active working sessions visible ahead of inspect backlog", () => {
+    const model = buildStatusPanelModel([
+      { ...row("inspect-old", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:20:00.000Z" },
+      { ...row("inspect-mid", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:41:00.000Z" },
+      { ...row("inspect-new", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:46:00.000Z" },
+      { ...row("working-wmhcar", "running", "running signal observed"), lastActivityAt: "2026-06-15T03:30:00.000Z" },
+      { ...row("working-mos", "running", "running signal observed"), lastActivityAt: "2026-06-15T03:54:00.000Z" },
+    ]);
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
+      "working-mos",
+      "working-wmhcar",
+      "inspect-new",
+    ]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["inspect-mid", "inspect-old"]);
   });
 
   it("uses the Atom intervention theme", () => {

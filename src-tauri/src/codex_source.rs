@@ -643,6 +643,7 @@ fn observation_from_thread(
                 | ObservationKind::CompletedImmediate
                 | ObservationKind::CompletedStale
                 | ObservationKind::Failed
+                | ObservationKind::Stopped
                 | ObservationKind::WaitingForInput
         )
     ) || hook_activity_is_newer_than_jsonl;
@@ -657,6 +658,7 @@ fn observation_from_thread(
                 | ObservationKind::CompletedImmediate
                 | ObservationKind::CompletedStale
                 | ObservationKind::Failed
+                | ObservationKind::Stopped
                 | ObservationKind::WaitingForInput
         )
     ) {
@@ -873,11 +875,22 @@ fn timestamp_ms_to_iso_utc(value: i64) -> Option<String> {
 }
 
 fn codex_state_db_path() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."));
+    codex_state_db_path_from_home(&home)
+}
+
+fn codex_state_db_path_from_home(home: &Path) -> PathBuf {
+    let current_path = home
         .join(".codex")
-        .join("state_5.sqlite")
+        .join("sqlite")
+        .join("state_5.sqlite");
+    if current_path.exists() {
+        return current_path;
+    }
+
+    home.join(".codex").join("state_5.sqlite")
 }
 
 fn codex_hook_events_path() -> PathBuf {
@@ -1623,6 +1636,46 @@ mod tests {
     }
 
     #[test]
+    fn desktop_turn_aborted_thread_stays_stopped_despite_recent_sqlite_update() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/15");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-15T11-07-35-019paused.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-15T03:07:36.032Z","type":"session_meta","payload":{"id":"019paused","cwd":"/Users/edy/hose/tmc/wmhcar","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-15T03:30:56.909Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-15T03:30:56.989Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
+                + "\n",
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019paused",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hose/tmc/wmhcar",
+            "调整 IM 接口实现",
+            1_781_494_256_989,
+        );
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_494_400),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Stopped);
+        assert_eq!(rows[0].jump_target, JumpTarget::Desktop);
+    }
+
+    #[test]
     fn recent_active_hook_event_promotes_stale_thread_to_running() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
@@ -1964,6 +2017,21 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, ObservationKind::WaitingForInput);
         assert_eq!(rows[0].jump_target, JumpTarget::Cli);
+    }
+
+    #[test]
+    fn default_state_db_path_prefers_current_sqlite_directory() {
+        let temp = tempdir().expect("temp dir");
+        let legacy_db = temp.path().join(".codex/state_5.sqlite");
+        let current_db = temp.path().join(".codex/sqlite/state_5.sqlite");
+        fs::create_dir_all(current_db.parent().expect("current db parent")).expect("current db dir");
+        fs::create_dir_all(legacy_db.parent().expect("legacy db parent")).expect("legacy db dir");
+        fs::write(&legacy_db, "").expect("legacy db");
+        fs::write(&current_db, "").expect("current db");
+
+        let selected = super::codex_state_db_path_from_home(temp.path());
+
+        assert_eq!(selected, current_db);
     }
 
     fn create_threads_table(state_db: &std::path::Path) {
