@@ -14,6 +14,7 @@ const baseRow: SessionRow = {
   statusReason: "running signal observed",
   handled: false,
   dismissed: false,
+  pinned: false,
   jumpAvailability: "exact",
   jumpTarget: "desktop",
 };
@@ -160,6 +161,45 @@ describe("buildStatusPanelModel", () => {
       "inspect-new",
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["inspect-mid", "inspect-old"]);
+  });
+
+  it("keeps pinned inspect rows visible ahead of working sessions and inspect backlog", () => {
+    const model = buildStatusPanelModel([
+      { ...row("inspect-old", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:20:00.000Z" },
+      { ...row("inspect-new", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:46:00.000Z" },
+      { ...row("working-new", "running", "running signal observed"), lastActivityAt: "2026-06-15T03:54:00.000Z" },
+      {
+        ...row("pinned-inspect", "inspect", "completed task ready to inspect; open it to mark read"),
+        pinned: true,
+        lastActivityAt: "2026-06-15T03:30:00.000Z",
+      },
+    ]);
+
+    expect(model.visibleRows.map((item) => [item.sessionId, item.pinned])).toEqual([
+      ["pinned-inspect", true],
+      ["working-new", false],
+      ["inspect-new", false],
+    ]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["inspect-old"]);
+  });
+
+  it("keeps pinned idle rows visible instead of folding them into quiet hidden count", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("pinned-idle", "idle", "Read window expired; idle until the next source signal."),
+        pinned: true,
+      },
+      row("working", "running", "running signal observed"),
+    ]);
+
+    expect(model.visibleRows.map((item) => [item.sessionId, item.displayStatus, item.pinned])).toEqual([
+      ["pinned-idle", "idle", true],
+      ["working", "working", false],
+    ]);
+    expect(model.hiddenRows).toEqual([]);
+    expect(model.hiddenCount).toBe(0);
+    expect(model.quietHiddenCount).toBe(0);
+    expect(model.idleCount).toBe(1);
   });
 
   it("uses the Atom intervention theme", () => {

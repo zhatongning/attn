@@ -88,6 +88,10 @@ export interface StatusPanelCopy {
   collapsePanelLabel: string;
   jumpBackLabel: string;
   openingSessionLabel: string;
+  pinLabel: string;
+  unpinLabel: string;
+  pinningLabel: string;
+  unpinningLabel: string;
   dismissLabel: string;
   dismissingLabel: string;
   showEvidenceLabel: (label: string) => string;
@@ -240,6 +244,10 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     collapsePanelLabel: "Collapse status panel",
     jumpBackLabel: "Jump back",
     openingSessionLabel: "Opening session",
+    pinLabel: "Pin session",
+    unpinLabel: "Unpin session",
+    pinningLabel: "Pinning session",
+    unpinningLabel: "Unpinning session",
     dismissLabel: "Dismiss",
     dismissingLabel: "Dismissing session",
     showEvidenceLabel: (label) => `Show status evidence for ${label}`,
@@ -318,6 +326,10 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     collapsePanelLabel: "收起状态面板",
     jumpBackLabel: "返回会话",
     openingSessionLabel: "正在打开会话",
+    pinLabel: "固定会话",
+    unpinLabel: "取消固定会话",
+    pinningLabel: "正在固定会话",
+    unpinningLabel: "正在取消固定会话",
     dismissLabel: "忽略",
     dismissingLabel: "正在忽略",
     showEvidenceLabel: (label) => `查看 ${label} 的状态依据`,
@@ -364,14 +376,15 @@ export function buildStatusPanelModel(
     .filter(shouldIncludeInWatchlist)
     .map((row) => toPanelRow(row, theme, copy))
   const rolledUpRows = rollUpSubagentRows(panelRows, copy).sort(comparePanelRows);
-  const cardRows = rolledUpRows.filter((row) => row.displayStatus !== "idle");
+  const cardRows = rolledUpRows.filter((row) => row.pinned || row.displayStatus !== "idle");
   const quietRows = rolledUpRows.filter((row) => row.statusTone === "quiet");
   const visibleRows = cardRows.slice(0, config.visibleItemCount);
   const hiddenRows = cardRows.slice(config.visibleItemCount);
   const expandableHiddenRows = hiddenRows.filter((row) => row.statusTone === "alert");
-  const hiddenCount = hiddenRows.length + rolledUpRows.filter((row) => row.displayStatus === "idle").length;
+  const hiddenIdleCount = rolledUpRows.filter((row) => !row.pinned && row.displayStatus === "idle").length;
+  const hiddenCount = hiddenRows.length + hiddenIdleCount;
   const quietHiddenCount = hiddenRows.filter((row) => row.statusTone === "quiet").length
-    + rolledUpRows.filter((row) => row.displayStatus === "idle").length;
+    + hiddenIdleCount;
 
   return {
     visibleRows,
@@ -543,6 +556,9 @@ function themeFromConfig(config: StatusPanelConfig): AtomInterventionTheme {
 }
 
 function comparePanelRows(left: StatusPanelRow, right: StatusPanelRow) {
+  const pinnedDelta = Number(right.pinned) - Number(left.pinned);
+  if (pinnedDelta !== 0) return pinnedDelta;
+
   const priorityDelta = statusPriority[left.displayStatus] - statusPriority[right.displayStatus];
   if (priorityDelta !== 0) return priorityDelta;
 
@@ -561,6 +577,7 @@ function toPanelRow(row: SessionRow, theme: AtomInterventionTheme, copy: StatusP
 
   return {
     ...row,
+    pinned: row.pinned === true,
     displayStatus,
     statusLabel: status.label,
     statusMarker: status.marker,

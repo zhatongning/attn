@@ -10,6 +10,8 @@ import {
   loadCodexHookIntegrationStatus,
   loadSessions,
   loadSourceHealth,
+  pinSession as pinSessionCommand,
+  unpinSession as unpinSessionCommand,
 } from "../inbox/inboxApi";
 import {
   buildStatusPanelModel,
@@ -58,7 +60,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
   const [hookInstallPending, setHookInstallPending] = useState(false);
-  const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss">>({});
+  const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss" | "pin" | "unpin">>({});
   const [attentionCues, setAttentionCues] = useState<Record<string, boolean>>({});
   const [panelOpen, setPanelOpen] = useState(config.panelMode === "persistent");
   const alertSignatureRef = useRef<string | null>(null);
@@ -224,7 +226,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     setPendingAction(sessionId, "dismiss");
     setRows((currentRows) =>
       currentRows.map((row) =>
-        row.sessionId === sessionId ? { ...row, dismissed: true, handled: true } : row,
+        row.sessionId === sessionId ? { ...row, dismissed: true, handled: true, pinned: false } : row,
       ),
     );
     setErrorMessage(null);
@@ -238,6 +240,31 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
       setErrorMessage(error instanceof Error ? error.message : "Dismiss command failed.");
     } finally {
       clearPendingAction(sessionId);
+    }
+  }
+
+  async function togglePinnedSession(row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number]) {
+    const previousRows = rows;
+    const nextPinned = !row.pinned;
+    setPendingAction(row.sessionId, nextPinned ? "pin" : "unpin");
+    setRows((currentRows) =>
+      currentRows.map((currentRow) =>
+        currentRow.sessionId === row.sessionId ? { ...currentRow, pinned: nextPinned } : currentRow,
+      ),
+    );
+    setErrorMessage(null);
+
+    try {
+      const updatedRows = nextPinned
+        ? await pinSessionCommand(row.sessionId, previousRows)
+        : await unpinSessionCommand(row.sessionId, previousRows);
+      setRows(updatedRows);
+      setCommandMessage(nextPinned ? "pinned" : "unpinned");
+    } catch (error) {
+      setRows(previousRows);
+      setErrorMessage(error instanceof Error ? error.message : "Pin command failed.");
+    } finally {
+      clearPendingAction(row.sessionId);
     }
   }
 
@@ -484,6 +511,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
                   attentionCue={attentionCues[row.sessionId] === true}
                   copy={model.copy}
                   onJump={jumpToSession}
+                  onTogglePinned={togglePinnedSession}
                   onDismiss={dismissSession}
                 />
               ))
@@ -521,7 +549,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     </main>
   );
 
-  function setPendingAction(sessionId: string, action: "jump" | "dismiss") {
+  function setPendingAction(sessionId: string, action: "jump" | "dismiss" | "pin" | "unpin") {
     setPendingActions((current) => ({ ...current, [sessionId]: action }));
   }
 
@@ -629,22 +657,31 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
 interface StatusRowProps {
   row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number];
-  pendingAction?: "jump" | "dismiss";
+  pendingAction?: "jump" | "dismiss" | "pin" | "unpin";
   attentionCue?: boolean;
   copy: ReturnType<typeof buildStatusPanelModel>["copy"];
   onJump: (sessionId: string) => void;
+  onTogglePinned: (row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number]) => void;
   onDismiss: (sessionId: string) => void;
 }
 
-function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onDismiss }: StatusRowProps) {
+function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onTogglePinned, onDismiss }: StatusRowProps) {
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const evidenceRef = useRef<HTMLSpanElement | null>(null);
   const jumpTitle = pendingAction === "jump" ? copy.openingSessionLabel : copy.jumpBackLabel;
+  const pinTitle = pendingAction === "pin"
+    ? copy.pinningLabel
+    : pendingAction === "unpin"
+      ? copy.unpinningLabel
+    : row.pinned
+      ? copy.unpinLabel
+      : copy.pinLabel;
   const dismissTitle = pendingAction === "dismiss" ? copy.dismissingLabel : copy.dismissLabel;
   const rowClassName = [
     "status-row",
     `status-row--${row.displayStatus}`,
     `status-row--${row.statusTone}`,
+    row.pinned ? "status-row--pinned" : "",
     attentionCue ? "status-row--attention-cue" : "",
     evidenceOpen ? "status-row--evidence-open" : "",
   ].filter(Boolean).join(" ");
@@ -730,6 +767,16 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onD
         </button>
         <button
           type="button"
+          className="status-action status-action--pin"
+          title={pinTitle}
+          disabled={pendingAction === "pin" || pendingAction === "unpin"}
+          aria-pressed={row.pinned}
+          onClick={() => onTogglePinned(row)}
+        >
+          {pendingAction === "pin" || pendingAction === "unpin" ? <PendingIcon /> : <PinIcon pinned={row.pinned} />}
+        </button>
+        <button
+          type="button"
           className="status-action status-action--dismiss"
           title={dismissTitle}
           disabled={pendingAction === "dismiss"}
@@ -756,6 +803,20 @@ function DismissIcon() {
     <svg aria-hidden="true" className="status-action-icon" viewBox="0 0 16 16">
       <path d="M5 5l6 6" />
       <path d="M11 5l-6 6" />
+    </svg>
+  );
+}
+
+function PinIcon({ pinned }: { pinned: boolean }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={`status-action-icon${pinned ? " status-action-icon--pinned" : ""}`}
+      viewBox="0 0 16 16"
+    >
+      <path d="M6 2h4" />
+      <path d="M7 2l-.8 5L4 9h8L9.8 7 9 2" />
+      <path d="M8 9v5" />
     </svg>
   );
 }

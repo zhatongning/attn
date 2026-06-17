@@ -973,6 +973,86 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("follow-up")).toBeTruthy();
   });
 
+  it("pins and unpins a row from the status panel", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "pin-row",
+      label: "Pin row",
+      state: "inspect",
+      pinned: false,
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return [row];
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "pin_session") return [{ ...row, pinned: true }];
+      if (command === "unpin_session") return [row];
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    fireEvent.click(await screen.findByTitle("Pin session"));
+
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("pin_session", { sessionId: "pin-row" });
+    expect(await screen.findByTitle("Unpin session")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("Unpin session"));
+
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("unpin_session", { sessionId: "pin-row" });
+    expect(await screen.findByTitle("Pin session")).toBeTruthy();
+  });
+
+  it("keeps pinned rows in inspect after jump refresh returns acknowledged state", async () => {
+    const pinnedRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "pinned-jump-row",
+      label: "Pinned jump row",
+      state: "inspect",
+      pinned: true,
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const acknowledgedButPinnedRow: SessionRow = {
+      ...pinnedRow,
+      state: "inspect",
+      handled: false,
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    let jumped = false;
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return jumped ? [acknowledgedButPinnedRow] : [pinnedRow];
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "jump_to_session") {
+        jumped = true;
+        return {
+          sessionId: pinnedRow.sessionId,
+          availability: "exact",
+          target: "desktop",
+          message: "Opened Codex Desktop session.",
+        };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={[pinnedRow]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    fireEvent.click(await screen.findByTitle("Jump back"));
+
+    expect(await screen.findByText("inspect")).toBeTruthy();
+    expect(screen.queryByText("follow-up")).toBeNull();
+    expect(screen.getByTitle("Unpin session")).toBeTruthy();
+  });
+
   it("removes a dismissed row immediately while the command is still running", async () => {
     const row = { ...initialSessions[0], sessionId: "dismiss-lag", label: "Dismiss lag row" };
     let resolveDismiss: ((response: Response) => void) | undefined;

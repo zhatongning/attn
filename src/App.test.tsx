@@ -57,6 +57,7 @@ const baseRow: SessionRow = {
   statusReason: "running signal observed",
   handled: false,
   dismissed: false,
+  pinned: false,
   jumpAvailability: "exact",
   jumpTarget: "desktop",
 };

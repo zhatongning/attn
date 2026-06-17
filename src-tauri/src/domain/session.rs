@@ -137,6 +137,7 @@ pub struct SessionRow {
     pub dismissability_reason: Option<String>,
     pub handled: bool,
     pub dismissed: bool,
+    pub pinned: bool,
     pub jump_availability: JumpAvailability,
     pub jump_target: JumpTarget,
 }
@@ -164,6 +165,7 @@ impl SessionRow {
             dismissability_reason: None,
             handled: false,
             dismissed: false,
+            pinned: false,
             jump_availability: JumpAvailability::Unavailable,
             jump_target: JumpTarget::Unknown,
         }
@@ -232,6 +234,7 @@ impl SessionRow {
     pub fn mark_dismissed(mut self) -> Self {
         self.handled = true;
         self.dismissed = true;
+        self.pinned = false;
         self
     }
 

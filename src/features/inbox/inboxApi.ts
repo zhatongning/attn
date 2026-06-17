@@ -95,6 +95,34 @@ export async function restoreSession(sessionId: string, currentRows: SessionRow[
   );
 }
 
+export async function pinSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
+  if (!hasTauriRuntime()) {
+    return currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, pinned: true } : row,
+    );
+  }
+
+  return invoke<SessionRow[]>("pin_session", { sessionId }).catch(() =>
+    currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, pinned: true } : row,
+    ),
+  );
+}
+
+export async function unpinSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
+  if (!hasTauriRuntime()) {
+    return currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, pinned: false } : row,
+    );
+  }
+
+  return invoke<SessionRow[]>("unpin_session", { sessionId }).catch(() =>
+    currentRows.map((row) =>
+      row.sessionId === sessionId ? { ...row, pinned: false } : row,
+    ),
+  );
+}
+
 export async function jumpToSession(sessionId: string): Promise<JumpResult> {
   if (!hasTauriRuntime()) {
     return fetchDevJson<JumpResult>("/api/jump", {

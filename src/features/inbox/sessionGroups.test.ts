@@ -10,6 +10,7 @@ const baseRow: SessionRow = {
   statusReason: "waiting",
   handled: false,
   dismissed: false,
+  pinned: false,
   jumpAvailability: "exact",
   jumpTarget: "desktop",
 };

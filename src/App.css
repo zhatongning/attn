@@ -252,6 +252,12 @@ p {
   background: #222d39;
 }
 
+.status-row--pinned {
+  box-shadow:
+    inset 0 0 0 1px rgba(97, 175, 239, 0.18),
+    inset 0 1px 0 rgba(171, 178, 191, 0.08);
+}
+
 .status-row--stopped {
   --row-border-color: #5a3d27;
   background: #2d2924;
@@ -505,6 +511,10 @@ p {
 
 .status-action-icon--pending {
   animation: action-spin 900ms linear infinite;
+}
+
+.status-action-icon--pinned {
+  color: #61afef;
 }
 
 @keyframes action-spin {

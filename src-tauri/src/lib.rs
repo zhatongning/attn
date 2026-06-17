@@ -41,6 +41,28 @@ async fn restore_session(
 }
 
 #[tauri::command]
+async fn pin_session(
+    state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
+    session_id: String,
+) -> Result<Vec<domain::session::SessionRow>, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.pin_session(&session_id))
+        .await
+        .map_err(|error| format!("pin worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn unpin_session(
+    state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
+    session_id: String,
+) -> Result<Vec<domain::session::SessionRow>, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.unpin_session(&session_id))
+        .await
+        .map_err(|error| format!("unpin worker failed: {error}"))
+}
+
+#[tauri::command]
 fn source_health(
     state: tauri::State<Arc<inbox_store::InboxStore>>,
 ) -> domain::source_health::SourceHealth {
@@ -226,6 +248,8 @@ pub fn run() {
             list_sessions,
             dismiss_session,
             restore_session,
+            pin_session,
+            unpin_session,
             source_health,
             codex_hook_integration_status,
             install_codex_hooks,

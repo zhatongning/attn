@@ -19,6 +19,7 @@ export interface SessionRow {
   dismissabilityReason?: string;
   handled: boolean;
   dismissed: boolean;
+  pinned: boolean;
   jumpAvailability: JumpAvailability;
   jumpTarget: JumpTarget;
 }

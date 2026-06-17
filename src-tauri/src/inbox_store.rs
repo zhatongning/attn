@@ -46,6 +46,7 @@ enum JumpCommandPlan {
 #[derive(Debug, Default)]
 pub struct InboxStore {
     dismissed_session_ids: Mutex<HashSet<String>>,
+    pinned_session_ids: Mutex<HashSet<String>>,
     acknowledged_signals: Mutex<HashSet<AcknowledgedSignal>>,
     session_rows_cache: Mutex<Option<CachedSessionRows>>,
 }
@@ -118,10 +119,15 @@ impl InboxStore {
 
     fn compute_session_rows(&self) -> Vec<SessionRow> {
         self.refresh_persisted_acknowledged_signals();
+        self.refresh_persisted_pinned_session_ids();
         let dismissed_session_ids = self
             .dismissed_session_ids
             .lock()
             .expect("dismissed session store lock poisoned");
+        let pinned_session_ids = self
+            .pinned_session_ids
+            .lock()
+            .expect("pinned session store lock poisoned");
         let acknowledged_signals = self
             .acknowledged_signals
             .lock()
@@ -153,6 +159,7 @@ impl InboxStore {
                     row,
                     &acknowledged_signals,
                     &dismissed_session_ids,
+                    &pinned_session_ids,
                     now_ms,
                 )
             })
@@ -167,6 +174,13 @@ impl InboxStore {
             .lock()
             .expect("dismissed session store lock poisoned")
             .insert(session_id.to_string());
+        let mut pinned_session_ids = self
+            .pinned_session_ids
+            .lock()
+            .expect("pinned session store lock poisoned");
+        pinned_session_ids.remove(session_id);
+        let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
+        drop(pinned_session_ids);
         self.invalidate_session_rows_cache();
 
         self.list_sessions()
@@ -177,6 +191,32 @@ impl InboxStore {
             .lock()
             .expect("dismissed session store lock poisoned")
             .remove(session_id);
+        self.invalidate_session_rows_cache();
+
+        self.list_sessions()
+    }
+
+    pub fn pin_session(&self, session_id: &str) -> Vec<SessionRow> {
+        let mut pinned_session_ids = self
+            .pinned_session_ids
+            .lock()
+            .expect("pinned session store lock poisoned");
+        pinned_session_ids.insert(session_id.to_string());
+        let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
+        drop(pinned_session_ids);
+        self.invalidate_session_rows_cache();
+
+        self.list_sessions()
+    }
+
+    pub fn unpin_session(&self, session_id: &str) -> Vec<SessionRow> {
+        let mut pinned_session_ids = self
+            .pinned_session_ids
+            .lock()
+            .expect("pinned session store lock poisoned");
+        pinned_session_ids.remove(session_id);
+        let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
+        drop(pinned_session_ids);
         self.invalidate_session_rows_cache();
 
         self.list_sessions()
@@ -329,8 +369,15 @@ impl InboxStore {
         } else {
             JumpAvailability::Unavailable
         };
+        let pinned_session_ids = self
+            .pinned_session_ids
+            .lock()
+            .expect("pinned session store lock poisoned");
 
-        Some(row.with_jump_availability(jump_availability))
+        Some(apply_pinned_session_state(
+            row.with_jump_availability(jump_availability),
+            &pinned_session_ids,
+        ))
     }
 
     fn refresh_persisted_acknowledged_signals(&self) {
@@ -345,12 +392,26 @@ impl InboxStore {
             .expect("acknowledged signal store lock poisoned");
         acknowledged_signals.extend(loaded);
     }
+
+    fn refresh_persisted_pinned_session_ids(&self) {
+        let loaded = load_pinned_session_ids(&pinned_session_ids_path());
+        if loaded.is_empty() {
+            return;
+        }
+
+        let mut pinned_session_ids = self
+            .pinned_session_ids
+            .lock()
+            .expect("pinned session store lock poisoned");
+        pinned_session_ids.extend(loaded);
+    }
 }
 
 fn finalize_session_row(
     row: SessionRow,
     acknowledged_signals: &HashSet<AcknowledgedSignal>,
     dismissed_session_ids: &HashSet<String>,
+    pinned_session_ids: &HashSet<String>,
     now_ms: u64,
 ) -> SessionRow {
     let dismissability = evaluate_dismissability(&row);
@@ -358,7 +419,12 @@ fn finalize_session_row(
     let row = row
         .with_dismissability_reason(Some(dismissability.reason))
         .with_jump_availability(jump_availability);
-    let row = apply_acknowledged_session_state(row, acknowledged_signals, now_ms);
+    let row = apply_pinned_session_state(row, pinned_session_ids);
+    let row = if row.pinned {
+        row
+    } else {
+        apply_acknowledged_session_state(row, acknowledged_signals, now_ms)
+    };
     apply_dismissed_session_state(row, dismissed_session_ids)
 }
 
@@ -424,6 +490,27 @@ fn save_acknowledged_signals(
     fs::write(path, content)
 }
 
+fn load_pinned_session_ids(path: &std::path::Path) -> HashSet<String> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_pinned_session_ids(
+    path: &std::path::Path,
+    session_ids: &HashSet<String>,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = serde_json::to_string_pretty(session_ids)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(path, content)
+}
+
 fn apply_acknowledged_session_state(
     row: SessionRow,
     acknowledged_signals: &HashSet<AcknowledgedSignal>,
@@ -484,6 +571,21 @@ fn apply_dismissed_session_state(
         row.mark_restored()
     } else {
         row.mark_dismissed()
+    }
+}
+
+fn apply_pinned_session_state(
+    row: SessionRow,
+    pinned_session_ids: &HashSet<String>,
+) -> SessionRow {
+    if !pinned_session_ids.contains(&row.session_id) {
+        return row;
+    }
+
+    SessionRow {
+        pinned: true,
+        dismissed: false,
+        ..row
     }
 }
 
@@ -1322,6 +1424,15 @@ fn acknowledged_signals_path() -> PathBuf {
         .join("acknowledged-signals.json")
 }
 
+fn pinned_session_ids_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+        .join("agent-session-inbox")
+        .join("pinned-sessions.json")
+}
+
 fn current_time_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1919,9 +2030,69 @@ mod tests {
     }
 
     #[test]
+    fn pinned_rows_are_marked_on_finalize_without_changing_source_state() {
+        let acknowledged_signals = HashSet::new();
+        let dismissed_session_ids = HashSet::new();
+        let pinned_session_ids = HashSet::from(["s9".to_string()]);
+
+        let row = super::finalize_session_row(
+            SessionRow::new("s9", "Pinned inspect", SessionState::Inspect, Confidence::Exact)
+                .with_workspace(Some("/repo".to_string()))
+                .with_jump_target(JumpTarget::Desktop),
+            &acknowledged_signals,
+            &dismissed_session_ids,
+            &pinned_session_ids,
+            1_780_000_000_000,
+        );
+
+        assert_eq!(row.state, SessionState::Inspect);
+        assert!(row.pinned);
+        assert!(!row.dismissed);
+    }
+
+    #[test]
+    fn pinned_rows_ignore_acknowledged_signals_until_unpinned() {
+        let row = SessionRow::new("s13", "Pinned inspect", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:00:00.000Z");
+        let acknowledged_at_ms = 1_780_000_000_000;
+        let acknowledged_signals = HashSet::from([super::AcknowledgedSignal::from_row_at(
+            &row,
+            acknowledged_at_ms,
+        )]);
+        let dismissed_session_ids = HashSet::new();
+        let pinned_session_ids = HashSet::from(["s13".to_string()]);
+
+        let row = super::finalize_session_row(
+            row,
+            &acknowledged_signals,
+            &dismissed_session_ids,
+            &pinned_session_ids,
+            acknowledged_at_ms + 29 * 60 * 1000,
+        );
+
+        assert_eq!(row.state, SessionState::Inspect);
+        assert!(!row.handled);
+        assert!(row.pinned);
+    }
+
+    #[test]
+    fn dismissed_rows_clear_pinned_state() {
+        let dismissed_session_ids = HashSet::from(["s10".to_string()]);
+        let pinned_session_ids = HashSet::from(["s10".to_string()]);
+        let row = SessionRow::new("s10", "Pinned inspect", SessionState::Inspect, Confidence::Exact);
+
+        let row = super::apply_pinned_session_state(row, &pinned_session_ids);
+        let row = super::apply_dismissed_session_state(row, &dismissed_session_ids);
+
+        assert!(row.dismissed);
+        assert!(!row.pinned);
+    }
+
+    #[test]
     fn completed_threads_are_sorted_as_quiet_rows() {
         let acknowledged_signals = HashSet::new();
         let dismissed_session_ids = HashSet::new();
+        let pinned_session_ids = HashSet::new();
         let mut rows = vec![
             SessionRow::new("idle", "Completed", SessionState::Idle, Confidence::Inferred)
                 .with_workspace(Some("/repo".to_string()))
@@ -1945,6 +2116,7 @@ mod tests {
                 row,
                 &acknowledged_signals,
                 &dismissed_session_ids,
+                &pinned_session_ids,
                 1_780_000_000_000,
             )
         })
@@ -1978,6 +2150,7 @@ mod tests {
         );
         let store = InboxStore {
             dismissed_session_ids: std::sync::Mutex::new(HashSet::new()),
+            pinned_session_ids: std::sync::Mutex::new(HashSet::new()),
             acknowledged_signals: std::sync::Mutex::new(HashSet::new()),
             session_rows_cache: std::sync::Mutex::new(Some(super::CachedSessionRows {
                 rows: vec![cached_row.clone()],
@@ -2087,5 +2260,18 @@ mod tests {
 
         assert_eq!(loaded, signals);
         assert!(fs::read_to_string(path).expect("signal file").contains("2026-06-05T07:22:45.199Z"));
+    }
+
+    #[test]
+    fn pinned_session_ids_round_trip_to_disk() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("pinned-sessions.json");
+        let session_ids = HashSet::from(["s11".to_string(), "s12".to_string()]);
+
+        super::save_pinned_session_ids(&path, &session_ids).expect("save pinned sessions");
+        let loaded = super::load_pinned_session_ids(&path);
+
+        assert_eq!(loaded, session_ids);
+        assert!(fs::read_to_string(path).expect("pinned file").contains("s11"));
     }
 }
