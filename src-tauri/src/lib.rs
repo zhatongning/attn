@@ -30,6 +30,17 @@ async fn dismiss_session(
 }
 
 #[tauri::command]
+async fn dismiss_sessions(
+    state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
+    session_ids: Vec<String>,
+) -> Result<Vec<domain::session::SessionRow>, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.dismiss_sessions(&session_ids))
+        .await
+        .map_err(|error| format!("dismiss worker failed: {error}"))
+}
+
+#[tauri::command]
 async fn restore_session(
     state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
     session_id: String,
@@ -85,10 +96,13 @@ async fn install_codex_hooks() -> Result<codex_hooks::CodexHookIntegrationStatus
 async fn jump_to_session(
     state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
     session_id: String,
+    acknowledged_session_ids: Option<Vec<String>>,
 ) -> Result<inbox_store::JumpResult, String> {
     let state = Arc::clone(state.inner());
     let fallback_session_id = session_id.clone();
-    tauri::async_runtime::spawn_blocking(move || state.jump_to_session(&session_id))
+    tauri::async_runtime::spawn_blocking(move || {
+        state.jump_to_session(&session_id, acknowledged_session_ids.as_deref())
+    })
         .await
         .map_err(|error| format!("jump worker failed: {error}"))
         .or_else(|error| Ok(inbox_store::JumpResult {
@@ -121,6 +135,7 @@ impl PanelPosition {
 
 fn apply_panel_window_behavior<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.set_always_on_top(true);
+    let _ = window.set_visible_on_all_workspaces(true);
     let _ = move_panel_window(window, PanelPosition::TopRight);
 }
 
@@ -247,6 +262,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             dismiss_session,
+            dismiss_sessions,
             restore_session,
             pin_session,
             unpin_session,

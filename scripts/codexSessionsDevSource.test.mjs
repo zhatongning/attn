@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 describe("codexSessionsDevSource", () => {
-  it("prefers the current Codex sqlite state DB over the legacy root DB", () => {
+  it("prefers the newest Codex state DB when both known locations exist", () => {
     const temp = tempDir();
     const home = path.join(temp, "home");
     const legacyDb = path.join(home, ".codex", "state_5.sqlite");
@@ -31,6 +31,23 @@ describe("codexSessionsDevSource", () => {
     fs.mkdirSync(path.dirname(currentDb), { recursive: true });
     fs.writeFileSync(legacyDb, "");
     fs.writeFileSync(currentDb, "");
+    fs.utimesSync(legacyDb, new Date("2026-06-17T10:00:00.000Z"), new Date("2026-06-17T10:00:00.000Z"));
+    fs.utimesSync(currentDb, new Date("2026-06-17T09:00:00.000Z"), new Date("2026-06-17T09:00:00.000Z"));
+
+    expect(defaultCodexStateDbPath(home)).toBe(legacyDb);
+  });
+
+  it("keeps the current Codex sqlite state DB when it is at least as new as legacy", () => {
+    const temp = tempDir();
+    const home = path.join(temp, "home");
+    const legacyDb = path.join(home, ".codex", "state_5.sqlite");
+    const currentDb = path.join(home, ".codex", "sqlite", "state_5.sqlite");
+    fs.mkdirSync(path.dirname(legacyDb), { recursive: true });
+    fs.mkdirSync(path.dirname(currentDb), { recursive: true });
+    fs.writeFileSync(legacyDb, "");
+    fs.writeFileSync(currentDb, "");
+    fs.utimesSync(legacyDb, new Date("2026-06-17T09:00:00.000Z"), new Date("2026-06-17T09:00:00.000Z"));
+    fs.utimesSync(currentDb, new Date("2026-06-17T10:00:00.000Z"), new Date("2026-06-17T10:00:00.000Z"));
 
     expect(defaultCodexStateDbPath(home)).toBe(currentDb);
   });
@@ -61,6 +78,72 @@ describe("codexSessionsDevSource", () => {
     expect(selectLiveCliPrimarySessionId(cliArgs, [childId, parentId])).toBeUndefined();
     expect(selectLiveCliPrimarySessionId(cliArgs, [childId])).toBe(childId);
     expect(selectLiveCliPrimarySessionId(`${cliArgs} resume ${parentId}`, [childId])).toBe(parentId);
+  });
+
+  it("sorts running ahead of follow-up and stopped rows", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb);
+    const sessionsRoot = path.join(temp, "sessions", "2026", "06", "17");
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    const rows = [
+      {
+        id: "019stopped",
+        event: '{"timestamp":"2026-06-17T01:03:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}',
+      },
+      {
+        id: "019running",
+        event: '{"timestamp":"2026-06-17T01:02:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"continue"}}',
+      },
+      {
+        id: "019needed",
+        event: '{"timestamp":"2026-06-17T01:01:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        updatedAtMs: Date.parse("2026-06-17T01:01:30.000Z"),
+      },
+      {
+        id: "019inspect",
+        event: '{"timestamp":"2026-06-17T01:00:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+      },
+    ];
+
+    for (const row of rows) {
+      const rolloutPath = path.join(sessionsRoot, `rollout-2026-06-17T09-00-00-${row.id}.jsonl`);
+      fs.writeFileSync(
+        rolloutPath,
+        [
+          `{"timestamp":"2026-06-17T00:59:00.000Z","type":"session_meta","payload":{"id":"${row.id}","cwd":"/repo","originator":"Codex Desktop","source":"vscode"}}`,
+          row.event,
+          "",
+        ].join("\n"),
+      );
+      insertThread({
+        stateDb,
+        id: row.id,
+        rolloutPath,
+        cwd: "/repo",
+        title: row.id,
+        source: "vscode",
+        threadSource: "user",
+        preview: row.id,
+        updatedAtMs: row.updatedAtMs ?? Date.parse("2026-06-17T01:00:00.000Z"),
+      });
+    }
+
+    const sessions = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(sessions.map((row) => row.state)).toEqual([
+      "inspect",
+      "running",
+      "needsAttention",
+      "stopped",
+    ]);
   });
 
   it("uses immediate SQLite threads and JSONL completion evidence like the Tauri source", () => {

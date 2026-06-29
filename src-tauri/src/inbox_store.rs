@@ -43,12 +43,38 @@ enum JumpCommandPlan {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InboxStore {
     dismissed_session_ids: Mutex<HashSet<String>>,
     pinned_session_ids: Mutex<HashSet<String>>,
     acknowledged_signals: Mutex<HashSet<AcknowledgedSignal>>,
     session_rows_cache: Mutex<Option<CachedSessionRows>>,
+    dismissed_sessions_path: PathBuf,
+}
+
+impl Default for InboxStore {
+    fn default() -> Self {
+        Self {
+            dismissed_session_ids: Mutex::new(HashSet::new()),
+            pinned_session_ids: Mutex::new(HashSet::new()),
+            acknowledged_signals: Mutex::new(HashSet::new()),
+            session_rows_cache: Mutex::new(None),
+            dismissed_sessions_path: dismissed_sessions_path(),
+        }
+    }
+}
+
+impl InboxStore {
+    #[cfg(test)]
+    fn with_dismissed_sessions_path(dismissed_sessions_path: PathBuf) -> Self {
+        Self {
+            dismissed_session_ids: Mutex::new(HashSet::new()),
+            pinned_session_ids: Mutex::new(HashSet::new()),
+            acknowledged_signals: Mutex::new(HashSet::new()),
+            session_rows_cache: Mutex::new(None),
+            dismissed_sessions_path,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
@@ -120,18 +146,22 @@ impl InboxStore {
     fn compute_session_rows(&self) -> Vec<SessionRow> {
         self.refresh_persisted_acknowledged_signals();
         self.refresh_persisted_pinned_session_ids();
+        self.refresh_persisted_dismissed_session_ids();
         let dismissed_session_ids = self
             .dismissed_session_ids
             .lock()
-            .expect("dismissed session store lock poisoned");
+            .expect("dismissed session store lock poisoned")
+            .clone();
         let pinned_session_ids = self
             .pinned_session_ids
             .lock()
-            .expect("pinned session store lock poisoned");
+            .expect("pinned session store lock poisoned")
+            .clone();
         let acknowledged_signals = self
             .acknowledged_signals
             .lock()
-            .expect("acknowledged signal store lock poisoned");
+            .expect("acknowledged signal store lock poisoned")
+            .clone();
         let now = SystemTime::now();
         let now_ms = current_time_millis();
         let live_cli_sessions = find_live_codex_cli_sessions();
@@ -164,21 +194,32 @@ impl InboxStore {
                 )
             })
             .collect::<Vec<_>>();
+        self.restore_running_dismissed_session_ids(&rows, &dismissed_session_ids);
         rows.sort_by(compare_session_rows_for_store);
         rows.truncate(80);
         rows
     }
 
     pub fn dismiss_session(&self, session_id: &str) -> Vec<SessionRow> {
-        self.dismissed_session_ids
+        self.dismiss_sessions(&[session_id.to_string()])
+    }
+
+    pub fn dismiss_sessions(&self, session_ids: &[String]) -> Vec<SessionRow> {
+        let mut dismissed_session_ids = self
+            .dismissed_session_ids
             .lock()
-            .expect("dismissed session store lock poisoned")
-            .insert(session_id.to_string());
+            .expect("dismissed session store lock poisoned");
+        dismissed_session_ids.extend(session_ids.iter().cloned());
+        let _ = save_dismissed_session_ids(&self.dismissed_sessions_path, &dismissed_session_ids);
+        drop(dismissed_session_ids);
+
         let mut pinned_session_ids = self
             .pinned_session_ids
             .lock()
             .expect("pinned session store lock poisoned");
-        pinned_session_ids.remove(session_id);
+        for session_id in session_ids {
+            pinned_session_ids.remove(session_id);
+        }
         let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
         drop(pinned_session_ids);
         self.invalidate_session_rows_cache();
@@ -187,10 +228,13 @@ impl InboxStore {
     }
 
     pub fn restore_session(&self, session_id: &str) -> Vec<SessionRow> {
-        self.dismissed_session_ids
+        let mut dismissed_session_ids = self
+            .dismissed_session_ids
             .lock()
-            .expect("dismissed session store lock poisoned")
-            .remove(session_id);
+            .expect("dismissed session store lock poisoned");
+        dismissed_session_ids.remove(session_id);
+        let _ = save_dismissed_session_ids(&self.dismissed_sessions_path, &dismissed_session_ids);
+        drop(dismissed_session_ids);
         self.invalidate_session_rows_cache();
 
         self.list_sessions()
@@ -259,7 +303,11 @@ impl InboxStore {
         }
     }
 
-    pub fn jump_to_session(&self, session_id: &str) -> JumpResult {
+    pub fn jump_to_session(
+        &self,
+        session_id: &str,
+        acknowledged_session_ids: Option<&[String]>,
+    ) -> JumpResult {
         let row = self
             .fast_session_row_for_jump(session_id)
             .or_else(|| {
@@ -281,7 +329,7 @@ impl InboxStore {
         let execution = plan.clone().map(execute_jump_command_plan);
         if matches!(execution, Some(Ok(()))) {
             if let Some(row) = row.as_ref() {
-                self.acknowledge_session_signal(row);
+                self.acknowledge_session_signals(row, acknowledged_session_ids);
                 self.invalidate_session_rows_cache();
             }
         }
@@ -325,12 +373,28 @@ impl InboxStore {
         }
     }
 
-    fn acknowledge_session_signal(&self, row: &SessionRow) {
+    fn acknowledge_session_signals(
+        &self,
+        row: &SessionRow,
+        acknowledged_session_ids: Option<&[String]>,
+    ) {
         let mut acknowledged_signals = self
             .acknowledged_signals
             .lock()
             .expect("acknowledged signal store lock poisoned");
-        acknowledged_signals.replace(AcknowledgedSignal::from_row_at(row, current_time_millis()));
+        let acknowledged_at_ms = current_time_millis();
+        acknowledged_signals.replace(AcknowledgedSignal::from_row_at(row, acknowledged_at_ms));
+        if let Some(session_ids) = acknowledged_session_ids {
+            for session_id in session_ids {
+                if session_id == &row.session_id {
+                    continue;
+                }
+                let Some(row) = self.fast_session_row_for_jump(session_id) else {
+                    continue;
+                };
+                acknowledged_signals.replace(AcknowledgedSignal::from_row_at(&row, acknowledged_at_ms));
+            }
+        }
         let _ = save_acknowledged_signals(&acknowledged_signals_path(), &acknowledged_signals);
     }
 
@@ -405,6 +469,43 @@ impl InboxStore {
             .expect("pinned session store lock poisoned");
         pinned_session_ids.extend(loaded);
     }
+
+    fn refresh_persisted_dismissed_session_ids(&self) {
+        let loaded = load_dismissed_session_ids(&self.dismissed_sessions_path);
+        if loaded.is_empty() {
+            return;
+        }
+
+        let mut dismissed_session_ids = self
+            .dismissed_session_ids
+            .lock()
+            .expect("dismissed session store lock poisoned");
+        dismissed_session_ids.extend(loaded);
+    }
+
+    fn restore_running_dismissed_session_ids(
+        &self,
+        rows: &[SessionRow],
+        dismissed_session_ids: &HashSet<String>,
+    ) {
+        let running_dismissed_ids = rows
+            .iter()
+            .filter(|row| row.state == SessionState::Running && dismissed_session_ids.contains(&row.session_id))
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        if running_dismissed_ids.is_empty() {
+            return;
+        }
+
+        let mut dismissed_session_ids = self
+            .dismissed_session_ids
+            .lock()
+            .expect("dismissed session store lock poisoned");
+        for session_id in running_dismissed_ids {
+            dismissed_session_ids.remove(&session_id);
+        }
+        let _ = save_dismissed_session_ids(&self.dismissed_sessions_path, &dismissed_session_ids);
+    }
 }
 
 fn finalize_session_row(
@@ -453,9 +554,9 @@ fn session_state_priority(state: SessionState) -> u8 {
     match state {
         SessionState::WaitingForInput => 0,
         SessionState::Inspect | SessionState::Dismissable => 1,
-        SessionState::Stopped => 2,
-        SessionState::Running => 3,
-        SessionState::NeedsAttention => 4,
+        SessionState::Running => 2,
+        SessionState::NeedsAttention => 3,
+        SessionState::Stopped => 4,
         SessionState::Idle => 5,
         SessionState::Unknown => 6,
     }
@@ -491,6 +592,14 @@ fn save_acknowledged_signals(
 }
 
 fn load_pinned_session_ids(path: &std::path::Path) -> HashSet<String> {
+    load_session_id_set(path)
+}
+
+fn load_dismissed_session_ids(path: &std::path::Path) -> HashSet<String> {
+    load_session_id_set(path)
+}
+
+fn load_session_id_set(path: &std::path::Path) -> HashSet<String> {
     let Ok(content) = fs::read_to_string(path) else {
         return HashSet::new();
     };
@@ -499,6 +608,20 @@ fn load_pinned_session_ids(path: &std::path::Path) -> HashSet<String> {
 }
 
 fn save_pinned_session_ids(
+    path: &std::path::Path,
+    session_ids: &HashSet<String>,
+) -> Result<(), std::io::Error> {
+    save_session_id_set(path, session_ids)
+}
+
+fn save_dismissed_session_ids(
+    path: &std::path::Path,
+    session_ids: &HashSet<String>,
+) -> Result<(), std::io::Error> {
+    save_session_id_set(path, session_ids)
+}
+
+fn save_session_id_set(
     path: &std::path::Path,
     session_ids: &HashSet<String>,
 ) -> Result<(), std::io::Error> {
@@ -792,22 +915,51 @@ fn row_has_fresh_activity(row: &SessionRow, now: SystemTime, freshness: Duration
 
 fn build_jump_command_plan(row: &SessionRow) -> Option<JumpCommandPlan> {
     let live_sessions = find_live_codex_cli_sessions();
-    build_jump_command_plan_with_live_sessions(
+    let app_thread_ids = find_live_codex_app_thread_ids();
+    build_jump_command_plan_with_runtime_signals(
         row,
         &live_sessions,
+        &app_thread_ids,
         find_previous_iterm_tty_for_workspace,
     )
 }
 
+#[cfg(test)]
 fn build_jump_command_plan_with_live_sessions(
     row: &SessionRow,
     live_sessions: &[LiveCliSession],
     previous_iterm_tty_for_workspace: impl FnOnce(&str) -> Option<String>,
 ) -> Option<JumpCommandPlan> {
+    build_jump_command_plan_with_runtime_signals(
+        row,
+        live_sessions,
+        &HashSet::new(),
+        previous_iterm_tty_for_workspace,
+    )
+}
+
+fn build_jump_command_plan_with_runtime_signals(
+    row: &SessionRow,
+    live_sessions: &[LiveCliSession],
+    app_thread_ids: &HashSet<String>,
+    previous_iterm_tty_for_workspace: impl FnOnce(&str) -> Option<String>,
+) -> Option<JumpCommandPlan> {
     let Some(workspace_path) = row.workspace_path.as_deref() else {
         return build_jump_command_plan_with_cli_context(row, None, None);
     };
-    let live_tty = live_cli_tty_for_jump_plan(row, live_sessions);
+    let exact_live_tty = live_cli_exact_tty_for_jump_plan(row, live_sessions);
+    if let Some(tty) = exact_live_tty {
+        return Some(JumpCommandPlan::ITermActivate {
+            tty,
+            live_codex: true,
+        });
+    }
+
+    if app_thread_ids.contains(&row.session_id) {
+        return Some(codex_desktop_jump_command_plan(row, workspace_path));
+    }
+
+    let live_tty = live_cli_workspace_tty_for_jump_plan(row, live_sessions);
     let resume_tty = if live_tty.is_none() && matches!(row.jump_target, JumpTarget::Cli) {
         previous_iterm_tty_for_workspace(workspace_path)
     } else {
@@ -817,28 +969,32 @@ fn build_jump_command_plan_with_live_sessions(
     build_jump_command_plan_with_cli_context(row, live_tty, resume_tty)
 }
 
-fn live_cli_tty_for_jump_plan(
+fn live_cli_exact_tty_for_jump_plan(
     row: &SessionRow,
     live_sessions: &[LiveCliSession],
 ) -> Option<String> {
-    if let Some(session) = live_sessions
-        .iter()
-        .find(|session| live_session_has_session_id(session, &row.session_id))
-    {
-        return Some(session.tty.clone());
-    }
-
-    let workspace_path = row.workspace_path.as_deref()?;
-    if matches!(row.jump_target, JumpTarget::Cli) {
-        return live_sessions
-            .iter()
-            .find(|session| session.session_id.is_none() && session.workspace_path == workspace_path)
-            .map(|session| session.tty.clone());
+    if !matches!(row.jump_target, JumpTarget::Cli) {
+        return None;
     }
 
     live_sessions
         .iter()
-        .find(|session| session.workspace_path == workspace_path)
+        .find(|session| live_session_has_session_id(session, &row.session_id))
+        .map(|session| session.tty.clone())
+}
+
+fn live_cli_workspace_tty_for_jump_plan(
+    row: &SessionRow,
+    live_sessions: &[LiveCliSession],
+) -> Option<String> {
+    if !matches!(row.jump_target, JumpTarget::Cli) {
+        return None;
+    }
+
+    let workspace_path = row.workspace_path.as_deref()?;
+    live_sessions
+        .iter()
+        .find(|session| session.session_id.is_none() && session.workspace_path == workspace_path)
         .map(|session| session.tty.clone())
 }
 
@@ -857,17 +1013,23 @@ fn build_jump_command_plan_with_cli_context(
     };
 
     match row.jump_target {
-        JumpTarget::Desktop | JumpTarget::Unknown => Some(JumpCommandPlan::CodexDesktop {
-            thread_id: row.session_id.clone(),
-            deeplink_url: codex_thread_deeplink(&row.session_id),
-            workspace_path,
-            activate_bundle_id: codex_bundle_id().to_string(),
-        }),
+        JumpTarget::Desktop | JumpTarget::Unknown => {
+            Some(codex_desktop_jump_command_plan(row, &workspace_path))
+        }
         JumpTarget::Cli => Some(JumpCommandPlan::ITermResume {
             thread_id: row.session_id.clone(),
             workspace_path,
             tty: resume_tty,
         }),
+    }
+}
+
+fn codex_desktop_jump_command_plan(row: &SessionRow, workspace_path: &str) -> JumpCommandPlan {
+    JumpCommandPlan::CodexDesktop {
+        thread_id: row.session_id.clone(),
+        deeplink_url: codex_thread_deeplink(&row.session_id),
+        workspace_path: workspace_path.to_string(),
+        activate_bundle_id: codex_bundle_id().to_string(),
     }
 }
 
@@ -967,6 +1129,20 @@ fn find_live_codex_cli_sessions() -> Vec<LiveCliSession> {
     sessions
 }
 
+fn find_live_codex_app_thread_ids() -> HashSet<String> {
+    let output = match Command::new("ps").args(["-axo", "pid=,comm=,args="]).output() {
+        Ok(output) => output,
+        Err(_) => return HashSet::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    stdout
+        .lines()
+        .filter_map(parse_codex_app_server_process_line)
+        .flat_map(live_cli_session_ids_from_open_files)
+        .collect()
+}
+
 fn find_previous_iterm_tty_for_workspace(workspace_path: &str) -> Option<String> {
     let workspace_shell_ttys = find_shell_ttys_for_workspace(workspace_path);
     if workspace_shell_ttys.is_empty() {
@@ -1064,6 +1240,16 @@ fn parse_codex_process_line(line: &str) -> Option<(&str, &str, &str)> {
     Some((pid, tty, args))
 }
 
+fn parse_codex_app_server_process_line(line: &str) -> Option<&str> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?;
+    let _comm = parts.next()?;
+    let args_start = line.find(_comm)? + _comm.len();
+    let args = line[args_start..].trim();
+
+    is_codex_app_server_args(args).then_some(pid)
+}
+
 fn is_codex_cli_args(args: &str) -> bool {
     if args.contains(" app-server ") {
         return false;
@@ -1073,6 +1259,16 @@ fn is_codex_cli_args(args: &str) -> bool {
         return false;
     };
     executable.rsplit('/').next().unwrap_or(executable) == "codex"
+}
+
+fn is_codex_app_server_args(args: &str) -> bool {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    let Some(executable) = parts.first() else {
+        return false;
+    };
+
+    executable.rsplit('/').next().unwrap_or(executable) == "codex"
+        && parts.get(1) == Some(&"app-server")
 }
 
 fn live_cli_session_id_from_args(args: &str) -> Option<String> {
@@ -1408,11 +1604,29 @@ fn codex_state_db_path_from_home(home: &std::path::Path) -> PathBuf {
         .join(".codex")
         .join("sqlite")
         .join("state_5.sqlite");
-    if current_path.exists() {
+    let legacy_path = home.join(".codex").join("state_5.sqlite");
+    let current_exists = current_path.exists();
+    let legacy_exists = legacy_path.exists();
+    if current_exists && legacy_exists {
+        if codex_state_db_modified_at(&legacy_path) > codex_state_db_modified_at(&current_path) {
+            return legacy_path;
+        }
         return current_path;
     }
+    if current_exists {
+        return current_path;
+    }
+    if legacy_exists {
+        return legacy_path;
+    }
 
-    home.join(".codex").join("state_5.sqlite")
+    legacy_path
+}
+
+fn codex_state_db_modified_at(path: &std::path::Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn acknowledged_signals_path() -> PathBuf {
@@ -1425,12 +1639,20 @@ fn acknowledged_signals_path() -> PathBuf {
 }
 
 fn pinned_session_ids_path() -> PathBuf {
+    agent_session_inbox_state_path("pinned-sessions.json")
+}
+
+fn dismissed_sessions_path() -> PathBuf {
+    agent_session_inbox_state_path("dismissed-sessions.json")
+}
+
+fn agent_session_inbox_state_path(file_name: &str) -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codex")
         .join("agent-session-inbox")
-        .join("pinned-sessions.json")
+        .join(file_name)
 }
 
 fn current_time_millis() -> u64 {
@@ -1462,7 +1684,8 @@ mod tests {
 
     #[test]
     fn dismiss_and_restore_round_trips_row_state() {
-        let store = InboxStore::default();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = InboxStore::with_dismissed_sessions_path(temp.path().join("dismissed-sessions.json"));
 
         let Some(session_id) = store
             .list_sessions()
@@ -1494,10 +1717,25 @@ mod tests {
     }
 
     #[test]
+    fn dismiss_sessions_records_every_group_member() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = InboxStore::with_dismissed_sessions_path(temp.path().join("dismissed-sessions.json"));
+
+        let _ = store.dismiss_sessions(&["parent".to_string(), "child".to_string()]);
+        let dismissed_session_ids = store
+            .dismissed_session_ids
+            .lock()
+            .expect("dismissed session ids");
+
+        assert!(dismissed_session_ids.contains("parent"));
+        assert!(dismissed_session_ids.contains("child"));
+    }
+
+    #[test]
     fn jump_reports_unavailable_for_unknown_rows() {
         let store = InboxStore::default();
 
-        let result = store.jump_to_session("missing");
+        let result = store.jump_to_session("missing", None);
 
         assert_eq!(result.availability, JumpAvailability::Unavailable);
         assert_eq!(result.target, JumpTarget::Unknown);
@@ -1524,23 +1762,31 @@ mod tests {
     }
 
     #[test]
-    fn live_cli_terminal_takes_precedence_over_desktop_jump_plan_for_same_workspace() {
+    fn desktop_jump_plan_ignores_live_cli_from_same_workspace() {
         let row = SessionRow::new("s1", "Desktop row", SessionState::Running, Confidence::Exact)
             .with_workspace(Some("/Users/edy/project-a".to_string()))
             .with_jump_availability(JumpAvailability::Exact)
             .with_jump_target(JumpTarget::Desktop);
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("other-session".to_string()),
+            session_ids: vec!["other-session".to_string()],
+            workspace_path: "/Users/edy/project-a".to_string(),
+            tty: "ttys009".to_string(),
+        }];
 
-        let plan = super::build_jump_command_plan_with_cli_context(
+        let plan = super::build_jump_command_plan_with_live_sessions(
             &row,
-            Some("ttys009".to_string()),
-            None,
+            &live_sessions,
+            |_| None,
         );
 
         assert_eq!(
             plan,
-            Some(super::JumpCommandPlan::ITermActivate {
-                tty: "ttys009".to_string(),
-                live_codex: true
+            Some(super::JumpCommandPlan::CodexDesktop {
+                thread_id: "s1".to_string(),
+                workspace_path: "/Users/edy/project-a".to_string(),
+                deeplink_url: "codex://threads/s1".to_string(),
+                activate_bundle_id: "com.openai.codex".to_string()
             })
         );
     }
@@ -1556,6 +1802,72 @@ mod tests {
             &row,
             Some("ttys008".to_string()),
             None,
+        );
+
+        assert_eq!(
+            plan,
+            Some(super::JumpCommandPlan::ITermActivate {
+                tty: "ttys008".to_string(),
+                live_codex: true
+            })
+        );
+    }
+
+    #[test]
+    fn cli_session_open_in_codex_app_builds_desktop_jump_plan() {
+        let row = SessionRow::new(
+            "019e8c3e-f343-78d2-a7be-90f318bf303c",
+            "CLI row continued in app",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/Users/edy/project-b".to_string()))
+        .with_jump_availability(JumpAvailability::Approximate)
+        .with_jump_target(JumpTarget::Cli);
+        let app_thread_ids = HashSet::from(["019e8c3e-f343-78d2-a7be-90f318bf303c".to_string()]);
+
+        let plan = super::build_jump_command_plan_with_runtime_signals(
+            &row,
+            &[],
+            &app_thread_ids,
+            |_| Some("ttys002".to_string()),
+        );
+
+        assert_eq!(
+            plan,
+            Some(super::JumpCommandPlan::CodexDesktop {
+                thread_id: "019e8c3e-f343-78d2-a7be-90f318bf303c".to_string(),
+                workspace_path: "/Users/edy/project-b".to_string(),
+                deeplink_url: "codex://threads/019e8c3e-f343-78d2-a7be-90f318bf303c".to_string(),
+                activate_bundle_id: "com.openai.codex".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn matching_live_cli_session_takes_precedence_over_codex_app_signal() {
+        let row = SessionRow::new(
+            "019e8c3e-f343-78d2-a7be-90f318bf303c",
+            "CLI row still live",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/Users/edy/project-b".to_string()))
+        .with_jump_availability(JumpAvailability::Approximate)
+        .with_jump_target(JumpTarget::Cli);
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("019e8c3e-f343-78d2-a7be-90f318bf303c".to_string()),
+            session_ids: vec!["019e8c3e-f343-78d2-a7be-90f318bf303c".to_string()],
+            workspace_path: "/Users/edy/project-b".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+        let app_thread_ids = HashSet::from(["019e8c3e-f343-78d2-a7be-90f318bf303c".to_string()]);
+
+        let plan = super::build_jump_command_plan_with_runtime_signals(
+            &row,
+            &live_sessions,
+            &app_thread_ids,
+            |_| Some("ttys002".to_string()),
         );
 
         assert_eq!(
@@ -1663,6 +1975,23 @@ mod tests {
                 "/Applications/Codex.app/Contents/Resources/codex resume 019e9153-943a-7402-8e61-9e89cee5a6f4 --cd /Users/edy/hose/tmc_symposium/tmc_surprise"
             ))
         );
+    }
+
+    #[test]
+    fn parse_codex_app_server_process_line_only_accepts_app_server() {
+        let app_server_line =
+            "59618 /Applications/Co /Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled";
+        let cli_resume_line =
+            "29457 /Applications/Co /Applications/Codex.app/Contents/Resources/codex resume 019e9153-943a-7402-8e61-9e89cee5a6f4 --cd /Users/edy/project";
+        let helper_line =
+            "4576 /Users/edy/.code /Users/edy/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient turn-ended";
+
+        assert_eq!(
+            super::parse_codex_app_server_process_line(app_server_line),
+            Some("59618")
+        );
+        assert!(super::parse_codex_app_server_process_line(cli_resume_line).is_none());
+        assert!(super::parse_codex_app_server_process_line(helper_line).is_none());
     }
 
     #[test]
@@ -2104,6 +2433,16 @@ mod tests {
                 .with_jump_target(JumpTarget::Desktop)
                 .with_reason("running signal observed")
                 .with_last_activity("2026-06-06T04:01:00.000Z"),
+            SessionRow::new("needed", "Follow-up", SessionState::NeedsAttention, Confidence::Exact)
+                .with_workspace(Some("/repo".to_string()))
+                .with_jump_target(JumpTarget::Desktop)
+                .with_reason("Read recently; keep in needed state until 30 minutes pass.")
+                .with_last_activity("2026-06-06T04:03:00.000Z"),
+            SessionRow::new("stopped", "Stopped", SessionState::Stopped, Confidence::Exact)
+                .with_workspace(Some("/repo".to_string()))
+                .with_jump_target(JumpTarget::Desktop)
+                .with_reason("stopped before completion; decide whether to continue, inspect, or dismiss")
+                .with_last_activity("2026-06-06T04:04:00.000Z"),
             SessionRow::new("inspect", "Inspect", SessionState::Inspect, Confidence::Exact)
                 .with_workspace(Some("/repo".to_string()))
                 .with_jump_target(JumpTarget::Desktop)
@@ -2128,7 +2467,7 @@ mod tests {
             rows.iter()
                 .map(|row| row.session_id.as_str())
                 .collect::<Vec<_>>(),
-            ["inspect", "running", "idle"]
+            ["inspect", "running", "needed", "stopped", "idle"]
         );
         let idle_row = rows
             .iter()
@@ -2142,6 +2481,7 @@ mod tests {
 
     #[test]
     fn fresh_session_rows_cache_short_circuits_local_discovery() {
+        let temp = tempfile::tempdir().expect("temp dir");
         let cached_row = SessionRow::new(
             "cached-session",
             "Cached session",
@@ -2156,6 +2496,7 @@ mod tests {
                 rows: vec![cached_row.clone()],
                 loaded_at: std::time::Instant::now(),
             })),
+            dismissed_sessions_path: temp.path().join("dismissed-sessions.json"),
         };
 
         let rows = store.list_sessions();
@@ -2206,6 +2547,35 @@ mod tests {
     }
 
     #[test]
+    fn batch_acknowledged_rows_become_needed_together() {
+        let parent = SessionRow::new("parent", "Parent", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:00:00.000Z");
+        let child = SessionRow::new("child", "Child", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:01:00.000Z");
+        let acknowledged_at_ms = 1_780_000_000_000;
+        let acknowledged = HashSet::from([
+            super::AcknowledgedSignal::from_row_at(&parent, acknowledged_at_ms),
+            super::AcknowledgedSignal::from_row_at(&child, acknowledged_at_ms),
+        ]);
+
+        let confirmed_parent = super::apply_acknowledged_session_state(
+            parent,
+            &acknowledged,
+            acknowledged_at_ms + 5 * 60 * 1000,
+        );
+        let confirmed_child = super::apply_acknowledged_session_state(
+            child,
+            &acknowledged,
+            acknowledged_at_ms + 5 * 60 * 1000,
+        );
+
+        assert_eq!(confirmed_parent.state, SessionState::NeedsAttention);
+        assert_eq!(confirmed_child.state, SessionState::NeedsAttention);
+        assert!(confirmed_parent.handled);
+        assert!(confirmed_child.handled);
+    }
+
+    #[test]
     fn acknowledged_waiting_for_input_rows_stay_waiting_for_input() {
         let row = SessionRow::new(
             "s8",
@@ -2230,7 +2600,7 @@ mod tests {
     }
 
     #[test]
-    fn default_state_db_path_prefers_current_sqlite_directory() {
+    fn default_state_db_path_prefers_newest_known_state_db() {
         let temp = tempfile::tempdir().expect("temp dir");
         let legacy_db = temp.path().join(".codex/state_5.sqlite");
         let current_db = temp.path().join(".codex/sqlite/state_5.sqlite");
@@ -2238,6 +2608,41 @@ mod tests {
         fs::create_dir_all(legacy_db.parent().expect("legacy db parent")).expect("legacy db dir");
         fs::write(&legacy_db, "").expect("legacy db");
         fs::write(&current_db, "").expect("current db");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171800"])
+            .arg(&legacy_db)
+            .status()
+            .expect("set legacy mtime");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171500"])
+            .arg(&current_db)
+            .status()
+            .expect("set current mtime");
+
+        let selected = super::codex_state_db_path_from_home(temp.path());
+
+        assert_eq!(selected, legacy_db);
+    }
+
+    #[test]
+    fn default_state_db_path_keeps_current_sqlite_when_at_least_as_new() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let legacy_db = temp.path().join(".codex/state_5.sqlite");
+        let current_db = temp.path().join(".codex/sqlite/state_5.sqlite");
+        fs::create_dir_all(current_db.parent().expect("current db parent")).expect("current db dir");
+        fs::create_dir_all(legacy_db.parent().expect("legacy db parent")).expect("legacy db dir");
+        fs::write(&legacy_db, "").expect("legacy db");
+        fs::write(&current_db, "").expect("current db");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171500"])
+            .arg(&legacy_db)
+            .status()
+            .expect("set legacy mtime");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171800"])
+            .arg(&current_db)
+            .status()
+            .expect("set current mtime");
 
         let selected = super::codex_state_db_path_from_home(temp.path());
 
@@ -2273,5 +2678,18 @@ mod tests {
 
         assert_eq!(loaded, session_ids);
         assert!(fs::read_to_string(path).expect("pinned file").contains("s11"));
+    }
+
+    #[test]
+    fn dismissed_session_ids_round_trip_to_disk() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("dismissed-sessions.json");
+        let session_ids = HashSet::from(["parent".to_string(), "child".to_string()]);
+
+        super::save_dismissed_session_ids(&path, &session_ids).expect("save dismissed sessions");
+        let loaded = super::load_dismissed_session_ids(&path);
+
+        assert_eq!(loaded, session_ids);
+        assert!(fs::read_to_string(path).expect("dismissed file").contains("parent"));
     }
 }

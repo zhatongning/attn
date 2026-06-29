@@ -31,12 +31,12 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
       ["unknown", "blocked"],
-      ["needs-input", "input"],
-      ["stopped", "stopped"],
-      ["active", "working"],
+      ["needs-input", "attention"],
+      ["complete", "inspect"],
+      ["active", "running"],
     ]);
     expect(model.hiddenRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
-      ["complete", "inspect"],
+      ["stopped", "stopped"],
     ]);
   });
 
@@ -125,7 +125,7 @@ describe("buildStatusPanelModel", () => {
     expect(model.interventionCount).toBe(0);
   });
 
-  it("keeps working rows visible but moves idle rows into quiet count", () => {
+  it("keeps running rows visible ahead of follow-up rows and moves idle rows into quiet count", () => {
     const model = buildStatusPanelModel([
       row("idle", "idle", "completed task observed; idle until the next source signal"),
       row("working", "running", "running signal observed"),
@@ -136,8 +136,8 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
       "blocked",
-      "working",
       "inspect",
+      "working",
       "needed",
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
@@ -146,7 +146,7 @@ describe("buildStatusPanelModel", () => {
     expect(model.hiddenCount).toBe(1);
   });
 
-  it("keeps active working sessions visible ahead of inspect backlog", () => {
+  it("keeps inspect backlog visible ahead of active working sessions", () => {
     const model = buildStatusPanelModel([
       { ...row("inspect-old", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:20:00.000Z" },
       { ...row("inspect-mid", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:41:00.000Z" },
@@ -156,11 +156,11 @@ describe("buildStatusPanelModel", () => {
     ]);
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
-      "working-mos",
-      "working-wmhcar",
       "inspect-new",
+      "inspect-mid",
+      "inspect-old",
     ]);
-    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["inspect-mid", "inspect-old"]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["working-mos", "working-wmhcar"]);
   });
 
   it("keeps pinned inspect rows visible ahead of working sessions and inspect backlog", () => {
@@ -177,10 +177,10 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.pinned])).toEqual([
       ["pinned-inspect", true],
-      ["working-new", false],
       ["inspect-new", false],
+      ["inspect-old", false],
     ]);
-    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["inspect-old"]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["working-new"]);
   });
 
   it("keeps pinned idle rows visible instead of folding them into quiet hidden count", () => {
@@ -207,7 +207,7 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.theme.styleFamily).toBe("atom");
     expect(model.visibleRows[0].statusMarker).toBe("●");
-    expect(model.visibleRows[0].statusLabel).toBe("input");
+    expect(model.visibleRows[0].statusLabel).toBe("attention");
     expect(model.visibleRows[0].statusColor).toBe(atomInterventionTheme.status.input.color);
   });
 
@@ -259,9 +259,119 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["child-input", "parent"]);
     expect(model.visibleRows.find((item) => item.sessionId === "parent")?.subtaskSummary).toBe(
-      "2 subtasks: 1 inspect, 1 working",
+      "2 subtasks: 1 inspect, 1 running",
     );
     expect(model.hiddenCount).toBe(0);
+  });
+
+  it("suppresses orphaned quiet subagents while promoting orphaned intervention subagents", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("child-working", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "missing-parent",
+        },
+        {
+          ...row("child-inspect", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "missing-parent",
+        },
+        {
+          ...row("child-input", "waitingForInput", "waiting for user input"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "missing-parent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["child-input"]);
+    expect(model.visibleRows[0].subagentMarker).toBe("subagent anomaly");
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
+  });
+
+  it("keeps rolled-up subagent rows addressable for expansion and group dismiss", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child-working", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "parent",
+          lastActivityAt: "2026-06-15T03:40:00.000Z",
+        },
+        {
+          ...row("child-inspect-old", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "parent",
+          lastActivityAt: "2026-06-15T03:30:00.000Z",
+        },
+        {
+          ...row("child-inspect-new", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "parent",
+          lastActivityAt: "2026-06-15T03:50:00.000Z",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    const parent = model.visibleRows.find((item) => item.sessionId === "parent");
+
+    expect(parent?.subtaskSummary).toBe("3 subtasks: 2 inspect, 1 running");
+    expect(parent?.subtaskRows?.map((item) => item.sessionId)).toEqual([
+      "child-inspect-new",
+      "child-inspect-old",
+      "child-working",
+    ]);
+    expect(parent?.dismissSessionIds).toEqual([
+      "parent",
+      "child-inspect-new",
+      "child-inspect-old",
+      "child-working",
+    ]);
+  });
+
+  it("keeps rolled-up inspect subagents addressable for parent acknowledge", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("parent", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child-inspect", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "parent",
+        },
+        {
+          ...row("child-input", "waitingForInput", "waiting for user input"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "parent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 4 },
+    );
+
+    const parent = model.visibleRows.find((item) => item.sessionId === "parent");
+    const childInput = model.visibleRows.find((item) => item.sessionId === "child-input");
+
+    expect(parent?.acknowledgeSessionIds).toEqual(["parent", "child-inspect"]);
+    expect(childInput?.subagentMarker).toBe("subagent anomaly");
   });
 
   it("uses explicit parent session ids before falling back to workspace grouping", () => {
@@ -291,13 +401,13 @@ describe("buildStatusPanelModel", () => {
     );
 
     expect(model.visibleRows.find((item) => item.sessionId === "actual-parent")?.subtaskSummary).toBe(
-      "1 subtask: 1 working",
+      "1 subtask: 1 running",
     );
     expect(model.visibleRows.find((item) => item.sessionId === "newer-parent")?.subtaskSummary).toBeUndefined();
     expect(model.visibleRows.map((item) => item.sessionId)).not.toContain("child-working");
   });
 
-  it("uses a rolled-up desktop child as the jump target for a cli parent summary", () => {
+  it("keeps the parent jump target when subagents roll up", () => {
     const model = buildStatusPanelModel(
       [
         {
@@ -326,11 +436,11 @@ describe("buildStatusPanelModel", () => {
     expect(model.visibleRows[0]).toMatchObject({
       sessionId: "cli-parent",
       label: "https://wiki.hosecloud.com/pages/viewpage.action?pageId=580026375",
-      subtaskSummary: "1 subtask: 1 working",
-      jumpSessionId: "desktop-child",
-      jumpTarget: "desktop",
-      jumpAvailability: "exact",
+      subtaskSummary: "1 subtask: 1 running",
+      jumpTarget: "cli",
+      jumpAvailability: "approximate",
     });
+    expect(model.visibleRows[0].jumpSessionId).toBeUndefined();
   });
 
   it("keeps an exact desktop parent as the jump target when desktop subagents roll up", () => {

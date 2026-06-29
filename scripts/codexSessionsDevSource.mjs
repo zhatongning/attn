@@ -13,9 +13,24 @@ export function defaultCodexSessionsRoot() {
 
 export function defaultCodexStateDbPath(homeDir = os.homedir()) {
   const currentPath = path.join(homeDir, ".codex", "sqlite", "state_5.sqlite");
-  if (fs.existsSync(currentPath)) return currentPath;
+  const legacyPath = path.join(homeDir, ".codex", "state_5.sqlite");
+  const currentExists = fs.existsSync(currentPath);
+  const legacyExists = fs.existsSync(legacyPath);
+  if (currentExists && legacyExists) {
+    return fileModifiedMs(legacyPath) > fileModifiedMs(currentPath) ? legacyPath : currentPath;
+  }
+  if (currentExists) return currentPath;
+  if (legacyExists) return legacyPath;
 
-  return path.join(homeDir, ".codex", "state_5.sqlite");
+  return legacyPath;
+}
+
+function fileModifiedMs(filePath) {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
 }
 
 export function sourceHealth({
@@ -684,8 +699,9 @@ function sessionStatePriority(state) {
   if (state === "inspect" || state === "dismissable") return 1;
   if (state === "running") return 2;
   if (state === "needsAttention") return 3;
-  if (state === "idle") return 4;
-  return 5;
+  if (state === "stopped") return 4;
+  if (state === "idle") return 5;
+  return 6;
 }
 
 function timestampValue(value) {

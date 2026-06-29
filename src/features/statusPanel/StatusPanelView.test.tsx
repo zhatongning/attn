@@ -451,14 +451,14 @@ describe("StatusPanelView", () => {
     ]));
   });
 
-  it("lets macOS Dock desktop assignment control where the panel appears", () => {
+  it("keeps the macOS panel visible across Spaces", () => {
     // @ts-expect-error This test reads local config without adding Node types to the app build.
     const tauriConfig = JSON.parse(readFileSync(join(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"));
     // @ts-expect-error This test reads local source without adding Node types to the app build.
     const tauriLib = readFileSync(join(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
 
-    expect(tauriConfig.app.windows[0].visibleOnAllWorkspaces).not.toBe(true);
-    expect(tauriLib).not.toContain("set_visible_on_all_workspaces(true)");
+    expect(tauriConfig.app.windows[0].visibleOnAllWorkspaces).toBe(true);
+    expect(tauriLib).toContain("set_visible_on_all_workspaces(true)");
   });
 
   it("does not create extra panel windows for secondary displays", () => {
@@ -865,7 +865,7 @@ describe("StatusPanelView", () => {
       element.textContent?.replace(/\s+/g, " ").trim(),
     );
 
-    expect(statusTexts).toEqual(["● blocked", "● input", "○ working"]);
+    expect(statusTexts).toEqual(["● blocked", "● attention", "● inspect"]);
   });
 
   it("shows a parent subtask summary while only promoting intervention subagents", () => {
@@ -912,11 +912,185 @@ describe("StatusPanelView", () => {
     expandPanel();
 
     expect(screen.getByText("Parent task")).toBeTruthy();
-    expect(screen.getByText("2 subtasks: 1 inspect, 1 working")).toBeTruthy();
+    expect(screen.getByText("2 subtasks: 1 inspect, 1 running")).toBeTruthy();
     expect(screen.getByText("Input child task")).toBeTruthy();
+    expect(screen.getByText("subagent anomaly")).toBeTruthy();
     expect(screen.queryByText("Quiet child task")).toBeNull();
     expect(screen.queryByText("Inspect child task")).toBeNull();
     expect(screen.getAllByRole("article")).toHaveLength(2);
+  });
+
+  it("acknowledges rolled-up inspect subagents when the parent inspect row is opened", async () => {
+    const rows: SessionRow[] = [
+      {
+        ...initialSessions[0],
+        sessionId: "parent",
+        label: "Parent task",
+        state: "inspect",
+        workspacePath: "/Users/edy/project",
+        threadSource: "user",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-inspect",
+        label: "Inspect child task",
+        state: "inspect",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        parentSessionId: "parent",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-input",
+        label: "Input child task",
+        state: "waitingForInput",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        parentSessionId: "parent",
+        statusReason: "waiting for user input",
+      },
+    ];
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_sessions") return rows;
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "jump_to_session") {
+        return {
+          sessionId: args?.sessionId,
+          availability: "exact",
+          target: "desktop",
+          message: "Opened parent session.",
+        };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    const parentRow = screen.getByTestId("status-row-parent");
+    fireEvent.click(within(parentRow).getByTitle("Jump back"));
+
+    await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("jump_to_session", {
+        sessionId: "parent",
+        acknowledgedSessionIds: ["parent", "child-inspect"],
+      });
+    });
+  });
+
+  it("expands rolled-up subagents and jumps to the selected child session", async () => {
+    const rows: SessionRow[] = [
+      {
+        ...initialSessions[0],
+        sessionId: "parent",
+        label: "Parent task",
+        state: "running",
+        workspacePath: "/Users/edy/project",
+        threadSource: "user",
+        statusReason: "running signal observed",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-inspect",
+        label: "Inspect child task",
+        state: "inspect",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        parentSessionId: "parent",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_sessions") return rows;
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "jump_to_session") {
+        return {
+          sessionId: args?.sessionId,
+          availability: "exact",
+          target: "desktop",
+          message: "Opened child session.",
+        };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "1 subtask: 1 inspect" }));
+    const subtaskRow = await screen.findByTestId("subtask-row-child-inspect");
+
+    expect(within(subtaskRow).getByText("Inspect child task")).toBeTruthy();
+    fireEvent.click(within(subtaskRow).getByTitle("Jump back"));
+
+    await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("jump_to_session", {
+        sessionId: "child-inspect",
+        acknowledgedSessionIds: ["child-inspect"],
+      });
+    });
+  });
+
+  it("dismisses a parent and its rolled-up subagent sessions as one group", async () => {
+    const rows: SessionRow[] = [
+      {
+        ...initialSessions[0],
+        sessionId: "parent",
+        label: "Parent task",
+        state: "running",
+        workspacePath: "/Users/edy/project",
+        threadSource: "user",
+        statusReason: "running signal observed",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-inspect",
+        label: "Inspect child task",
+        state: "inspect",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        parentSessionId: "parent",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "list_sessions") return rows;
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "dismiss_sessions") {
+        const ids = new Set(args?.sessionIds as string[]);
+        return rows.map((row) => (
+          ids.has(row.sessionId) ? { ...row, dismissed: true, handled: true } : row
+        ));
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    fireEvent.click(screen.getByTitle("Dismiss"));
+
+    expect(screen.queryByText("Parent task")).toBeNull();
+    expect(screen.queryByText("Inspect child task")).toBeNull();
+    await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("dismiss_sessions", {
+        sessionIds: ["parent", "child-inspect"],
+      });
+    });
   });
 
   it("keeps an opened intervention row as needed during the read window", async () => {

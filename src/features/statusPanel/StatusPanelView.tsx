@@ -18,6 +18,7 @@ import {
   defaultStatusPanelConfig,
   type InterventionStatus,
   type StatusPanelConfig,
+  type StatusPanelRow,
 } from "./statusPanel";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
@@ -221,18 +222,21 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     };
   }, [model.visibleRows, model.hiddenRows]);
 
-  async function dismissSession(sessionId: string) {
+  async function dismissSession(row: StatusPanelRow) {
+    const sessionId = row.sessionId;
+    const sessionIds = row.dismissSessionIds ?? [row.sessionId];
+    const dismissedIds = new Set(sessionIds);
     const previousRows = rows;
     setPendingAction(sessionId, "dismiss");
     setRows((currentRows) =>
       currentRows.map((row) =>
-        row.sessionId === sessionId ? { ...row, dismissed: true, handled: true, pinned: false } : row,
+        dismissedIds.has(row.sessionId) ? { ...row, dismissed: true, handled: true, pinned: false } : row,
       ),
     );
     setErrorMessage(null);
 
     try {
-      const updatedRows = await dismissSessionCommand(sessionId, previousRows);
+      const updatedRows = await dismissSessionCommand(sessionId, previousRows, sessionIds);
       setRows(updatedRows);
       setCommandMessage("dismissed");
     } catch (error) {
@@ -268,13 +272,13 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }
   }
 
-  async function jumpToSession(sessionId: string) {
+  async function jumpToSession(sessionId: string, acknowledgedSessionIds = [sessionId]) {
     setPendingAction(sessionId, "jump");
     setCommandMessage("opening session");
     setErrorMessage(null);
 
     try {
-      const result = await jumpToSessionCommand(sessionId);
+      const result = await jumpToSessionCommand(sessionId, acknowledgedSessionIds);
       setCommandMessage(result.message);
       await refreshPanel();
     } catch (error) {
@@ -508,6 +512,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
                   key={row.sessionId}
                   row={row}
                   pendingAction={pendingActions[row.sessionId]}
+                  pendingActions={pendingActions}
                   attentionCue={attentionCues[row.sessionId] === true}
                   copy={model.copy}
                   onJump={jumpToSession}
@@ -656,17 +661,28 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 }
 
 interface StatusRowProps {
-  row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number];
+  row: StatusPanelRow;
   pendingAction?: "jump" | "dismiss" | "pin" | "unpin";
+  pendingActions?: Record<string, "jump" | "dismiss" | "pin" | "unpin">;
   attentionCue?: boolean;
   copy: ReturnType<typeof buildStatusPanelModel>["copy"];
-  onJump: (sessionId: string) => void;
-  onTogglePinned: (row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number]) => void;
-  onDismiss: (sessionId: string) => void;
+  onJump: (sessionId: string, acknowledgedSessionIds?: string[]) => void;
+  onTogglePinned: (row: StatusPanelRow) => void;
+  onDismiss: (row: StatusPanelRow) => void;
 }
 
-function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onTogglePinned, onDismiss }: StatusRowProps) {
+function StatusRow({
+  row,
+  pendingAction,
+  pendingActions = {},
+  attentionCue = false,
+  copy,
+  onJump,
+  onTogglePinned,
+  onDismiss,
+}: StatusRowProps) {
   const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [subtasksOpen, setSubtasksOpen] = useState(false);
   const evidenceRef = useRef<HTMLSpanElement | null>(null);
   const jumpTitle = pendingAction === "jump" ? copy.openingSessionLabel : copy.jumpBackLabel;
   const pinTitle = pendingAction === "pin"
@@ -677,6 +693,7 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onT
       ? copy.unpinLabel
       : copy.pinLabel;
   const dismissTitle = pendingAction === "dismiss" ? copy.dismissingLabel : copy.dismissLabel;
+  const subtaskRows = row.subtaskRows ?? [];
   const rowClassName = [
     "status-row",
     `status-row--${row.displayStatus}`,
@@ -724,8 +741,20 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onT
         <h2>{row.label}</h2>
         <p className="status-meta">
           <span className="status-workspace">{rowSubtitle(row)}</span>
-          {row.subtaskSummary ? (
+          {row.subtaskSummary && subtaskRows.length > 0 ? (
+            <button
+              type="button"
+              className="status-subtasks"
+              aria-expanded={subtasksOpen}
+              onClick={() => setSubtasksOpen((current) => !current)}
+            >
+              {row.subtaskSummary}
+            </button>
+          ) : row.subtaskSummary ? (
             <span className="status-subtasks">{row.subtaskSummary}</span>
+          ) : null}
+          {row.subagentMarker ? (
+            <span className="status-subagent-marker">{row.subagentMarker}</span>
           ) : null}
           <span className="status-confidence">{copy.confidenceLabels[row.confidence]}</span>
           <span className="status-evidence-anchor" ref={evidenceRef}>
@@ -761,7 +790,7 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onT
           className="status-action status-action--jump"
           title={jumpTitle}
           disabled={pendingAction === "jump"}
-          onClick={() => onJump(row.jumpSessionId ?? row.sessionId)}
+          onClick={() => onJump(row.jumpSessionId ?? row.sessionId, row.acknowledgeSessionIds ?? [row.sessionId])}
         >
           {pendingAction === "jump" ? <PendingIcon /> : <JumpIcon />}
         </button>
@@ -780,12 +809,79 @@ function StatusRow({ row, pendingAction, attentionCue = false, copy, onJump, onT
           className="status-action status-action--dismiss"
           title={dismissTitle}
           disabled={pendingAction === "dismiss"}
-          onClick={() => onDismiss(row.sessionId)}
+          onClick={() => onDismiss(row)}
         >
           {pendingAction === "dismiss" ? <PendingIcon /> : <DismissIcon />}
         </button>
       </div>
+      {subtasksOpen && subtaskRows.length > 0 ? (
+        <div className="status-subtask-list">
+          {subtaskRows.map((subtask) => (
+            <SubtaskRow
+              key={subtask.sessionId}
+              row={subtask}
+              pendingAction={subtaskPendingAction(pendingActions[subtask.sessionId])}
+              copy={copy}
+              onJump={onJump}
+              onDismiss={onDismiss}
+            />
+          ))}
+        </div>
+      ) : null}
     </article>
+  );
+}
+
+function subtaskPendingAction(action?: "jump" | "dismiss" | "pin" | "unpin") {
+  return action === "jump" || action === "dismiss" ? action : undefined;
+}
+
+interface SubtaskRowProps {
+  row: StatusPanelRow;
+  pendingAction?: "jump" | "dismiss";
+  copy: ReturnType<typeof buildStatusPanelModel>["copy"];
+  onJump: (sessionId: string, acknowledgedSessionIds?: string[]) => void;
+  onDismiss: (row: StatusPanelRow) => void;
+}
+
+function SubtaskRow({ row, pendingAction, copy, onJump, onDismiss }: SubtaskRowProps) {
+  const jumpTitle = pendingAction === "jump" ? copy.openingSessionLabel : copy.jumpBackLabel;
+  const dismissTitle = pendingAction === "dismiss" ? copy.dismissingLabel : copy.dismissLabel;
+
+  return (
+    <div
+      className={`status-subtask status-subtask--${row.displayStatus}`}
+      data-testid={`subtask-row-${row.sessionId}`}
+    >
+      <span
+        className="status-subtask-code"
+        style={{ "--status-color": row.statusColor } as React.CSSProperties}
+      >
+        {row.statusLabel}
+      </span>
+      <span className="status-subtask-title">{row.label}</span>
+      <span className="status-confidence">{copy.confidenceLabels[row.confidence]}</span>
+      <div className="status-actions status-actions--subtask">
+        <button
+          type="button"
+          className="status-action status-action--jump"
+          title={jumpTitle}
+          disabled={pendingAction === "jump"}
+          onClick={() => onJump(row.sessionId, [row.sessionId])}
+        >
+          {pendingAction === "jump" ? <PendingIcon /> : <JumpIcon />}
+        </button>
+        <button
+          type="button"
+          className="status-action status-action--dismiss"
+          title={dismissTitle}
+          disabled={pendingAction === "dismiss"}
+          onClick={() => onDismiss(row)}
+        >
+          {pendingAction === "dismiss" ? <PendingIcon /> : <DismissIcon />}
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -978,7 +1074,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function rowSubtitle(row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number]) {
+function rowSubtitle(row: StatusPanelRow) {
   return row.projectName ?? row.workspacePath ?? row.interventionReason;
 }
 

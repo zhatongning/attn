@@ -11,7 +11,7 @@ The status model should answer one question:
 
 > Do I need to do anything with this agent session right now?
 
-Subagent sessions follow the same rule. They should be discovered and preserved, but the panel should not become a flat list of every internal worker session. When JSONL `session_meta.payload.parent_thread_id` links a subagent to a parent thread, normal subagent rows are summarized on that parent row. If the parent id is missing or the parent row is not currently visible, the panel may fall back to the same-workspace parent heuristic. Subagent rows are promoted back into the top-level list only when they need direct intervention, currently `input`, `stopped`, or `blocked`.
+Subagent sessions follow the same rule. They should be discovered and preserved, but the panel should not become a flat list of every internal worker session. When JSONL `session_meta.payload.parent_thread_id` links a subagent to a parent thread, normal subagent rows are summarized on that parent row. If the parent id is missing or the parent row is not currently visible, the panel may fall back to the same-workspace parent heuristic. Subagent rows are promoted back into the top-level list only when they need direct intervention, currently `attention`, `stopped`, or `blocked`.
 
 ## State Layers
 
@@ -21,7 +21,7 @@ The implementation currently has three layers. Keeping them separate prevents mo
 | --- | --- | --- |
 | Source observation | `Running`, `Stopped`, `Idle`, `Completed`, `CompletedStale`, `WaitingForInput`, `Failed`, `InsufficientEvidence` | Raw or inferred evidence from SQLite, JSONL, and process checks. |
 | Internal row state | `running`, `stopped`, `idle`, `needsAttention`, `dismissable`, `unknown` | Normalized state used by commands and storage. |
-| UI display key | `working`, `stopped`, `idle`, `needed`, `inspect`, `blocked` | Stable key used for sorting and colors. Labels can be localized, for example `needed` displays as `follow-up` or `待跟进`. |
+| Display status | `blocked`, `attention`, `inspect`, `running`, `follow-up`, `stopped`, `idle` | User-facing status used by the panel and documentation. |
 
 ## Event Sources
 
@@ -45,31 +45,33 @@ The intended model is:
 
 | Display status | Marker | Meaning | Should user act? |
 | --- | --- | --- | --- |
-| `working` | `○ working` | The agent is actively executing work now. | No. Keep visible as quiet context. |
-| `input` | `● input` | The agent is waiting for user intervention, such as approval, confirmation, or additional information. | Yes. |
+| `blocked` | `● blocked` | The agent cannot continue because of missing evidence, unavailable source, or an actionable failure signal. | Yes. |
+| `attention` | `● attention` | The agent is waiting for user intervention, such as approval, confirmation, or additional information. | Yes. |
+| `inspect` | `● inspect` | The agent just produced a result that should be checked while context is fresh. | Yes. |
+| `running` | `○ running` | The agent is actively executing work now. | No. Keep visible as quiet context. |
+| `follow-up` | `● follow-up` | The session was opened recently and may still need a short follow-up before it settles. | Yes. |
 | `stopped` | `● stopped` | The run was manually stopped or aborted before a completion signal. | Yes. Decide whether to continue, inspect, or dismiss it. |
 | `idle` | `○ idle` | No active work is happening and no user action is required. | No. Count it as quiet context, but do not spend a card on it by default. |
-| `needed` | `● follow-up` | The session was opened recently and may still need a short follow-up before it settles. | Yes. |
-| `inspect` | `● inspect` | The agent just produced a result that should be checked while context is fresh. | Yes. |
-| `blocked` | `● blocked` | The agent cannot continue because of missing evidence, unavailable source, or an actionable failure signal. | Yes. |
 
 ### Display Name Rationale
 
 `inspect` replaces `review` because the expected action is "check what happened", not necessarily approve or code-review the result.
 `review` carried an acceptance/assessment implication that was broader than this product needs.
 
-`follow-up` is the display label for the internal `needed` state.
+`follow-up` is the display status for the internal `needsAttention` row state.
 It means "keep this session in short-term attention after it was opened" without implying the agent has a response to read, that the only possible action is text input, or that the user must personally complete the underlying task.
+
+`running` is the display status for active execution.
 
 Chinese labels, if the UI becomes localized:
 
 | English | Recommended Chinese | Rationale |
 | --- | --- | --- |
 | `blocked` | `受阻` | Short and clearly means the agent cannot continue. |
-| `input` | `待介入` | Broader than "typing input"; covers approval, confirmation, permission, or additional information. |
+| `attention` | `待介入` | Broader than "typing input"; covers approval, confirmation, permission, or additional information. |
 | `inspect` | `待检查` | Matches the action: open and inspect the result. |
 | `follow-up` | `待跟进` | Matches the post-read window: the user may need to continue, confirm, or take over soon without implying an urgent blocker. |
-| `working` | `进行中` | Clear active-work state. |
+| `running` | `进行中` | Clear active-work state. |
 | `stopped` | `已停止` | Clear stopped-before-completion state. |
 | `idle` | `空闲` | Quiet no-action state. |
 
@@ -93,7 +95,7 @@ These are the rules implemented today.
 Completion attention is read-driven, not completion-age-driven:
 
 - `inspect`: completed result has not been opened/read yet.
-- `needed`: completed result was opened/read within the last 30 minutes.
+- `follow-up`: completed result was opened/read within the last 30 minutes.
 - `idle`: completed result was opened/read more than 30 minutes ago.
 
 To avoid flooding the panel with historical completions, unread-completion tracking has a migration baseline:
@@ -134,7 +136,7 @@ These hooks are the preferred source for live status transitions when the app-ow
 | `Stop` | pending terminal check | A turn ended. Do not classify as `Completed` by itself. |
 
 `Stop` is intentionally not a final state. It can mean success, waiting for input, interruption, tool failure, or a normal turn boundary.
-After `Stop`, the app should consult JSONL and any hook payload to decide whether the row becomes `inspect`, `stopped`, `needed`, `blocked`, or `idle`.
+After `Stop`, the app should consult JSONL and any hook payload to decide whether the row becomes `inspect`, `stopped`, `follow-up`, `blocked`, or `idle`.
 
 ### Hook Storage
 
@@ -180,13 +182,13 @@ For this app, user-level hooks are likely the right default because the status p
 
 ## Current UI Mapping
 
-| Internal row state | UI display status |
+| Internal row state | Display status |
 | --- | --- |
-| `running` | `working` |
+| `running` | `running` |
 | `stopped` | `stopped` |
 | `idle` | `idle` |
-| `waitingForInput` | `input` |
-| `needsAttention` | `needed` |
+| `waitingForInput` | `attention` |
+| `needsAttention` | `follow-up` |
 | `inspect` | `inspect` |
 | legacy `dismissable` | `inspect` |
 | `unknown` with actionable reason | `blocked` |
@@ -201,9 +203,9 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 | Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `follow-up` for 30 minutes. |
 | Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
-| Click Jump back on `working` or `idle` | No state transition. |
-| Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the source changes to `running` or `needsAttention`. |
-| Dismiss a `working` or `needed` row | It is restored immediately on next list because active/intervention rows should not stay hidden. |
+| Click Jump back on `running` or `idle` | No state transition. |
+| Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the display status becomes `running` or `follow-up`. |
+| Dismiss a `running` or `follow-up` row | It is restored immediately on next list because active/intervention rows should not stay hidden. |
 
 Read acknowledgement is keyed by `sessionId + lastActivityAt` and stores `acknowledgedAt`.
 If the same session gets newer activity, the read acknowledgement no longer applies.
@@ -228,7 +230,7 @@ These are the areas that currently feel wrong or need product decisions.
    The product goal is an intervention watchlist. Old quiet rows should probably be hidden or collapsed more aggressively.
 
 6. Hook reading is integrated, and hook installation is explicit from the management page.
-   Without installed hooks, `working` still falls back to SQLite/JSONL/process inference.
+   Without installed hooks, `running` still falls back to SQLite/JSONL/process inference.
 
 7. TODO: Find a reliable read/open evidence source for Codex Desktop history navigation.
    Current local evidence is insufficient to prove an `inspect` row was read when the user opens that thread directly inside Codex Desktop. `threads.updated_at_ms` does not always advance, `threads` has no `read_at`/`seen_at` field, `logs_2.sqlite` has execution logs but no reliable post-completion read event, and generic UI click/Sentry data is not safely attributable to a specific session. Hooks are useful for execution lifecycle state, but they do not currently prove UI-level read/open actions.
@@ -250,12 +252,12 @@ We should decide these before more code changes.
    Current decision:
    - `blocked`
    - `inspect`
-   - `needed`
-   - current `working`
+   - current `running`
+   - `follow-up`
    - `idle` only contributes to the quiet count and does not occupy a card
 
 4. Should quiet states be visible at all?
-   Current behavior keeps `working` visible because live work is important context, but moves `idle` into the quiet count because it does not require action.
+   Current behavior keeps `running` visible because live work is important context, but moves `idle` into the quiet count because it does not require action.
 
 5. What is the retention rule for completed sessions?
    Current decision: completions older than 30 minutes become `idle`.
@@ -286,12 +288,12 @@ stateDiagram-v2
 
 Candidate principles:
 
-- `working` means active execution, not merely "thread exists."
-- Hook events should be the strongest proof of `working`.
+- `running` means active execution, not merely "thread exists."
+- Hook events should be the strongest proof of `running`.
 - `idle` means no action required.
 - `inspect` should be scarce. It should represent something the user is likely to care about now.
 - Old completions should automatically become `idle`.
-- `needed` and `blocked` are the strongest intervention states.
+- `follow-up` and `blocked` are strong intervention states.
 - Old historical sessions should not crowd the panel.
 
 ## Code Touchpoints

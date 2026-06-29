@@ -67,18 +67,23 @@ export async function installCodexHooks(): Promise<CodexHookIntegrationStatus> {
   return invoke<CodexHookIntegrationStatus>("install_codex_hooks");
 }
 
-export async function dismissSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
+export async function dismissSession(
+  sessionId: string,
+  currentRows: SessionRow[],
+  sessionIds = [sessionId],
+): Promise<SessionRow[]> {
+  const dismissedIds = new Set(sessionIds);
+  const fallbackRows = () => currentRows.map((row) =>
+    dismissedIds.has(row.sessionId) ? { ...row, dismissed: true, handled: true } : row,
+  );
+
   if (!hasTauriRuntime()) {
-    return currentRows.map((row) =>
-      row.sessionId === sessionId ? { ...row, dismissed: true, handled: true } : row,
-    );
+    return fallbackRows();
   }
 
-  return invoke<SessionRow[]>("dismiss_session", { sessionId }).catch(() =>
-    currentRows.map((row) =>
-      row.sessionId === sessionId ? { ...row, dismissed: true, handled: true } : row,
-    ),
-  );
+  return invoke<SessionRow[]>("dismiss_sessions", { sessionIds })
+    .catch(() => invoke<SessionRow[]>("dismiss_session", { sessionId }))
+    .catch(fallbackRows);
 }
 
 export async function restoreSession(sessionId: string, currentRows: SessionRow[]): Promise<SessionRow[]> {
@@ -123,7 +128,10 @@ export async function unpinSession(sessionId: string, currentRows: SessionRow[])
   );
 }
 
-export async function jumpToSession(sessionId: string): Promise<JumpResult> {
+export async function jumpToSession(
+  sessionId: string,
+  acknowledgedSessionIds = [sessionId],
+): Promise<JumpResult> {
   if (!hasTauriRuntime()) {
     return fetchDevJson<JumpResult>("/api/jump", {
       sessionId,
@@ -133,11 +141,11 @@ export async function jumpToSession(sessionId: string): Promise<JumpResult> {
     }, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({ sessionId, acknowledgedSessionIds }),
     });
   }
 
-  return invoke<JumpResult>("jump_to_session", { sessionId }).catch(() =>
+  return invoke<JumpResult>("jump_to_session", { sessionId, acknowledgedSessionIds }).catch(() =>
     fetchDevJson<JumpResult>("/api/jump", {
       sessionId,
       availability: "unavailable",
@@ -146,7 +154,7 @@ export async function jumpToSession(sessionId: string): Promise<JumpResult> {
     }, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({ sessionId, acknowledgedSessionIds }),
     }),
   );
 }

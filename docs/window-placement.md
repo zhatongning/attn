@@ -2,24 +2,20 @@
 
 Attn uses one floating panel window. It intentionally does not create one panel per display.
 
-## macOS Desktop And Display Assignment
+## macOS Desktop And Display Behavior
 
-Use the macOS Dock menu to decide where the panel appears:
+Attn configures the panel as visible on all macOS Spaces.
+The panel is a single window, not one replica per Desktop or Display.
 
-1. Right-click the Attn Dock icon.
-2. Open `Options`.
-3. Choose one of the macOS `Assign To` options.
+The macOS Dock `Options -> Assign To` menu may still show an assignment, but the panel window itself explicitly joins all Spaces so switching Desktops keeps it visible.
 
 Recommended behavior:
 
-| Dock assignment | Result |
+| Scenario | Result |
 | --- | --- |
-| `All Desktops` | The single panel follows Desktop/Space changes on the assigned display. |
-| `Desktop ... on Display ...` | The panel is scoped to that specific Desktop/Display assignment. |
-| `None` | macOS decides the normal window ownership behavior. |
-
-Attn does not force `visibleOnAllWorkspaces`.
-That is deliberate: macOS should own Space and Display assignment so the panel follows the user's Dock configuration.
+| Switch Desktop/Space | The same panel remains visible. |
+| Multiple displays | Attn keeps one panel window; it does not create display-specific replicas. |
+| Use Dock `Assign To` | macOS can record the Dock assignment, but Attn still asks the panel window to join all Spaces. |
 
 ## Panel Position
 

@@ -34,6 +34,10 @@ export interface StatusPanelRow extends SessionRow {
   interventionReason: string;
   evidenceTooltip: string;
   subtaskSummary?: string;
+  subtaskRows?: StatusPanelRow[];
+  dismissSessionIds?: string[];
+  acknowledgeSessionIds?: string[];
+  subagentMarker?: string;
   jumpSessionId?: string;
 }
 
@@ -94,6 +98,7 @@ export interface StatusPanelCopy {
   unpinningLabel: string;
   dismissLabel: string;
   dismissingLabel: string;
+  subagentAnomalyLabel: string;
   showEvidenceLabel: (label: string) => string;
   subtaskSummaryLabel: (summary: SubtaskSummary) => string;
   statusPrefix: string;
@@ -111,6 +116,7 @@ export interface StatusPanelCopy {
 interface SubtaskSummary {
   total: number;
   counts: Partial<Record<InterventionStatus, number>>;
+  rows: StatusPanelRow[];
   jumpRow?: StatusPanelRow;
 }
 
@@ -143,7 +149,7 @@ export const atomInterventionTheme: AtomInterventionTheme = {
       color: defaultStatusPanelConfig.statusColors.blocked,
     },
     input: {
-      label: "input",
+      label: "attention",
       marker: "●",
       color: defaultStatusPanelConfig.statusColors.input,
     },
@@ -163,7 +169,7 @@ export const atomInterventionTheme: AtomInterventionTheme = {
       color: defaultStatusPanelConfig.statusColors.needed,
     },
     working: {
-      label: "working",
+      label: "running",
       marker: "○",
       color: defaultStatusPanelConfig.statusColors.working,
     },
@@ -178,21 +184,21 @@ export const atomInterventionTheme: AtomInterventionTheme = {
 const statusPriority: Record<InterventionStatus, number> = {
   blocked: 0,
   input: 1,
-  stopped: 2,
+  inspect: 2,
   working: 3,
-  inspect: 4,
-  needed: 5,
+  needed: 4,
+  stopped: 5,
   idle: 6,
 };
 
 const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionStatus, string>> = {
   en: {
     blocked: "blocked",
-    input: "input",
+    input: "attention",
     inspect: "inspect",
     stopped: "stopped",
     needed: "follow-up",
-    working: "working",
+    working: "running",
     idle: "idle",
   },
   zh: {
@@ -209,7 +215,7 @@ const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionSta
 const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   en: {
     alertsLabel: "alerts",
-    workingLabel: "working",
+    workingLabel: "running",
     idleLabel: "idle",
     quietLabel: "quiet",
     hiddenAlertsLabel: "alerts",
@@ -250,15 +256,16 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     unpinningLabel: "Unpinning session",
     dismissLabel: "Dismiss",
     dismissingLabel: "Dismissing session",
+    subagentAnomalyLabel: "subagent anomaly",
     showEvidenceLabel: (label) => `Show status evidence for ${label}`,
     subtaskSummaryLabel: (summary) => {
       const parts = subtaskSummaryParts(summary, {
         blocked: "blocked",
-        input: "input",
+        input: "attention",
         inspect: "inspect",
         stopped: "stopped",
         needed: "follow-up",
-        working: "working",
+        working: "running",
         idle: "idle",
       });
       return `${summary.total} ${summary.total === 1 ? "subtask" : "subtasks"}${parts.length > 0 ? `: ${parts.join(", ")}` : ""}`;
@@ -332,6 +339,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     unpinningLabel: "正在取消固定会话",
     dismissLabel: "忽略",
     dismissingLabel: "正在忽略",
+    subagentAnomalyLabel: "子任务异常",
     showEvidenceLabel: (label) => `查看 ${label} 的状态依据`,
     subtaskSummaryLabel: (summary) => {
       const parts = subtaskSummaryParts(summary, statusLabels.zh);
@@ -412,58 +420,53 @@ function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
       ? parentForSubagentRow(row, parentBySessionId, parentByWorkspace)
       : undefined;
     if (!parent) {
+      if (isSubagentRow(row)) {
+        if (shouldPromoteSubagentRow(row)) {
+          visibleRows.push({ ...row, subagentMarker: copy.subagentAnomalyLabel });
+        }
+        continue;
+      }
       visibleRows.push(row);
       continue;
     }
 
     if (shouldPromoteSubagentRow(row)) {
-      visibleRows.push(row);
+      visibleRows.push({ ...row, subagentMarker: copy.subagentAnomalyLabel });
       continue;
     }
 
-    const summary = summaries.get(parent.sessionId) ?? { total: 0, counts: {} };
+    const summary = summaries.get(parent.sessionId) ?? { total: 0, counts: {}, rows: [] };
     summary.total += 1;
     summary.counts[row.displayStatus] = (summary.counts[row.displayStatus] ?? 0) + 1;
-    summary.jumpRow = betterRollupJumpRow(summary.jumpRow, row);
+    summary.rows.push(row);
     summaries.set(parent.sessionId, summary);
   }
 
   return visibleRows.map((row) => {
     const summary = summaries.get(row.sessionId);
     if (!summary) return row;
-    const jumpRow = shouldUseRollupJumpRow(row, summary.jumpRow) ? summary.jumpRow : undefined;
+    const subtaskRows = [...summary.rows].sort(compareSubtaskRows);
     return {
       ...row,
       subtaskSummary: copy.subtaskSummaryLabel(summary),
-      ...(jumpRow ? {
-        jumpSessionId: jumpRow.sessionId,
-        jumpTarget: jumpRow.jumpTarget,
-        jumpAvailability: jumpRow.jumpAvailability,
-      } : {}),
+      subtaskRows,
+      dismissSessionIds: [row.sessionId, ...subtaskRows.map((item) => item.sessionId)],
+      acknowledgeSessionIds: [row.sessionId, ...subtaskRows
+        .filter((item) => item.displayStatus === "inspect")
+        .map((item) => item.sessionId)],
     };
   });
 }
 
-function shouldUseRollupJumpRow(parent: StatusPanelRow, child: StatusPanelRow | undefined) {
-  if (!child) return false;
-  return !(parent.jumpTarget === "desktop" && parent.jumpAvailability === "exact");
+function compareSubtaskRows(left: StatusPanelRow, right: StatusPanelRow) {
+  const toneDelta = tonePriority(left.statusTone) - tonePriority(right.statusTone);
+  if (toneDelta !== 0) return toneDelta;
+
+  return comparePanelRows(left, right);
 }
 
-function betterRollupJumpRow(current: StatusPanelRow | undefined, candidate: StatusPanelRow) {
-  if (!current) return candidate;
-  return compareRollupJumpRows(candidate, current) < 0 ? candidate : current;
-}
-
-function compareRollupJumpRows(left: StatusPanelRow, right: StatusPanelRow) {
-  return jumpTargetPriority(left.jumpTarget)
-    - jumpTargetPriority(right.jumpTarget)
-    || timestampValue(right.lastActivityAt) - timestampValue(left.lastActivityAt);
-}
-
-function jumpTargetPriority(jumpTarget: SessionRow["jumpTarget"]) {
-  if (jumpTarget === "desktop") return 0;
-  if (jumpTarget === "cli") return 1;
-  return 2;
+function tonePriority(tone: StatusPanelRow["statusTone"]) {
+  return tone === "alert" ? 0 : 1;
 }
 
 function parentForSubagentRow(
@@ -503,7 +506,7 @@ function subtaskSummaryParts(
   summary: SubtaskSummary,
   labels: Record<InterventionStatus, string>,
 ) {
-  const statuses: InterventionStatus[] = ["blocked", "input", "stopped", "inspect", "needed", "working", "idle"];
+  const statuses: InterventionStatus[] = ["blocked", "input", "inspect", "working", "needed", "stopped", "idle"];
   return statuses
     .flatMap((status) => {
       const count = summary.counts[status] ?? 0;
@@ -630,7 +633,7 @@ function interventionReasonForRow(row: SessionRow, status: InterventionStatus) {
     case "needed":
       return "needs your attention";
     case "working":
-      return "working quietly";
+      return "running quietly";
     case "idle":
       return "last task completed";
   }

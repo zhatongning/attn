@@ -718,6 +718,13 @@ fn observation_from_thread(
         observation = observation.with_thread_source(thread_source);
     }
 
+    if let Some(parent_session_id) = jsonl_observation
+        .as_ref()
+        .and_then(|observation| observation.parent_session_id.clone())
+    {
+        observation = observation.with_parent_session_id(parent_session_id);
+    }
+
     if let Some(project_name) = project_name {
         observation = observation.with_project_name(project_name);
     }
@@ -886,11 +893,29 @@ fn codex_state_db_path_from_home(home: &Path) -> PathBuf {
         .join(".codex")
         .join("sqlite")
         .join("state_5.sqlite");
-    if current_path.exists() {
+    let legacy_path = home.join(".codex").join("state_5.sqlite");
+    let current_exists = current_path.exists();
+    let legacy_exists = legacy_path.exists();
+    if current_exists && legacy_exists {
+        if codex_state_db_modified_at(&legacy_path) > codex_state_db_modified_at(&current_path) {
+            return legacy_path;
+        }
         return current_path;
     }
+    if current_exists {
+        return current_path;
+    }
+    if legacy_exists {
+        return legacy_path;
+    }
 
-    home.join(".codex").join("state_5.sqlite")
+    legacy_path
+}
+
+fn codex_state_db_modified_at(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn codex_hook_events_path() -> PathBuf {
@@ -1516,6 +1541,45 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_subagent_thread_preserves_parent_session_id_from_jsonl() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/17");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-17T18-08-11-019child.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-17T10:08:11.000Z","type":"session_meta","payload":{"id":"019child","parent_thread_id":"019parent","cwd":"/Users/edy/hose/tmc/MOS","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019parent","depth":1}}}},"thread_source":"subagent"}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-17T10:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(format!(
+                "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
+                 values ('019child', '{}', 1781690891, 1781691600, 'vscode', 'OpenAI', '/Users/edy/hose/tmc/MOS', 'Review Task 2 implementation', '{{\"type\":\"disabled\"}}', 'never', 1781691600000, 'subagent', 'Review Task 2 implementation');",
+                rollout_path.display()
+            ))
+            .status()
+            .expect("insert thread");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_692_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thread_source.as_deref(), Some("subagent"));
+        assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
+    }
+
+    #[test]
     fn sqlite_thread_update_after_task_complete_marks_completion_as_read() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
@@ -2020,7 +2084,7 @@ mod tests {
     }
 
     #[test]
-    fn default_state_db_path_prefers_current_sqlite_directory() {
+    fn default_state_db_path_prefers_newest_known_state_db() {
         let temp = tempdir().expect("temp dir");
         let legacy_db = temp.path().join(".codex/state_5.sqlite");
         let current_db = temp.path().join(".codex/sqlite/state_5.sqlite");
@@ -2028,6 +2092,41 @@ mod tests {
         fs::create_dir_all(legacy_db.parent().expect("legacy db parent")).expect("legacy db dir");
         fs::write(&legacy_db, "").expect("legacy db");
         fs::write(&current_db, "").expect("current db");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171800"])
+            .arg(&legacy_db)
+            .status()
+            .expect("set legacy mtime");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171500"])
+            .arg(&current_db)
+            .status()
+            .expect("set current mtime");
+
+        let selected = super::codex_state_db_path_from_home(temp.path());
+
+        assert_eq!(selected, legacy_db);
+    }
+
+    #[test]
+    fn default_state_db_path_keeps_current_sqlite_when_at_least_as_new() {
+        let temp = tempdir().expect("temp dir");
+        let legacy_db = temp.path().join(".codex/state_5.sqlite");
+        let current_db = temp.path().join(".codex/sqlite/state_5.sqlite");
+        fs::create_dir_all(current_db.parent().expect("current db parent")).expect("current db dir");
+        fs::create_dir_all(legacy_db.parent().expect("legacy db parent")).expect("legacy db dir");
+        fs::write(&legacy_db, "").expect("legacy db");
+        fs::write(&current_db, "").expect("current db");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171500"])
+            .arg(&legacy_db)
+            .status()
+            .expect("set legacy mtime");
+        std::process::Command::new("touch")
+            .args(["-t", "202606171800"])
+            .arg(&current_db)
+            .status()
+            .expect("set current mtime");
 
         let selected = super::codex_state_db_path_from_home(temp.path());
 
