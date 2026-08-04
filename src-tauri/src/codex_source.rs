@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 
-const UNREAD_COMPLETION_TRACKING_START: &str = "2026-06-05T08:00:00.000Z";
+const UNREAD_COMPLETION_RETENTION: Duration = Duration::from_secs(12 * 60 * 60);
 const SESSION_TAIL_READ_BYTES: u64 = 128 * 1024;
 const HOOK_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(15 * 60);
 
@@ -310,18 +310,15 @@ fn parse_session_content(
         .and_then(parse_utc_timestamp)
         .and_then(|last_activity| now.duration_since(last_activity).ok())
         .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
-    let is_tracked_unread_completion = latest_timestamp
+    let is_recent_unread_completion = latest_timestamp
         .as_deref()
-        .zip(parse_utc_timestamp(UNREAD_COMPLETION_TRACKING_START))
-        .and_then(|(last_activity_at, tracking_start)| {
-            parse_utc_timestamp(last_activity_at)
-                .map(|last_activity| last_activity.duration_since(tracking_start).is_ok())
-        })
-        .unwrap_or(false);
+        .and_then(parse_utc_timestamp)
+        .and_then(|last_activity| now.duration_since(last_activity).ok())
+        .is_some_and(|age| age <= UNREAD_COMPLETION_RETENTION);
     let kind = if pending_tool_approval.is_some() {
         ObservationKind::WaitingForInput
     } else if matches!(last_activity_kind, ObservationKind::Completed) {
-        if !external_import_session && is_tracked_unread_completion {
+        if !external_import_session && is_recent_unread_completion {
             ObservationKind::CompletedImmediate
         } else {
             ObservationKind::CompletedStale
@@ -1236,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_unread_task_complete_after_inspect_window_as_immediate_completion() {
+    fn unread_task_complete_within_twelve_hours_stays_immediate() {
         let temp = tempdir().expect("temp dir");
         let session_dir = temp.path().join("2026/06/05");
         fs::create_dir_all(&session_dir).expect("session dir");
@@ -1253,11 +1250,36 @@ mod tests {
         let rows = discover_codex_observations_with_now(
             temp.path(),
             20,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_652_000),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_690_799),
         );
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
+    }
+
+    #[test]
+    fn unread_task_complete_after_twelve_hours_is_stale() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-05T16-00-00-019done-stale.jsonl"),
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019done-stale","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_690_801),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedStale);
     }
 
     #[test]
@@ -1296,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn treats_task_complete_before_tracking_baseline_as_stale_completed() {
+    fn treats_task_complete_after_unread_retention_as_stale_completed() {
         let temp = tempdir().expect("temp dir");
         let session_dir = temp.path().join("2026/06/03");
         fs::create_dir_all(&session_dir).expect("session dir");
@@ -1313,7 +1335,7 @@ mod tests {
         let rows = discover_codex_observations_with_now(
             temp.path(),
             20,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_466_400),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_500_001),
         );
 
         assert_eq!(rows.len(), 1);

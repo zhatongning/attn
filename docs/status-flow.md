@@ -86,20 +86,19 @@ These are the rules implemented today.
 
 | JSONL evidence | Source observation |
 | --- | --- |
-| Last relevant event is `task_complete` and the signal is unread | `CompletedImmediate` |
+| Last relevant event is `task_complete`, the signal is unread, and completion is at most 12 hours old | `CompletedImmediate` |
 | Last relevant event is `turn_aborted` | `Stopped` |
 | Last relevant event after `task_complete` is `user_message` or `agent_message`, and it is recent | `Running` |
 | Recent activity but no terminal event | `Running` |
 | Old activity with no terminal event | `InsufficientEvidence` |
 
-Completion attention is read-driven, not completion-age-driven:
+Completion attention is time-bounded and read-driven:
 
-- `inspect`: completed result has not been opened/read yet.
+- `inspect`: completed result is at most 12 hours old and has not been opened/read yet.
 - `follow-up`: completed result was opened/read within the last 30 minutes.
-- `idle`: completed result was opened/read more than 30 minutes ago.
+- `idle`: completed result is older than 12 hours, or was opened/read more than 30 minutes ago.
 
-To avoid flooding the panel with historical completions, unread-completion tracking has a migration baseline:
-completion events before `2026-06-05T08:00:00Z` are treated as old history and stay quiet unless newer source evidence appears.
+Unread-completion retention is 12 hours. After this window, a terminal unread completion becomes `CompletedStale` and stays quiet unless newer source evidence appears.
 
 Generic non-terminal activity is still considered recent for 2 hours.
 
@@ -108,7 +107,7 @@ Generic non-terminal activity is still considered recent for 2 hours.
 | SQLite/thread evidence | Source observation |
 | --- | --- |
 | JSONL says `CompletedImmediate`, `Completed`, `Failed`, or `WaitingForInput` | Use JSONL terminal/input state. |
-| JSONL says unread `task_complete` | Keep as `CompletedImmediate` until read. |
+| JSONL says unread `task_complete` within 12 hours | Keep as `CompletedImmediate` until read or the 12-hour retention window expires. |
 | SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat the completed result as read/opened and apply the 30-minute `follow-up` window from `updated_at_ms`. |
 | Thread is archived without explicit unread completion evidence | Apply completion-age fallback, usually `CompletedStale` for old archived threads. |
 | Desktop thread has recent activity | `Running` |
@@ -202,6 +201,7 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 | --- | --- |
 | Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `follow-up` for 30 minutes. |
 | Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
+| Unread completion exceeds 12 hours | Show the row as `idle` until newer source evidence arrives. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `running` or `idle` | No state transition. |
 | Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the display status becomes `running` or `follow-up`. |
@@ -214,8 +214,8 @@ If the same session gets newer activity, the read acknowledgement no longer appl
 
 These are the areas that currently feel wrong or need product decisions.
 
-1. Completion attention is read-bounded.
-   A completed result stays `inspect` until opened/read, then shows `follow-up` for 30 minutes, then `idle`.
+1. Completion attention is bounded by freshness and read state.
+   A completed result stays `inspect` for at most 12 hours unless opened/read earlier; reading shows `follow-up` for 30 minutes, then `idle`.
 
 2. `inspect` still combines successful completion and failure/manual-clear cases.
    These may need separate reasons later, but the shared user action is still "open and inspect."
@@ -260,7 +260,7 @@ We should decide these before more code changes.
    Current behavior keeps `running` visible because live work is important context, but moves `idle` into the quiet count because it does not require action.
 
 5. What is the retention rule for completed sessions?
-   Current decision: completions older than 30 minutes become `idle`.
+   Current decision: unread completions older than 12 hours become `idle`; acknowledged completions become `idle` after their 30-minute follow-up window.
 
 6. How should the hook writer be installed?
    Current implementation provides `scripts/attn-codex-hook.cjs`, reads its output, and can merge user-level `~/.codex/hooks.json` after the user confirms from the management page.
@@ -277,8 +277,9 @@ stateDiagram-v2
     Working --> Inspect: unread task_complete
     Inspect --> Needed: user opens/reads result
     Inspect --> Needed: SQLite updated_at_ms advances after task_complete
+    Inspect --> Idle: unread window exceeds 12 hours
     Needed --> Idle: read window exceeds 30 minutes
-    Working --> Idle: migrated old task_complete
+    Working --> Idle: task_complete older than 12 hours
     Working --> Idle: old activity without intervention signal
     Working --> Input: waiting for user intervention
     Working --> Blocked: actionable failure/source issue
