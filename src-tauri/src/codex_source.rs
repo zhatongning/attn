@@ -41,6 +41,13 @@ struct PendingToolApproval {
     evidence_summary: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingStructuredUserInput {
+    call_id: Option<String>,
+    timestamp: Option<String>,
+    evidence_summary: String,
+}
+
 pub fn discover_codex_observations(sessions_root: &Path, limit: usize) -> Vec<SourceObservation> {
     let state_db = codex_state_db_path();
     if state_db.exists() {
@@ -196,6 +203,7 @@ fn parse_session_content(
     let mut last_activity_kind = ObservationKind::InsufficientEvidence;
     let mut last_agent_message = None;
     let mut pending_tool_approval = None;
+    let mut pending_structured_user_input = None;
     let mut external_import_session = false;
 
     for line in content
@@ -257,6 +265,7 @@ fn parse_session_content(
                         .or(task_completed_at);
                 } else if event_type == Some("turn_aborted") {
                     pending_tool_approval = None;
+                    pending_structured_user_input = None;
                     last_activity_kind = ObservationKind::Stopped;
                 } else if matches!(event_type, Some("user_message" | "agent_message")) {
                     last_activity_kind = ObservationKind::Running;
@@ -284,14 +293,26 @@ fn parse_session_content(
                 if let Some(approval) = pending_tool_approval_from_response_item(&value) {
                     last_activity_kind = ObservationKind::WaitingForInput;
                     pending_tool_approval = Some(approval);
+                } else if let Some(request) = pending_structured_user_input_from_response_item(&value) {
+                    last_activity_kind = ObservationKind::WaitingForInput;
+                    pending_structured_user_input = Some(request);
                 } else if response_item_payload_type(&value) == Some("function_call_output") {
                     if let Some(call_id) = response_item_call_id(&value) {
                         let resolves_pending_approval = pending_tool_approval
                             .as_ref()
                             .and_then(|approval: &PendingToolApproval| approval.call_id.as_deref())
                             .is_some_and(|pending_call_id| pending_call_id == call_id);
+                        let resolves_pending_structured_user_input = pending_structured_user_input
+                            .as_ref()
+                            .and_then(|request: &PendingStructuredUserInput| request.call_id.as_deref())
+                            .is_some_and(|pending_call_id| pending_call_id == call_id);
                         if resolves_pending_approval {
                             pending_tool_approval = None;
+                        }
+                        if resolves_pending_structured_user_input {
+                            pending_structured_user_input = None;
+                        }
+                        if resolves_pending_approval || resolves_pending_structured_user_input {
                             last_activity_kind = ObservationKind::Running;
                         }
                     }
@@ -315,7 +336,15 @@ fn parse_session_content(
         .and_then(parse_utc_timestamp)
         .and_then(|last_activity| now.duration_since(last_activity).ok())
         .is_some_and(|age| age <= UNREAD_COMPLETION_RETENTION);
-    let kind = if pending_tool_approval.is_some() {
+    let pending_input = pending_structured_user_input
+        .as_ref()
+        .map(|request| (request.timestamp.clone(), request.evidence_summary.clone()))
+        .or_else(|| {
+            pending_tool_approval
+                .as_ref()
+                .map(|approval| (approval.timestamp.clone(), approval.evidence_summary.clone()))
+        });
+    let kind = if pending_input.is_some() {
         ObservationKind::WaitingForInput
     } else if matches!(last_activity_kind, ObservationKind::Completed) {
         if !external_import_session && is_recent_unread_completion {
@@ -343,9 +372,9 @@ fn parse_session_content(
         .or_else(|| project_name.as_ref().map(|name| format!("Codex: {name}")))
         .unwrap_or_else(|| format!("Codex session {session_id}"));
 
-    let evidence_summary = pending_tool_approval
+    let evidence_summary = pending_input
         .as_ref()
-        .map(|approval| approval.evidence_summary.clone())
+        .map(|(_, summary)| summary.clone())
         .or_else(|| last_agent_message.map(|message| truncate_for_summary(&message, 120)))
         .or_else(|| Some("local Codex JSONL activity observed".to_string()));
 
@@ -369,9 +398,9 @@ fn parse_session_content(
         observation = observation.with_workspace(cwd);
     }
 
-    if let Some(timestamp) = pending_tool_approval
+    if let Some(timestamp) = pending_input
         .as_ref()
-        .and_then(|approval| approval.timestamp.clone())
+        .and_then(|(timestamp, _)| timestamp.clone())
         .or(latest_timestamp)
     {
         observation = observation.with_last_activity(timestamp);
@@ -438,6 +467,33 @@ fn pending_tool_approval_from_response_item(value: &Value) -> Option<PendingTool
         call_id: response_item_call_id(value).map(ToString::to_string),
         timestamp,
         evidence_summary: format!("Codex is waiting for tool approval: {requested_action}"),
+    })
+}
+
+fn pending_structured_user_input_from_response_item(
+    value: &Value,
+) -> Option<PendingStructuredUserInput> {
+    if response_item_payload_type(value) != Some("function_call") {
+        return None;
+    }
+
+    let payload = value.get("payload")?;
+    if payload.get("name").and_then(Value::as_str) != Some("request_user_input") {
+        return None;
+    }
+
+    let call_id = response_item_call_id(value)?.trim();
+    if call_id.is_empty() {
+        return None;
+    }
+
+    Some(PendingStructuredUserInput {
+        call_id: Some(call_id.to_string()),
+        timestamp: value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        evidence_summary: "Codex is waiting for structured user input".to_string(),
     })
 }
 
@@ -1427,6 +1483,123 @@ mod tests {
             rows[1].last_activity_at.as_deref(),
             Some("2026-06-06T04:05:00.000Z")
         );
+    }
+
+    #[test]
+    fn unresolved_structured_user_input_marks_session_waiting_for_input() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/04");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-08-04T04-00-00-019structured-input.jsonl"),
+            r#"{"timestamp":"2026-08-04T04:00:00.000Z","type":"session_meta","payload":{"id":"019structured-input","cwd":"/Users/edy/project-input","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"id\":\"confirm\",\"question\":\"Continue?\"}]}","call_id":"call_input"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_817_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-08-04T04:05:00.000Z")
+        );
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("Codex is waiting for structured user input")
+        );
+    }
+
+    #[test]
+    fn structured_user_input_output_clears_waiting_for_input() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/04");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-08-04T04-00-00-019structured-input-cleared.jsonl"),
+            r#"{"timestamp":"2026-08-04T04:00:00.000Z","type":"session_meta","payload":{"id":"019structured-input-cleared","cwd":"/Users/edy/project-input","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"id\":\"confirm\",\"question\":\"Continue?\"}]}","call_id":"call_input"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:06:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_input","output":"{\"confirm\":\"yes\"}"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_817_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+    }
+
+    #[test]
+    fn unavailable_structured_user_input_is_not_waiting_for_input() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/04");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-08-04T04-00-00-019structured-input-unavailable.jsonl"),
+            r#"{"timestamp":"2026-08-04T04:00:00.000Z","type":"session_meta","payload":{"id":"019structured-input-unavailable","cwd":"/Users/edy/project-input","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"id\":\"confirm\",\"question\":\"Continue?\"}]}","call_id":"call_input"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:06:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_input","output":"request_user_input is unavailable in Default mode"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_817_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+    }
+
+    #[test]
+    fn interrupted_structured_user_input_is_stopped() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/04");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-08-04T04-00-00-019structured-input-interrupted.jsonl"),
+            r#"{"timestamp":"2026-08-04T04:00:00.000Z","type":"session_meta","payload":{"id":"019structured-input-interrupted","cwd":"/Users/edy/project-input","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"id\":\"confirm\",\"question\":\"Continue?\"}]}","call_id":"call_input"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-04T04:06:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_817_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows[0].kind, ObservationKind::Stopped);
     }
 
     #[test]

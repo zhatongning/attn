@@ -235,8 +235,8 @@ These are the areas that currently feel wrong or need product decisions.
 7. TODO: Find a reliable read/open evidence source for Codex Desktop history navigation.
    Current local evidence is insufficient to prove an `inspect` row was read when the user opens that thread directly inside Codex Desktop. `threads.updated_at_ms` does not always advance, `threads` has no `read_at`/`seen_at` field, `logs_2.sqlite` has execution logs but no reliable post-completion read event, and generic UI click/Sentry data is not safely attributable to a specific session. Hooks are useful for execution lifecycle state, but they do not currently prove UI-level read/open actions.
 
-8. TODO: Evaluate natural-language confirmation requests as weak `input` evidence.
-   Assistant text such as "if you agree, I will..." or "please confirm before I continue" may indicate the session is waiting for user intervention. This should be treated as inferred evidence only, not as strong as tool approval or structured Codex events. Any implementation needs conservative wording rules to avoid confusing optional offers such as "if you want, I can also..." with true blockers.
+8. Structured user-input requests are exact `input` evidence.
+   An unresolved JSONL `request_user_input` function call becomes `attention`. A matching `function_call_output`, including a cancellation or an `unavailable` result, clears that state. Assistant prose such as "if you agree, I will..." or "please confirm before I continue" remains intentionally unclassified, so optional offers cannot create a false alert.
 
 ## Open Product Decisions
 
