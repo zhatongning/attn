@@ -26,11 +26,12 @@ const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelC
 const PANEL_POSITION_STORAGE_KEY = "attn.panelPosition";
 const PANEL_WIDTH = 420;
 const MANAGEMENT_HEIGHT = 420;
-const PANEL_BASE_HEIGHT = 124;
+const PANEL_BASE_HEIGHT = 128;
 const PANEL_BASE_VISIBLE_ITEMS = 1;
-const PANEL_EXTRA_ROW_HEIGHT = 42;
+const PANEL_EXTRA_ROW_HEIGHT = 49;
 const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PANEL_EXTRA_ROW_HEIGHT;
-const PANEL_MESSAGE_HEIGHT = 30;
+const PANEL_MESSAGE_HEIGHT = 32;
+const PANEL_MAX_HEIGHT = 420;
 const PANEL_STRIP_HEIGHT = 50;
 const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "working"];
 const AUTO_COLLAPSE_STATUS_SET = new Set<InterventionStatus>(AUTO_COLLAPSE_STATUS_OPTIONS);
@@ -61,6 +62,8 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
   const hasPanelMessage = commandMessage !== null || errorMessage !== null;
+  const panelHeight = panelWindowHeight(displayedRows.length, hasPanelMessage);
+  const shouldScrollStatusList = panelHeight >= PANEL_MAX_HEIGHT;
   const shouldKeepPanelOpenForStatus = useMemo(() => {
     return hasPreventAutoCollapseStatus(model, config);
   }, [config, model]);
@@ -152,10 +155,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     const nextHeight = view === "management"
       ? MANAGEMENT_HEIGHT
       : panelOpen
-        ? panelWindowHeight(displayedRows.length, hasPanelMessage)
+        ? panelHeight
         : PANEL_STRIP_HEIGHT;
     void resizePanelWindow(nextHeight);
-  }, [displayedRows.length, hasPanelMessage, panelOpen, view]);
+  }, [panelHeight, panelOpen, view]);
 
   useEffect(() => {
     const previousSignature = alertSignatureRef.current;
@@ -493,7 +496,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
       {panelOpen ? (
         <>
           <section
-            className={`status-list${expanded ? " status-list--expanded" : ""}`}
+            className={`status-list${expanded ? " status-list--expanded" : ""}${shouldScrollStatusList ? " status-list--scrollable" : ""}`}
             aria-label="Codex status panel"
           >
             {displayedRows.length === 0 ? (
@@ -941,7 +944,7 @@ function panelWindowHeight(visibleItemCount: number, hasMessage = false) {
   );
 
   return Math.min(
-    420,
+    PANEL_MAX_HEIGHT,
     baseHeight + (hasMessage ? PANEL_MESSAGE_HEIGHT : 0),
   );
 }

@@ -827,7 +827,29 @@ describe("StatusPanelView", () => {
     });
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 292,
+        height: 324,
+        width: 420,
+      }));
+    });
+  });
+
+  it("makes the status list scrollable when configured rows reach the window height cap", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 8 }));
+    const rows: SessionRow[] = Array.from({ length: 8 }, (_, index) => ({
+      ...initialSessions[0],
+      sessionId: `capped-row-${index + 1}`,
+      label: `Capped row ${index + 1}`,
+      state: "running",
+      statusReason: "running signal observed",
+    }));
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    expect(screen.getByLabelText("Codex status panel").className).toContain("status-list--scrollable");
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 420,
         width: 420,
       }));
     });
@@ -861,7 +883,7 @@ describe("StatusPanelView", () => {
     expandPanel();
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 124,
+        height: 128,
         width: 420,
       }));
     });
@@ -902,7 +924,7 @@ describe("StatusPanelView", () => {
     expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 154,
+        height: 160,
         width: 420,
       }));
     });
@@ -1370,6 +1392,14 @@ describe("StatusPanelView", () => {
     expect(css).toContain("width: min(100vw - 8px, 412px);");
     expect(css).toContain("max-height: calc(100vh - 8px);");
     expect(css).toContain("inset 0 1px 0 rgba(171, 178, 191, 0.08);");
+  });
+
+  it("keeps the native minimum height aligned with the collapsed strip", () => {
+    // @ts-expect-error This test reads local JSON without adding Node types to the app build.
+    const tauriConfig = JSON.parse(readFileSync(join(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"));
+
+    expect(tauriConfig.app.windows[0].minHeight).toBe(50);
+    expect(tauriConfig.app.windows[0].maxHeight).toBe(420);
   });
 
   it("keeps the strip toggle from shifting header layout", () => {

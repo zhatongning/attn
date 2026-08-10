@@ -200,7 +200,8 @@ p {
   padding-left: 2px;
 }
 
-.status-list--expanded {
+.status-list--expanded,
+.status-list--scrollable {
   overflow-y: auto;
 }
 
