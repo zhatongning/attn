@@ -523,6 +523,7 @@ struct ThreadSummary {
     agent_nickname: Option<String>,
     thread_source: Option<String>,
     preview: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Option<Vec<ThreadSummary>> {
@@ -545,10 +546,17 @@ fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Option<Vec<T
         return None;
     }
 
-    Some(String::from_utf8_lossy(&output.stdout)
+    let mut threads = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_thread_summary_json)
-        .collect())
+        .collect::<Vec<_>>();
+    let session_ids = threads.iter().map(|thread| thread.id.clone()).collect::<Vec<_>>();
+    let parent_session_ids = discover_parent_session_ids_from_state_db(state_db, &session_ids);
+    for thread in &mut threads {
+        thread.parent_session_id = parent_session_ids.get(&thread.id).cloned();
+    }
+
+    Some(threads)
 }
 
 fn discover_thread_from_state_db_by_id(state_db: &Path, session_id: &str) -> Option<ThreadSummary> {
@@ -569,9 +577,67 @@ fn discover_thread_from_state_db_by_id(state_db: &Path, session_id: &str) -> Opt
         return None;
     }
 
+    let mut thread = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(parse_thread_summary_json)?;
+    let parent_session_ids = discover_parent_session_ids_from_state_db(
+        state_db,
+        std::slice::from_ref(&thread.id),
+    );
+    thread.parent_session_id = parent_session_ids.get(&thread.id).cloned();
+    Some(thread)
+}
+
+fn discover_parent_session_ids_from_state_db(
+    state_db: &Path,
+    child_session_ids: &[String],
+) -> HashMap<String, String> {
+    if child_session_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let child_session_ids = child_session_ids
+        .iter()
+        .map(|session_id| format!("'{}'", sqlite_string_literal(session_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "select json_object(
+        'child_thread_id', child_thread_id,
+        'parent_thread_id', parent_thread_id
+    ) from thread_spawn_edges
+    where child_thread_id in ({child_session_ids})
+      and parent_thread_id is not null;"
+    );
+    let Ok(output) = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-readonly")
+        .arg(state_db)
+        .arg(query)
+        .output()
+    else {
+        return HashMap::new();
+    };
+
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .find_map(parse_thread_summary_json)
+        .filter_map(parse_parent_session_id_json)
+        .collect()
+}
+
+fn parse_parent_session_id_json(line: &str) -> Option<(String, String)> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let child_session_id = value.get("child_thread_id")?.as_str()?.trim();
+    let parent_session_id = value.get("parent_thread_id")?.as_str()?.trim();
+    if child_session_id.is_empty() || parent_session_id.is_empty() {
+        return None;
+    }
+
+    Some((child_session_id.to_string(), parent_session_id.to_string()))
 }
 
 fn thread_summary_json_select() -> &'static str {
@@ -629,6 +695,7 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
         agent_nickname,
         thread_source,
         preview,
+        parent_session_id: None,
     })
 }
 
@@ -774,6 +841,7 @@ fn observation_from_thread(
     if let Some(parent_session_id) = jsonl_observation
         .as_ref()
         .and_then(|observation| observation.parent_session_id.clone())
+        .or(thread.parent_session_id)
     {
         observation = observation.with_parent_session_id(parent_session_id);
     }
@@ -1771,6 +1839,53 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].thread_source.as_deref(), Some("subagent"));
+        assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
+    }
+
+    #[test]
+    fn sqlite_subagent_thread_uses_spawn_edge_when_tail_omits_session_metadata() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/17");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-17T18-08-11-019child.jsonl");
+        let mut session_content = r#"{"timestamp":"2026-06-17T10:08:11.000Z","type":"session_meta","payload":{"id":"019child","parent_thread_id":"019parent","cwd":"/Users/edy/hose/tmc/MOS","thread_source":"subagent"}}"#
+            .to_string();
+        session_content.push('\n');
+        session_content.push_str(&"x".repeat(super::SESSION_TAIL_READ_BYTES as usize + 1));
+        session_content.push('\n');
+        session_content.push_str(
+            r#"{"timestamp":"2026-06-17T10:20:00.000Z","type":"event_msg","payload":{"type":"turn_aborted"}}"#,
+        );
+        session_content.push('\n');
+        fs::write(&rollout_path, session_content).expect("session file");
+
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019child",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hose/tmc/MOS",
+            "Review Task 2 implementation",
+            1_781_691_600_000,
+        );
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(
+                "create table thread_spawn_edges (child_thread_id text primary key, parent_thread_id text not null);\n                 insert into thread_spawn_edges (child_thread_id, parent_thread_id) values ('019child', '019parent');",
+            )
+            .status()
+            .expect("create spawn edge");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_692_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Stopped);
         assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
     }
 

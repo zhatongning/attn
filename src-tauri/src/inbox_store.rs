@@ -665,7 +665,7 @@ fn apply_acknowledged_session_state(
         return SessionRow {
             state: SessionState::NeedsAttention,
             confidence: Confidence::Exact,
-            status_reason: "Read recently; keep in needed state until 30 minutes pass.".to_string(),
+            status_reason: "Read recently; keep it quiet during the 30-minute follow-up window.".to_string(),
             handled: true,
             dismissed: false,
             ..row
@@ -2436,7 +2436,7 @@ mod tests {
             SessionRow::new("needed", "Follow-up", SessionState::NeedsAttention, Confidence::Exact)
                 .with_workspace(Some("/repo".to_string()))
                 .with_jump_target(JumpTarget::Desktop)
-                .with_reason("Read recently; keep in needed state until 30 minutes pass.")
+                .with_reason("Read recently; keep it quiet during the 30-minute follow-up window.")
                 .with_last_activity("2026-06-06T04:03:00.000Z"),
             SessionRow::new("stopped", "Stopped", SessionState::Stopped, Confidence::Exact)
                 .with_workspace(Some("/repo".to_string()))
@@ -2523,7 +2523,10 @@ mod tests {
         assert_eq!(confirmed_row.confidence, Confidence::Exact);
         assert!(confirmed_row.handled);
         assert!(!confirmed_row.dismissed);
-        assert!(confirmed_row.status_reason.contains("Read recently"));
+        assert_eq!(
+            confirmed_row.status_reason,
+            "Read recently; keep it quiet during the 30-minute follow-up window."
+        );
 
         let row = SessionRow::new("s6", "Needs input", SessionState::Inspect, Confidence::Exact)
             .with_last_activity("2026-06-04T04:00:00.000Z");

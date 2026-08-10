@@ -24,24 +24,16 @@ import {
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
 const PANEL_POSITION_STORAGE_KEY = "attn.panelPosition";
-const PANEL_WIDTH = 560;
+const PANEL_WIDTH = 420;
 const MANAGEMENT_HEIGHT = 420;
-const PANEL_BASE_HEIGHT = 252;
-const PANEL_BASE_VISIBLE_ITEMS = 3;
-const PANEL_EXTRA_ROW_HEIGHT = 48;
+const PANEL_BASE_HEIGHT = 124;
+const PANEL_BASE_VISIBLE_ITEMS = 1;
+const PANEL_EXTRA_ROW_HEIGHT = 42;
 const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PANEL_EXTRA_ROW_HEIGHT;
 const PANEL_MESSAGE_HEIGHT = 30;
-const PANEL_STRIP_HEIGHT = 60;
-const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "needed", "working"];
-const CONFIGURABLE_STATUSES = new Set<InterventionStatus>([
-  "blocked",
-  "input",
-  "inspect",
-  "stopped",
-  "needed",
-  "working",
-  "idle",
-]);
+const PANEL_STRIP_HEIGHT = 50;
+const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "working"];
+const AUTO_COLLAPSE_STATUS_SET = new Set<InterventionStatus>(AUTO_COLLAPSE_STATUS_OPTIONS);
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
@@ -617,6 +609,22 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }
 
   function hiddenToggleLabel() {
+    const hiddenPinnedCount = model.expandableHiddenRows.filter(
+      (row) => row.pinned && row.statusTone === "quiet",
+    ).length;
+    const hiddenAlertCount = model.expandableHiddenCount - hiddenPinnedCount;
+    const hiddenQuietCount = model.quietHiddenCount - hiddenPinnedCount;
+
+    if (hiddenPinnedCount > 0) {
+      const alertLabel = hiddenAlertCount > 0
+        ? `+${hiddenAlertCount} ${model.copy.hiddenAlertsLabel}, `
+        : "";
+      const quietLabel = hiddenQuietCount > 0
+        ? `, +${hiddenQuietCount} ${model.copy.quietLabel}`
+        : "";
+      return `${alertLabel}+${hiddenPinnedCount} ${model.copy.hiddenPinnedLabel}${quietLabel}`;
+    }
+
     if (model.quietHiddenCount > 0 && model.quietHiddenCount === model.hiddenCount) {
       return `+${model.quietHiddenCount} ${model.copy.quietLabel}`;
     }
@@ -1025,7 +1033,7 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
 
   const statusColors = isObject(value.statusColors) ? value.statusColors : {};
   const preventAutoCollapseStatuses = Array.isArray(value.preventAutoCollapseStatuses)
-    ? value.preventAutoCollapseStatuses.filter(isConfigurableStatus)
+    ? value.preventAutoCollapseStatuses.filter(isAutoCollapseStatus)
     : defaultStatusPanelConfig.preventAutoCollapseStatuses;
   const visibleItemCount = typeof value.visibleItemCount === "number"
     ? Math.min(8, Math.max(1, value.visibleItemCount))
@@ -1062,8 +1070,8 @@ function hasPreventAutoCollapseStatus(
   return [...model.visibleRows, ...model.hiddenRows].some((row) => statuses.has(row.displayStatus));
 }
 
-function isConfigurableStatus(value: unknown): value is InterventionStatus {
-  return typeof value === "string" && CONFIGURABLE_STATUSES.has(value as InterventionStatus);
+function isAutoCollapseStatus(value: unknown): value is InterventionStatus {
+  return typeof value === "string" && AUTO_COLLAPSE_STATUS_SET.has(value as InterventionStatus);
 }
 
 function colorValue(value: unknown, fallback: string) {

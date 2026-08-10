@@ -350,7 +350,7 @@ describe("codexSessionsDevSource", () => {
     expect(rows[0]).toMatchObject({
       sessionId: "019read-signal",
       state: "needsAttention",
-      statusReason: "completed task still needs your attention",
+      statusReason: "completed task was opened; keep it quiet during the 30-minute follow-up window",
       lastActivityAt: "2026-06-06T04:10:00.000Z",
     });
   });
@@ -452,7 +452,7 @@ describe("codexSessionsDevSource", () => {
     expect(source.discoverCodexSessions()[0]).toMatchObject({
       sessionId: "019read-window",
       state: "needsAttention",
-      statusReason: "Read recently; keep in needed state until 30 minutes pass.",
+      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
       handled: true,
     });
 

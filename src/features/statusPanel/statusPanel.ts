@@ -61,6 +61,7 @@ export interface StatusPanelCopy {
   idleLabel: string;
   quietLabel: string;
   hiddenAlertsLabel: string;
+  hiddenPinnedLabel: string;
   collapseLabel: string;
   managementTitle: string;
   languageLabel: string;
@@ -124,10 +125,10 @@ export const defaultStatusPanelConfig: StatusPanelConfig = {
   styleFamily: "atom",
   palette: "oneDark",
   language: "en",
-  visibleItemCount: 3,
+  visibleItemCount: 1,
   panelMode: "auto",
   autoCollapseDelayMs: 8000,
-  preventAutoCollapseStatuses: ["inspect"],
+  preventAutoCollapseStatuses: [],
   statusColors: {
     blocked: "#e06c75",
     input: "#c678dd",
@@ -165,7 +166,7 @@ export const atomInterventionTheme: AtomInterventionTheme = {
     },
     needed: {
       label: "follow-up",
-      marker: "●",
+      marker: "○",
       color: defaultStatusPanelConfig.statusColors.needed,
     },
     working: {
@@ -185,9 +186,9 @@ const statusPriority: Record<InterventionStatus, number> = {
   blocked: 0,
   input: 1,
   inspect: 2,
-  working: 3,
-  needed: 4,
-  stopped: 5,
+  needed: 3,
+  stopped: 4,
+  working: 5,
   idle: 6,
 };
 
@@ -219,6 +220,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     idleLabel: "idle",
     quietLabel: "quiet",
     hiddenAlertsLabel: "alerts",
+    hiddenPinnedLabel: "pinned",
     collapseLabel: "collapse",
     managementTitle: "management",
     languageLabel: "Language",
@@ -302,6 +304,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     idleLabel: "空闲",
     quietLabel: "安静",
     hiddenAlertsLabel: "需关注",
+    hiddenPinnedLabel: "已固定",
     collapseLabel: "收起",
     managementTitle: "设置",
     languageLabel: "语言",
@@ -384,15 +387,32 @@ export function buildStatusPanelModel(
     .filter(shouldIncludeInWatchlist)
     .map((row) => toPanelRow(row, theme, copy))
   const rolledUpRows = rollUpSubagentRows(panelRows, copy).sort(comparePanelRows);
-  const cardRows = rolledUpRows.filter((row) => row.pinned || row.displayStatus !== "idle");
+  const cardRows = rolledUpRows.filter(
+    (row) => row.pinned || row.statusTone === "alert" || row.displayStatus === "working",
+  );
+  const followUpRows = rolledUpRows.filter(
+    (row) => !row.pinned && row.displayStatus === "needed",
+  );
   const quietRows = rolledUpRows.filter((row) => row.statusTone === "quiet");
-  const visibleRows = cardRows.slice(0, config.visibleItemCount);
+  const visibleCardRows = cardRows.slice(0, config.visibleItemCount);
+  const followUpSlots = Math.max(0, config.visibleItemCount - visibleCardRows.length);
+  const visibleFollowUpRows = followUpRows.slice(0, followUpSlots);
+  const visibleRows = [...visibleCardRows, ...visibleFollowUpRows];
   const hiddenRows = cardRows.slice(config.visibleItemCount);
-  const expandableHiddenRows = hiddenRows.filter((row) => row.statusTone === "alert");
-  const hiddenIdleCount = rolledUpRows.filter((row) => !row.pinned && row.displayStatus === "idle").length;
-  const hiddenCount = hiddenRows.length + hiddenIdleCount;
+  const expandableHiddenRows = hiddenRows.filter(
+    (row) => row.statusTone === "alert" || row.pinned,
+  );
+  const hiddenFollowUpRows = followUpRows.slice(visibleFollowUpRows.length);
+  const quietNonCardCount = rolledUpRows.filter(
+    (row) => !row.pinned
+      && row.statusTone === "quiet"
+      && row.displayStatus !== "working"
+      && row.displayStatus !== "needed",
+  ).length;
+  const hiddenCount = hiddenRows.length + hiddenFollowUpRows.length + quietNonCardCount;
   const quietHiddenCount = hiddenRows.filter((row) => row.statusTone === "quiet").length
-    + hiddenIdleCount;
+    + hiddenFollowUpRows.length
+    + quietNonCardCount;
 
   return {
     visibleRows,
@@ -410,15 +430,16 @@ export function buildStatusPanelModel(
 }
 
 function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
-  const parentBySessionId = new Map(rows.filter((row) => !isSubagentRow(row)).map((row) => [row.sessionId, row]));
+  const rowBySessionId = new Map(rows.map((row) => [row.sessionId, row]));
   const parentByWorkspace = parentRowsByWorkspace(rows);
   const summaries = new Map<string, SubtaskSummary>();
   const visibleRows: StatusPanelRow[] = [];
 
   for (const row of rows) {
-    const parent = isSubagentRow(row)
-      ? parentForSubagentRow(row, parentBySessionId, parentByWorkspace)
+    const parentMatch = isSubagentRow(row)
+      ? parentForSubagentRow(row, rowBySessionId, parentByWorkspace)
       : undefined;
+    const parent = parentMatch?.parent;
     if (!parent) {
       if (isSubagentRow(row)) {
         if (shouldPromoteSubagentRow(row)) {
@@ -430,7 +451,7 @@ function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
       continue;
     }
 
-    if (shouldPromoteSubagentRow(row)) {
+    if (shouldPromoteAttachedSubagentRow(row, parentMatch.exactParentChain)) {
       visibleRows.push({ ...row, subagentMarker: copy.subagentAnomalyLabel });
       continue;
     }
@@ -469,17 +490,41 @@ function tonePriority(tone: StatusPanelRow["statusTone"]) {
   return tone === "alert" ? 0 : 1;
 }
 
+interface SubagentParentMatch {
+  parent: StatusPanelRow;
+  exactParentChain: boolean;
+}
+
 function parentForSubagentRow(
   row: StatusPanelRow,
-  parentBySessionId: Map<string, StatusPanelRow>,
+  rowBySessionId: Map<string, StatusPanelRow>,
   parentByWorkspace: Map<string, StatusPanelRow>,
-) {
-  if (row.parentSessionId) {
-    const parent = parentBySessionId.get(row.parentSessionId);
-    if (parent) return parent;
+): SubagentParentMatch | undefined {
+  const exactParent = rootParentForSubagentRow(row, rowBySessionId);
+  if (exactParent) {
+    return { parent: exactParent, exactParentChain: true };
   }
 
-  return row.workspacePath ? parentByWorkspace.get(row.workspacePath) : undefined;
+  const workspaceParent = row.workspacePath ? parentByWorkspace.get(row.workspacePath) : undefined;
+  return workspaceParent ? { parent: workspaceParent, exactParentChain: false } : undefined;
+}
+
+function rootParentForSubagentRow(
+  row: StatusPanelRow,
+  rowBySessionId: Map<string, StatusPanelRow>,
+) {
+  let parentSessionId = row.parentSessionId;
+  const visitedSessionIds = new Set([row.sessionId]);
+
+  while (parentSessionId && !visitedSessionIds.has(parentSessionId)) {
+    visitedSessionIds.add(parentSessionId);
+    const parent = rowBySessionId.get(parentSessionId);
+    if (!parent) return undefined;
+    if (!isSubagentRow(parent)) return parent;
+    parentSessionId = parent.parentSessionId;
+  }
+
+  return undefined;
 }
 
 function parentRowsByWorkspace(rows: StatusPanelRow[]) {
@@ -500,6 +545,12 @@ function isSubagentRow(row: SessionRow) {
 
 function shouldPromoteSubagentRow(row: StatusPanelRow) {
   return row.displayStatus === "blocked" || row.displayStatus === "input" || row.displayStatus === "stopped";
+}
+
+function shouldPromoteAttachedSubagentRow(row: StatusPanelRow, hasExactParentSession: boolean) {
+  return row.displayStatus === "blocked"
+    || row.displayStatus === "input"
+    || (row.displayStatus === "stopped" && !hasExactParentSession);
 }
 
 function subtaskSummaryParts(
@@ -585,7 +636,9 @@ function toPanelRow(row: SessionRow, theme: AtomInterventionTheme, copy: StatusP
     statusLabel: status.label,
     statusMarker: status.marker,
     statusColor: status.color,
-    statusTone: displayStatus === "working" || displayStatus === "idle" ? "quiet" : "alert",
+    statusTone: displayStatus === "working" || displayStatus === "idle" || displayStatus === "needed"
+      ? "quiet"
+      : "alert",
     interventionReason: interventionReasonForRow(row, displayStatus),
     evidenceTooltip: evidenceTooltipForRow(row, copy),
   };
@@ -631,7 +684,7 @@ function interventionReasonForRow(row: SessionRow, status: InterventionStatus) {
     case "stopped":
       return "stopped before completion";
     case "needed":
-      return "needs your attention";
+      return "recently opened; quiet during the follow-up window";
     case "working":
       return "running quietly";
     case "idle":

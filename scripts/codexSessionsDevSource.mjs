@@ -534,7 +534,7 @@ function classificationForKind(kind) {
     return {
       state: "needsAttention",
       confidence: "exact",
-      reason: "completed task still needs your attention",
+      reason: "completed task was opened; keep it quiet during the 30-minute follow-up window",
     };
   }
   if (kind === "completedStale") {
@@ -726,7 +726,7 @@ function applyAcknowledgedSessionState(row, acknowledgedSignals, nowMs = Date.no
       ...row,
       state: "needsAttention",
       confidence: "exact",
-      statusReason: "Read recently; keep in needed state until 30 minutes pass.",
+      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
       handled: true,
       dismissed: false,
     };

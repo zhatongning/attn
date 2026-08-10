@@ -49,7 +49,7 @@ The intended model is:
 | `attention` | `● attention` | The agent is waiting for user intervention, such as approval, confirmation, or additional information. | Yes. |
 | `inspect` | `● inspect` | The agent just produced a result that should be checked while context is fresh. | Yes. |
 | `running` | `○ running` | The agent is actively executing work now. | No. Keep visible as quiet context. |
-| `follow-up` | `● follow-up` | The session was opened recently and may still need a short follow-up before it settles. | Yes. |
+| `follow-up` | `○ follow-up` | The completed session was opened recently and remains in a short read window. | No. Keep it quiet and out of Alerts; it may fill an unused configured panel slot after primary rows. |
 | `stopped` | `● stopped` | The run was manually stopped or aborted before a completion signal. | Yes. Decide whether to continue, inspect, or dismiss it. |
 | `idle` | `○ idle` | No active work is happening and no user action is required. | No. Count it as quiet context, but do not spend a card on it by default. |
 
@@ -59,7 +59,7 @@ The intended model is:
 `review` carried an acceptance/assessment implication that was broader than this product needs.
 
 `follow-up` is the display status for the internal `needsAttention` row state.
-It means "keep this session in short-term attention after it was opened" without implying the agent has a response to read, that the only possible action is text input, or that the user must personally complete the underlying task.
+It means the completed session was opened recently. It remains a quiet short-term state without implying the agent has a response to read, that the only possible action is text input, or that the user must personally complete the underlying task.
 
 `running` is the display status for active execution.
 
@@ -70,7 +70,7 @@ Chinese labels, if the UI becomes localized:
 | `blocked` | `受阻` | Short and clearly means the agent cannot continue. |
 | `attention` | `待介入` | Broader than "typing input"; covers approval, confirmation, permission, or additional information. |
 | `inspect` | `待检查` | Matches the action: open and inspect the result. |
-| `follow-up` | `待跟进` | Matches the post-read window: the user may need to continue, confirm, or take over soon without implying an urgent blocker. |
+| `follow-up` | `待跟进` | Marks the post-read quiet window without implying an urgent blocker or required action. |
 | `running` | `进行中` | Clear active-work state. |
 | `stopped` | `已停止` | Clear stopped-before-completion state. |
 | `idle` | `空闲` | Quiet no-action state. |
@@ -95,7 +95,7 @@ These are the rules implemented today.
 Completion attention is time-bounded and read-driven:
 
 - `inspect`: completed result is at most 12 hours old and has not been opened/read yet.
-- `follow-up`: completed result was opened/read within the last 30 minutes.
+- `follow-up`: completed result was opened/read within the last 30 minutes; keep it quiet and out of Alerts, but use it to fill an unused configured panel slot after primary rows.
 - `idle`: completed result is older than 12 hours, or was opened/read more than 30 minutes ago.
 
 Unread-completion retention is 12 hours. After this window, a terminal unread completion becomes `CompletedStale` and stays quiet unless newer source evidence appears.
@@ -172,9 +172,9 @@ For this app, user-level hooks are likely the right default because the status p
 | `Running` | `running` | `exact` | `running signal observed` |
 | `Stopped` | `stopped` | `exact` | `stopped before completion; decide whether to continue, inspect, or dismiss` |
 | `Idle` | `idle` | `inferred` | `no recent activity observed; idle until the next source signal` |
-| `WaitingForInput` | `needsAttention` | `exact` | `waiting for user input` |
+| `WaitingForInput` | `waitingForInput` | `exact` | `waiting for user input` |
 | `CompletedImmediate` | `inspect` | `exact` | `completed task ready to inspect; open it to mark read` |
-| `Completed` | `needsAttention` | `exact` | `completed task still needs your attention` |
+| `Completed` | `needsAttention` | `exact` | `completed task was opened; keep it quiet during the 30-minute follow-up window` |
 | `CompletedStale` | `idle` | `inferred` | `completed task is no longer recent; idle until the next source signal` |
 | `Failed` | `inspect` | `exact` | `failed task can be manually reviewed and cleared` |
 | `InsufficientEvidence` | `unknown` | `unknown` | `missing source evidence for status classification` |
@@ -199,13 +199,13 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 
 | User action | Current transition |
 | --- | --- |
-| Click Jump back on an `inspect` row | Mark the current signal as read, then show it as `follow-up` for 30 minutes. |
+| Click Jump back on an `inspect` row | Mark the current signal as read, then keep it as quiet `follow-up` for 30 minutes. |
 | Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
 | Unread completion exceeds 12 hours | Show the row as `idle` until newer source evidence arrives. |
 | Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `running` or `idle` | No state transition. |
-| Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the display status becomes `running` or `follow-up`. |
-| Dismiss a `running` or `follow-up` row | It is restored immediately on next list because active/intervention rows should not stay hidden. |
+| Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the display status becomes `running`; any later `follow-up` remains quiet. |
+| Dismiss a `running` or `follow-up` row | A running row is restored immediately on the next list; an unpinned follow-up remains quiet. |
 
 Read acknowledgement is keyed by `sessionId + lastActivityAt` and stores `acknowledgedAt`.
 If the same session gets newer activity, the read acknowledgement no longer applies.
@@ -215,7 +215,7 @@ If the same session gets newer activity, the read acknowledgement no longer appl
 These are the areas that currently feel wrong or need product decisions.
 
 1. Completion attention is bounded by freshness and read state.
-   A completed result stays `inspect` for at most 12 hours unless opened/read earlier; reading shows `follow-up` for 30 minutes, then `idle`.
+   A completed result stays `inspect` for at most 12 hours unless opened/read earlier; reading shows quiet `follow-up` for 30 minutes, then `idle`.
 
 2. `inspect` still combines successful completion and failure/manual-clear cases.
    These may need separate reasons later, but the shared user action is still "open and inspect."
@@ -243,7 +243,7 @@ These are the areas that currently feel wrong or need product decisions.
 We should decide these before more code changes.
 
 1. When should `task_complete` become visible?
-   Current decision: unread completed results stay `inspect`; reading them starts a 30-minute `follow-up` window, then they become `idle`.
+   Current decision: unread completed results stay `inspect`; reading them starts a quiet 30-minute `follow-up` window, then they become `idle`.
 
 2. What does `inspect` mean?
    It means a result was produced and should be checked while context is fresh.
@@ -253,11 +253,14 @@ We should decide these before more code changes.
    - `blocked`
    - `inspect`
    - current `running`
-   - `follow-up`
-   - `idle` only contributes to the quiet count and does not occupy a card
+   - `attention`
+   - `stopped`
+   - `follow-up` fills an unused configured card slot after primary rows; otherwise it contributes to the quiet count
+   - `idle` only contributes to the quiet count and does not occupy an unpinned card
+   - pinned rows keep their normal priority and remain available from manual expansion when they exceed visible capacity
 
 4. Should quiet states be visible at all?
-   Current behavior keeps `running` visible because live work is important context, but moves `idle` into the quiet count because it does not require action.
+   Current behavior keeps `running` visible because live work is important context. `follow-up` can fill unused configured capacity after primary rows, while `idle` stays in the quiet count because it does not require action.
 
 5. What is the retention rule for completed sessions?
    Current decision: unread completions older than 12 hours become `idle`; acknowledged completions become `idle` after their 30-minute follow-up window.
@@ -294,7 +297,7 @@ Candidate principles:
 - `idle` means no action required.
 - `inspect` should be scarce. It should represent something the user is likely to care about now.
 - Old completions should automatically become `idle`.
-- `follow-up` and `blocked` are strong intervention states.
+- `blocked` is a strong intervention state; `follow-up` is quiet after the completed content was opened.
 - Old historical sessions should not crowd the panel.
 
 ## Code Touchpoints

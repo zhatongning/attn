@@ -49,6 +49,7 @@ vi.mock("@tauri-apps/api/dpi", () => ({
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   window.localStorage.clear();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   tauriWindowMock.setSize.mockClear();
@@ -85,7 +86,7 @@ describe("StatusPanelView", () => {
 
     expect(screen.getByText("Attn")).toBeTruthy();
     expect(screen.queryByText("$")).toBeNull();
-    expect(statusRows).toHaveLength(3);
+    expect(statusRows).toHaveLength(1);
     expect(screen.getByText(/quiet/)).toBeTruthy();
   });
 
@@ -104,11 +105,11 @@ describe("StatusPanelView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Expand status panel" }));
 
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
-    expect(screen.getAllByRole("article")).toHaveLength(2);
+    expect(screen.getAllByRole("article")).toHaveLength(1);
   });
 
   it("auto-expands when a new attention row appears after refresh", async () => {
-    const firstRows = initialSessions.filter((row) => row.state !== "needsAttention");
+    const firstRows = initialSessions.filter((row) => row.state !== "waitingForInput");
     const nextRows = [
       ...firstRows,
       {
@@ -137,8 +138,8 @@ describe("StatusPanelView", () => {
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
   });
 
-  it("auto-collapses after the configured alert display duration", async () => {
-    const firstRows = initialSessions.filter((row) => row.state !== "needsAttention");
+  it("shows a newly refreshed follow-up in an unused slot without treating it as an alert", async () => {
+    const firstRows = initialSessions.filter((row) => row.state !== "waitingForInput");
     const nextRows = [
       ...firstRows,
       {
@@ -146,7 +147,40 @@ describe("StatusPanelView", () => {
         sessionId: "timed-follow-up-row",
         label: "Timed follow-up row",
         state: "needsAttention" as const,
-        statusReason: "Read recently; keep in needed state until 30 minutes pass.",
+        statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") return jsonResponse(nextRows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 2 }));
+
+    render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByRole("main").className).toContain("panel-shell--collapsed");
+    fireEvent.click(screen.getByRole("button", { name: "Expand status panel" }));
+    expect(screen.getByText("0 alerts")).toBeTruthy();
+    expect(screen.getByText("+1 quiet")).toBeTruthy();
+    expect(screen.getByText("Timed follow-up row")).toBeTruthy();
+    expect(screen.getByText("follow-up")).toBeTruthy();
+  });
+
+  it("auto-collapses inspect rows by default instead of staying open", async () => {
+    const firstRows = initialSessions.filter((row) => row.state !== "waitingForInput");
+    const nextRows = [
+      ...firstRows,
+      {
+        ...initialSessions[0],
+        sessionId: "sticky-inspect-row",
+        label: "Sticky inspect row",
+        state: "inspect" as const,
+        statusReason: "completed task ready to inspect; open it to mark read",
       },
     ];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
@@ -172,7 +206,7 @@ describe("StatusPanelView", () => {
     render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
 
     await waitFor(() => {
-      expect(screen.getByText("Timed follow-up row")).toBeTruthy();
+      expect(screen.getByText("Sticky inspect row")).toBeTruthy();
     });
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
     expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 8000);
@@ -183,41 +217,6 @@ describe("StatusPanelView", () => {
     await waitFor(() => {
       expect(screen.getByRole("main").className).toContain("panel-shell--collapsed");
     });
-    setTimeoutSpy.mockRestore();
-  });
-
-  it("keeps the panel open when a configured status is present", async () => {
-    const firstRows = initialSessions.filter((row) => row.state !== "needsAttention");
-    const nextRows = [
-      ...firstRows,
-      {
-        ...initialSessions[0],
-        sessionId: "sticky-inspect-row",
-        label: "Sticky inspect row",
-        state: "inspect" as const,
-        statusReason: "completed task ready to inspect; open it to mark read",
-      },
-    ];
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
-      if (pathname === "/api/sessions") return jsonResponse(nextRows);
-      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
-      return jsonResponse({}, 404);
-    }));
-    const originalSetTimeout = window.setTimeout.bind(window);
-    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation(((
-      handler: TimerHandler,
-      timeout?: number,
-    ) => originalSetTimeout(handler, timeout)) as typeof window.setTimeout);
-
-    render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Sticky inspect row")).toBeTruthy();
-    });
-    expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
-    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), 8000);
-
     setTimeoutSpy.mockRestore();
   });
 
@@ -248,7 +247,7 @@ describe("StatusPanelView", () => {
     expect(persistedConfig.autoCollapseDelayMs).toBe(12000);
   });
 
-  it("persists statuses that keep the auto panel open after management confirmation", async () => {
+  it("does not offer follow-up as a keep-open status", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
     vi.mocked(listen).mockImplementation(async (_event, callback) => {
@@ -260,14 +259,36 @@ describe("StatusPanelView", () => {
     handler?.({ payload: "management" });
 
     expect(await screen.findByText("Keep open for statuses")).toBeTruthy();
-    expect((screen.getByLabelText("inspect") as HTMLInputElement).checked).toBe(true);
-    expect((screen.getByLabelText("follow-up") as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByLabelText("inspect") as HTMLInputElement).checked).toBe(false);
+    expect(screen.queryByLabelText("follow-up")).toBeNull();
 
-    fireEvent.click(screen.getByLabelText("follow-up"));
+    fireEvent.click(screen.getByLabelText("stopped"));
     fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
 
     const persistedConfig = JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
-    expect(persistedConfig.preventAutoCollapseStatuses).toEqual(["inspect", "needed"]);
+    expect(persistedConfig.preventAutoCollapseStatuses).toEqual(["stopped"]);
+  });
+
+  it("drops legacy follow-up keep-open settings when applying management changes", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      preventAutoCollapseStatuses: ["inspect", "needed"],
+    }));
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    expect((await screen.findByLabelText("inspect") as HTMLInputElement).checked).toBe(true);
+    expect(screen.queryByLabelText("follow-up")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    const persistedConfig = JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
+    expect(persistedConfig.preventAutoCollapseStatuses).toEqual(["inspect"]);
   });
 
   it("shows source evidence from an info control beside the workspace name", () => {
@@ -386,10 +407,46 @@ describe("StatusPanelView", () => {
     );
     expandPanel();
 
-    fireEvent.click(screen.getByText(/\+\d+ quiet/));
+    fireEvent.click(screen.getByText(/\+\d+ alerts/));
 
     expect(screen.queryByText("Quiet historical session")).toBeNull();
     expect(screen.getAllByRole("article")).toHaveLength(3);
+  });
+
+  it("keeps hidden pinned quiet rows reachable from the panel", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 1 }));
+    render(
+      <StatusPanelView
+        initialRows={[
+          {
+            ...initialSessions[0],
+            sessionId: "pinned-follow-up-new",
+            label: "Pinned follow-up new",
+            state: "needsAttention",
+            pinned: true,
+            lastActivityAt: "2026-06-15T03:46:00.000Z",
+            statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+          },
+          {
+            ...initialSessions[0],
+            sessionId: "pinned-follow-up-old",
+            label: "Pinned follow-up old",
+            state: "needsAttention",
+            pinned: true,
+            lastActivityAt: "2026-06-15T03:20:00.000Z",
+            statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+          },
+        ]}
+        sourceHealth={fakeSourceHealth}
+      />,
+    );
+    expandPanel();
+
+    const hiddenRowsButton = screen.getByRole("button", { name: "+1 pinned" });
+    expect((hiddenRowsButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(hiddenRowsButton);
+
+    expect(screen.getByText("Pinned follow-up old")).toBeTruthy();
   });
 
   it("keeps configurable options off the status panel", () => {
@@ -579,7 +636,7 @@ describe("StatusPanelView", () => {
 
     expect(screen.getByText("1 alerts")).toBeTruthy();
     expandPanel();
-    expect(screen.getByText("follow-up")).toBeTruthy();
+    expect(screen.getByText("attention")).toBeTruthy();
 
     handler?.({ payload: "management" });
     fireEvent.change(await screen.findByLabelText("Language"), { target: { value: "zh" } });
@@ -589,7 +646,7 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("1 进行中")).toBeTruthy();
     expect(screen.getByText("1 空闲")).toBeTruthy();
     expandPanel();
-    expect(screen.getByText("待跟进")).toBeTruthy();
+    expect(screen.getByText("待介入")).toBeTruthy();
   });
 
   it("shows Codex hook integration status and installs only after confirmation", async () => {
@@ -656,7 +713,7 @@ describe("StatusPanelView", () => {
     expandPanel();
 
     expect(screen.getByText("1 需关注")).toBeTruthy();
-    expect(screen.getByText("待跟进")).toBeTruthy();
+    expect(screen.getByText("待介入")).toBeTruthy();
   });
 
   it("localizes built-in panel and management copy when Chinese is selected", async () => {
@@ -669,6 +726,7 @@ describe("StatusPanelView", () => {
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
       ...defaultZhConfig(),
       panelMode: "persistent",
+      visibleItemCount: 2,
     }));
 
     render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
@@ -699,7 +757,7 @@ describe("StatusPanelView", () => {
     expect(screen.getByLabelText("面板显示")).toBeTruthy();
     expect(screen.getByLabelText("提醒显示秒数")).toBeTruthy();
     expect(screen.getByText("包含这些状态时不收起")).toBeTruthy();
-    expect((screen.getByLabelText("待检查") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("待检查") as HTMLInputElement).checked).toBe(false);
     expect(screen.getByText("状态颜色")).toBeTruthy();
     expect(screen.getByRole("button", { name: "应用设置" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "返回" })).toBeTruthy();
@@ -753,12 +811,12 @@ describe("StatusPanelView", () => {
 
     render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
     expandPanel();
-    expect(screen.getAllByRole("article")).toHaveLength(3);
+    expect(screen.getAllByRole("article")).toHaveLength(1);
 
     handler?.({ payload: "management" });
     fireEvent.change(await screen.findByLabelText("Visible items"), { target: { value: "5" } });
     fireEvent.click(screen.getByText("Back"));
-    expect(screen.getAllByRole("article")).toHaveLength(3);
+    expect(screen.getAllByRole("article")).toHaveLength(1);
 
     handler?.({ payload: "management" });
     fireEvent.change(await screen.findByLabelText("Visible items"), { target: { value: "5" } });
@@ -769,8 +827,8 @@ describe("StatusPanelView", () => {
     });
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 348,
-        width: 560,
+        height: 292,
+        width: 420,
       }));
     });
   });
@@ -796,15 +854,15 @@ describe("StatusPanelView", () => {
 
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 60,
-        width: 560,
+        height: 50,
+        width: 420,
       }));
     });
     expandPanel();
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 156,
-        width: 560,
+        height: 124,
+        width: 420,
       }));
     });
   });
@@ -844,13 +902,14 @@ describe("StatusPanelView", () => {
     expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 186,
-        width: 560,
+        height: 154,
+        width: 420,
       }));
     });
   });
 
   it("uses small Atom status markers for visible rows", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 3 }));
     const rows: SessionRow[] = [
       { ...initialSessions[0], sessionId: "blocked", state: "unknown", statusReason: "source status unavailable" },
       { ...initialSessions[0], sessionId: "input", state: "waitingForInput", statusReason: "waiting for user input" },
@@ -869,6 +928,7 @@ describe("StatusPanelView", () => {
   });
 
   it("shows a parent subtask summary while only promoting intervention subagents", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 2 }));
     const rows: SessionRow[] = [
       {
         ...initialSessions[0],
@@ -921,6 +981,7 @@ describe("StatusPanelView", () => {
   });
 
   it("acknowledges rolled-up inspect subagents when the parent inspect row is opened", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 2 }));
     const rows: SessionRow[] = [
       {
         ...initialSessions[0],
@@ -1093,7 +1154,7 @@ describe("StatusPanelView", () => {
     });
   });
 
-  it("keeps an opened intervention row as needed during the read window", async () => {
+  it("keeps an opened intervention row quiet but visible during the follow-up read window", async () => {
     const attentionRow: SessionRow = {
       ...initialSessions[0],
       sessionId: "needs-input",
@@ -1105,7 +1166,7 @@ describe("StatusPanelView", () => {
       ...attentionRow,
       state: "needsAttention",
       confidence: "exact",
-      statusReason: "Read recently; keep in needed state until 30 minutes pass.",
+      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
       handled: true,
       dismissed: false,
     };
@@ -1138,13 +1199,11 @@ describe("StatusPanelView", () => {
     fireEvent.click(screen.getByTitle("Jump back"));
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Show status evidence for AMap geolocation preload investigation")).toBeTruthy();
+      expect(screen.getByText("0 alerts")).toBeTruthy();
     });
-    fireEvent.click(screen.getByLabelText("Show status evidence for AMap geolocation preload investigation"));
-    expect(screen.getByRole("tooltip").textContent).toContain(
-      "Status: Read recently; keep in needed state until 30 minutes pass.",
-    );
+    expect(screen.getByLabelText("Show status evidence for AMap geolocation preload investigation")).toBeTruthy();
     expect(screen.getByText("follow-up")).toBeTruthy();
+    expect(screen.queryByText("+1 quiet")).toBeNull();
   });
 
   it("pins and unpins a row from the status panel", async () => {
@@ -1307,9 +1366,9 @@ describe("StatusPanelView", () => {
     // @ts-expect-error This test runs in Node and does not need app-level Node globals.
     const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
 
-    expect(css).toContain("padding: 8px;");
-    expect(css).toContain("width: min(100vw - 12px, 540px);");
-    expect(css).toContain("max-height: calc(100vh - 12px);");
+    expect(css).toContain("padding: 6px;");
+    expect(css).toContain("width: min(100vw - 8px, 412px);");
+    expect(css).toContain("max-height: calc(100vh - 8px);");
     expect(css).toContain("inset 0 1px 0 rgba(171, 178, 191, 0.08);");
   });
 
@@ -1320,8 +1379,8 @@ describe("StatusPanelView", () => {
     const stripToggleBlock = css.match(/\.strip-toggle \{[^}]+\}/)?.[0];
 
     expect(collapsedBlock).not.toContain("padding:");
-    expect(stripToggleBlock).toContain("width: 22px;");
-    expect(stripToggleBlock).toContain("line-height: 20px;");
+    expect(stripToggleBlock).toContain("width: 20px;");
+    expect(stripToggleBlock).toContain("line-height: 18px;");
   });
 
   it("defines a non-looping inspect attention cue animation", () => {
@@ -1352,12 +1411,12 @@ describe("StatusPanelView", () => {
     const statusCodeBlock = css.match(/\.status-code \{[^}]+\}/)?.[0];
     const statusMarkerBlock = css.match(/\.status-code span \{[^}]+\}/)?.[0];
 
-    expect(rowBlock).toContain("grid-template-columns: 96px minmax(0, 1fr) auto;");
-    expect(rowBlock).toContain("padding: 6px 7px 6px 12px;");
+    expect(rowBlock).toContain("grid-template-columns: 78px minmax(0, 1fr) auto;");
+    expect(rowBlock).toContain("padding: 4px 5px 4px 9px;");
     expect(statusCodeBlock).toContain("align-items: center;");
     expect(statusCodeBlock).toContain("display: flex;");
-    expect(statusCodeBlock).toContain("min-width: 76px;");
-    expect(statusMarkerBlock).toContain("margin-right: 8px;");
+    expect(statusCodeBlock).toContain("min-width: 62px;");
+    expect(statusMarkerBlock).toContain("margin-right: 6px;");
   });
 
   it("keeps status row left borders inside the clipped panel area", () => {
@@ -1366,8 +1425,8 @@ describe("StatusPanelView", () => {
     const listBlock = css.match(/\.status-list \{[^}]+\}/)?.[0];
     const rowBlock = css.match(/\.status-row \{[^}]+\}/)?.[0];
 
-    expect(listBlock).toContain("padding-left: 4px;");
-    expect(rowBlock).toContain("width: calc(100% - 4px);");
+    expect(listBlock).toContain("padding-left: 2px;");
+    expect(rowBlock).toContain("width: calc(100% - 2px);");
   });
 
   it("draws the status accent inside a complete row outline", () => {
@@ -1437,7 +1496,7 @@ function defaultZhConfig() {
     styleFamily: "atom",
     palette: "oneDark",
     language: "zh",
-    visibleItemCount: 3,
+    visibleItemCount: 1,
     panelMode: "auto",
     autoCollapseDelayMs: 8000,
     statusColors: {

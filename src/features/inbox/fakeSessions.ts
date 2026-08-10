@@ -8,7 +8,7 @@ export const initialSessions: SessionRow[] = [
     projectName: "wmhcar",
     workspacePath: "/Users/edy/hose/tmc/wmhcar",
     lastActivityAt: "2026-06-02T14:42:00+08:00",
-    state: "needsAttention",
+    state: "waitingForInput",
     confidence: "exact",
     statusReason: "Codex reports the task is waiting for user input.",
     handled: false,

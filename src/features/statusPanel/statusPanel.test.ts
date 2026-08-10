@@ -33,14 +33,14 @@ describe("buildStatusPanelModel", () => {
       ["unknown", "blocked"],
       ["needs-input", "attention"],
       ["complete", "inspect"],
-      ["active", "running"],
+      ["stopped", "stopped"],
     ]);
     expect(model.hiddenRows.map((item) => [item.sessionId, item.statusLabel])).toEqual([
-      ["stopped", "stopped"],
+      ["active", "running"],
     ]);
   });
 
-  it("shows three visible items by default and keeps the rest hidden", () => {
+  it("shows one visible item by default and keeps the rest hidden", () => {
     const model = buildStatusPanelModel([
       row("s1", "running", "running signal observed"),
       row("s2", "running", "running signal observed"),
@@ -48,16 +48,16 @@ describe("buildStatusPanelModel", () => {
       row("s4", "running", "running signal observed"),
     ]);
 
-    expect(defaultStatusPanelConfig.visibleItemCount).toBe(3);
-    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["s1", "s2", "s3"]);
-    expect(model.hiddenCount).toBe(1);
-    expect(model.quietHiddenCount).toBe(1);
+    expect(defaultStatusPanelConfig.visibleItemCount).toBe(1);
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["s1"]);
+    expect(model.hiddenCount).toBe(3);
+    expect(model.quietHiddenCount).toBe(3);
   });
 
-  it("defaults to an auto-collapsing panel that stays open for eight seconds after alerts", () => {
+  it("defaults to an auto-collapsing panel that does not stay open for any status", () => {
     expect(defaultStatusPanelConfig.panelMode).toBe("auto");
     expect(defaultStatusPanelConfig.autoCollapseDelayMs).toBe(8000);
-    expect(defaultStatusPanelConfig.preventAutoCollapseStatuses).toEqual(["inspect"]);
+    expect(defaultStatusPanelConfig.preventAutoCollapseStatuses).toEqual([]);
   });
 
   it("uses the configured visible item count from management settings", () => {
@@ -80,14 +80,16 @@ describe("buildStatusPanelModel", () => {
         row("blocked", "unknown", "source status unavailable"),
         row("inspect", "inspect", "completed task ready to inspect; confirm to mark idle"),
         row("input", "waitingForInput", "waiting for user input"),
-        row("needed", "needsAttention", "Read recently; keep in needed state until 30 minutes pass."),
+        row("needed", "needsAttention", "Read recently; keep it quiet during the 30-minute follow-up window."),
         row("idle", "idle", "completed task is no longer recent; idle until the next source signal"),
       ],
-      { ...defaultStatusPanelConfig, language: "zh" },
+      { ...defaultStatusPanelConfig, language: "zh", visibleItemCount: 3 },
     );
 
     expect(model.visibleRows.map((item) => item.statusLabel)).toEqual(["受阻", "待介入", "待检查"]);
-    expect(model.hiddenRows.map((item) => item.statusLabel)).toEqual(["待跟进"]);
+    expect(model.hiddenRows).toEqual([]);
+    expect(model.hiddenCount).toBe(2);
+    expect(model.quietHiddenCount).toBe(2);
     expect(model.copy.alertsLabel).toBe("需关注");
     expect(model.copy.workingLabel).toBe("进行中");
     expect(model.copy.idleLabel).toBe("空闲");
@@ -125,12 +127,12 @@ describe("buildStatusPanelModel", () => {
     expect(model.interventionCount).toBe(0);
   });
 
-  it("keeps running rows visible ahead of follow-up rows and moves idle rows into quiet count", () => {
+  it("uses an unused configured slot for an unpinned quiet follow-up", () => {
     const model = buildStatusPanelModel([
       row("idle", "idle", "completed task observed; idle until the next source signal"),
       row("working", "running", "running signal observed"),
       row("inspect", "dismissable", "failed task can be manually reviewed and cleared"),
-      row("needed", "needsAttention", "Read recently; keep in needed state until 30 minutes pass."),
+      row("needed", "needsAttention", "Read recently; keep it quiet during the 30-minute follow-up window."),
       row("blocked", "unknown", "source status unavailable"),
     ], { ...defaultStatusPanelConfig, visibleItemCount: 5 });
 
@@ -141,9 +143,74 @@ describe("buildStatusPanelModel", () => {
       "needed",
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
+    expect(model.visibleRows.find((item) => item.sessionId === "needed")?.statusTone).toBe("quiet");
     expect(model.idleCount).toBe(1);
     expect(model.quietHiddenCount).toBe(1);
     expect(model.hiddenCount).toBe(1);
+    expect(model.interventionCount).toBe(2);
+  });
+
+  it("keeps an unpinned follow-up in quiet count when primary rows fill configured capacity", () => {
+    const model = buildStatusPanelModel([
+      row("blocked", "unknown", "source status unavailable"),
+      row("working", "running", "running signal observed"),
+      row("needed", "needsAttention", "Read recently; keep it quiet during the 30-minute follow-up window."),
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 2 });
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["blocked", "working"]);
+    expect(model.hiddenRows).toEqual([]);
+    expect(model.hiddenCount).toBe(1);
+    expect(model.quietHiddenCount).toBe(1);
+    expect(model.interventionCount).toBe(1);
+  });
+
+  it("keeps a pinned follow-up row visible as quiet context", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("pinned-follow-up", "needsAttention", "Read recently; keep it quiet during the 30-minute follow-up window."),
+        pinned: true,
+      },
+      row("working", "running", "running signal observed"),
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 2 });
+
+    expect(model.visibleRows.map((item) => [item.sessionId, item.displayStatus, item.statusMarker, item.statusTone])).toEqual([
+      ["pinned-follow-up", "needed", "○", "quiet"],
+      ["working", "working", "○", "quiet"],
+    ]);
+    expect(model.interventionCount).toBe(0);
+  });
+
+  it("keeps an overflow pinned follow-up reachable through manual expansion", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("pinned-follow-up-new", "needsAttention", "Read recently; keep it quiet during the 30-minute follow-up window."),
+        pinned: true,
+        lastActivityAt: "2026-06-15T03:46:00.000Z",
+      },
+      {
+        ...row("pinned-follow-up-old", "needsAttention", "Read recently; keep it quiet during the 30-minute follow-up window."),
+        pinned: true,
+        lastActivityAt: "2026-06-15T03:20:00.000Z",
+      },
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 1 });
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["pinned-follow-up-new"]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["pinned-follow-up-old"]);
+    expect(model.expandableHiddenRows.map((item) => item.sessionId)).toEqual(["pinned-follow-up-old"]);
+    expect(model.expandableHiddenCount).toBe(1);
+    expect(model.quietHiddenCount).toBe(1);
+    expect(model.interventionCount).toBe(0);
+  });
+
+  it("uses a quiet follow-up fallback when source evidence has no reason", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("pinned-follow-up", "needsAttention", ""),
+        pinned: true,
+      },
+    ]);
+
+    expect(model.visibleRows[0].interventionReason).toBe("recently opened; quiet during the follow-up window");
   });
 
   it("keeps inspect backlog visible ahead of active working sessions", () => {
@@ -153,7 +220,7 @@ describe("buildStatusPanelModel", () => {
       { ...row("inspect-new", "inspect", "completed task ready to inspect; open it to mark read"), lastActivityAt: "2026-06-15T03:46:00.000Z" },
       { ...row("working-wmhcar", "running", "running signal observed"), lastActivityAt: "2026-06-15T03:30:00.000Z" },
       { ...row("working-mos", "running", "running signal observed"), lastActivityAt: "2026-06-15T03:54:00.000Z" },
-    ]);
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 3 });
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
       "inspect-new",
@@ -173,7 +240,7 @@ describe("buildStatusPanelModel", () => {
         pinned: true,
         lastActivityAt: "2026-06-15T03:30:00.000Z",
       },
-    ]);
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 3 });
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.pinned])).toEqual([
       ["pinned-inspect", true],
@@ -190,7 +257,7 @@ describe("buildStatusPanelModel", () => {
         pinned: true,
       },
       row("working", "running", "running signal observed"),
-    ]);
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 2 });
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.displayStatus, item.pinned])).toEqual([
       ["pinned-idle", "idle", true],
@@ -262,6 +329,86 @@ describe("buildStatusPanelModel", () => {
       "2 subtasks: 1 inspect, 1 running",
     );
     expect(model.hiddenCount).toBe(0);
+  });
+
+  it("rolls a stopped subagent into its known parent instead of promoting an anomaly", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child-stopped", "stopped", "stopped before completion"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "parent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 2 },
+    );
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["parent"]);
+    expect(model.visibleRows[0].subagentMarker).toBeUndefined();
+    expect(model.visibleRows[0].subtaskSummary).toBe("1 subtask: 1 stopped");
+    expect(model.hiddenRows).toEqual([]);
+  });
+
+  it("rolls a stopped descendant through its known subagent parent to the root task", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("root", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "root",
+        },
+        {
+          ...row("grandchild-stopped", "stopped", "stopped before completion"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "child",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 3 },
+    );
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["root"]);
+    expect(model.visibleRows[0].subagentMarker).toBeUndefined();
+    expect(model.visibleRows[0].subtaskSummary).toBe("2 subtasks: 1 running, 1 stopped");
+    expect(model.visibleRows[0].subtaskRows?.map((item) => item.sessionId)).toEqual([
+      "grandchild-stopped",
+      "child",
+    ]);
+  });
+
+  it("keeps a stopped subagent with only a workspace fallback as an anomaly", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child-stopped", "stopped", "stopped before completion"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "subagent",
+          parentSessionId: "missing-parent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 2 },
+    );
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["child-stopped", "parent"]);
+    expect(model.visibleRows[0].subagentMarker).toBe("subagent anomaly");
+    expect(model.visibleRows[1].subtaskSummary).toBeUndefined();
   });
 
   it("suppresses orphaned quiet subagents while promoting orphaned intervention subagents", () => {
