@@ -109,6 +109,7 @@ async fn jump_to_session(
             session_id: fallback_session_id,
             availability: domain::session::JumpAvailability::Unavailable,
             target: domain::session::JumpTarget::Unknown,
+            succeeded: false,
             message: format!("Jump-back unavailable: {error}"),
         }))
 }

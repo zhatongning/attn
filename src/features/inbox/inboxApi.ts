@@ -12,6 +12,7 @@ interface JumpResult {
   sessionId: string;
   availability: JumpAvailability;
   target: JumpTarget;
+  succeeded: boolean;
   message: string;
 }
 
@@ -24,9 +25,7 @@ export async function loadSessions(): Promise<SessionRow[]> {
     return fetchDevJson<SessionRow[]>("/api/sessions", initialSessions);
   }
 
-  return invoke<SessionRow[]>("list_sessions").catch(() =>
-    fetchDevJson<SessionRow[]>("/api/sessions", initialSessions),
-  );
+  return invoke<SessionRow[]>("list_sessions");
 }
 
 export async function loadSourceHealth(): Promise<SourceHealth> {
@@ -34,9 +33,7 @@ export async function loadSourceHealth(): Promise<SourceHealth> {
     return fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth);
   }
 
-  return invoke<SourceHealth>("source_health").catch(() =>
-    fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth),
-  );
+  return invoke<SourceHealth>("source_health");
 }
 
 export async function loadCodexHookIntegrationStatus(): Promise<CodexHookIntegrationStatus> {
@@ -137,6 +134,7 @@ export async function jumpToSession(
       sessionId,
       availability: "unavailable",
       target: "unknown",
+      succeeded: false,
       message: "Jump-back unavailable: local preview API is not connected.",
     }, {
       method: "POST",
@@ -145,18 +143,7 @@ export async function jumpToSession(
     });
   }
 
-  return invoke<JumpResult>("jump_to_session", { sessionId, acknowledgedSessionIds }).catch(() =>
-    fetchDevJson<JumpResult>("/api/jump", {
-      sessionId,
-      availability: "unavailable",
-      target: "unknown",
-      message: "Jump-back unavailable: local preview API is not connected.",
-    }, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, acknowledgedSessionIds }),
-    }),
-  );
+  return invoke<JumpResult>("jump_to_session", { sessionId, acknowledgedSessionIds });
 }
 
 async function fetchDevJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {

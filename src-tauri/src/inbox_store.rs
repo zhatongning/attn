@@ -24,6 +24,7 @@ pub struct JumpResult {
     pub session_id: String,
     pub availability: JumpAvailability,
     pub target: JumpTarget,
+    pub succeeded: bool,
     pub message: String,
 }
 
@@ -327,7 +328,8 @@ impl InboxStore {
             .as_ref()
             .and_then(build_jump_command_plan);
         let execution = plan.clone().map(execute_jump_command_plan);
-        if matches!(execution, Some(Ok(()))) {
+        let succeeded = execution.as_ref().is_some_and(Result::is_ok);
+        if succeeded {
             if let Some(row) = row.as_ref() {
                 self.acknowledge_session_signals(row, acknowledged_session_ids);
                 self.invalidate_session_rows_cache();
@@ -369,6 +371,7 @@ impl InboxStore {
             session_id: session_id.to_string(),
             availability,
             target,
+            succeeded,
             message,
         }
     }
@@ -1062,12 +1065,13 @@ fn execute_jump_command_plan(plan: JumpCommandPlan) -> Result<(), String> {
 fn execute_codex_desktop_jump(
     deeplink_url: &str,
     _workspace_path: &str,
-    _activate_bundle_id: &str,
+    activate_bundle_id: &str,
     open_deeplink: impl FnOnce(&str) -> Result<(), String>,
     _open_workspace: impl FnOnce(&str) -> Result<(), String>,
-    _activate: impl FnOnce(&str) -> Result<(), String>,
+    activate: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    open_deeplink(deeplink_url)
+    open_deeplink(deeplink_url)?;
+    activate(activate_bundle_id)
 }
 
 fn find_live_codex_cli_sessions() -> Vec<LiveCliSession> {
@@ -1739,6 +1743,11 @@ mod tests {
 
         assert_eq!(result.availability, JumpAvailability::Unavailable);
         assert_eq!(result.target, JumpTarget::Unknown);
+        assert_eq!(
+            serde_json::to_value(result)
+                .expect("jump result should serialize")["succeeded"],
+            false
+        );
     }
 
     #[test]
@@ -2081,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_deeplink_success_does_not_run_extra_activation() {
+    fn desktop_deeplink_success_activates_configured_codex_bundle() {
         let calls = std::cell::RefCell::new(Vec::new());
 
         let result = super::execute_codex_desktop_jump(
@@ -2103,11 +2112,17 @@ mod tests {
         );
 
         assert_eq!(result, Ok(()));
-        assert_eq!(*calls.borrow(), vec!["deeplink:codex://threads/s1"]);
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                "deeplink:codex://threads/s1",
+                "activate:com.openai.codex"
+            ]
+        );
     }
 
     #[test]
-    fn desktop_deeplink_failure_does_not_open_workspace_fallback() {
+    fn desktop_deeplink_failure_does_not_activate_codex_or_open_workspace_fallback() {
         let calls = std::cell::RefCell::new(Vec::new());
 
         let result = super::execute_codex_desktop_jump(

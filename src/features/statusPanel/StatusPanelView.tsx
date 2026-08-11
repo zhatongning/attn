@@ -9,7 +9,6 @@ import {
   jumpToSession as jumpToSessionCommand,
   loadCodexHookIntegrationStatus,
   loadSessions,
-  loadSourceHealth,
   pinSession as pinSessionCommand,
   unpinSession as unpinSessionCommand,
 } from "../inbox/inboxApi";
@@ -33,6 +32,7 @@ const PANEL_MIN_HEIGHT = PANEL_BASE_HEIGHT - (PANEL_BASE_VISIBLE_ITEMS - 1) * PA
 const PANEL_MESSAGE_HEIGHT = 32;
 const PANEL_MAX_HEIGHT = 420;
 const PANEL_STRIP_HEIGHT = 50;
+const COMMAND_MESSAGE_DISMISS_DELAY_MS = 3000;
 const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "working"];
 const AUTO_COLLAPSE_STATUS_SET = new Set<InterventionStatus>(AUTO_COLLAPSE_STATUS_OPTIONS);
 
@@ -41,9 +41,8 @@ interface StatusPanelViewProps {
   sourceHealth: SourceHealth;
 }
 
-export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewProps) {
+export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: StatusPanelViewProps) {
   const [rows, setRows] = useState(initialRows);
-  const [health, setHealth] = useState(sourceHealth);
   const [config, setConfig] = useState<StatusPanelConfig>(() => loadInitialConfig());
   const [draftConfig, setDraftConfig] = useState<StatusPanelConfig>(() => config);
   const configRef = useRef(config);
@@ -51,6 +50,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [view, setView] = useState<"panel" | "management">("panel");
   const [expanded, setExpanded] = useState(false);
   const [commandMessage, setCommandMessage] = useState<string | null>(null);
+  const [jumpNotice, setJumpNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
   const [hookInstallPending, setHookInstallPending] = useState(false);
@@ -59,6 +59,11 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   const [panelOpen, setPanelOpen] = useState(config.panelMode === "persistent");
   const alertSignatureRef = useRef<string | null>(null);
   const autoCollapseTimerRef = useRef<number | undefined>(undefined);
+  const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
+  const actionFeedbackSequenceRef = useRef(0);
+  const mountedRef = useRef(true);
+  const resizeInFlightRef = useRef(false);
+  const queuedResizeHeightRef = useRef<number | undefined>(undefined);
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
   const hasPanelMessage = commandMessage !== null || errorMessage !== null;
@@ -78,29 +83,42 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
 
   async function refreshPanel() {
     try {
-      const [loadedRows, loadedHealth] = await Promise.all([loadSessions(), loadSourceHealth()]);
+      const loadedRows = await loadSessions();
+      if (!mountedRef.current) {
+        return;
+      }
       setRows(loadedRows);
-      setHealth(loadedHealth);
       setErrorMessage(null);
     } catch (error: unknown) {
-      setErrorMessage(error instanceof Error ? error.message : "Unable to load Codex source.");
+      if (!mountedRef.current) {
+        return;
+      }
+      setErrorMessage(messageFromUnknownError(error, "Unable to load Codex source."));
     }
   }
 
   async function refreshHookStatus() {
     try {
-      setHookStatus(await loadCodexHookIntegrationStatus());
+      const status = await loadCodexHookIntegrationStatus();
+      if (!mountedRef.current) {
+        return;
+      }
+      setHookStatus(status);
     } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
       setHookStatus({
         installed: false,
         hooksPath: "~/.codex/hooks.json",
         eventStorePath: "~/.codex/agent-session-inbox/hook-events.jsonl",
-        detail: error instanceof Error ? error.message : "Unable to load Codex hook status.",
+          detail: messageFromUnknownError(error, "Unable to load Codex hook status."),
       });
     }
   }
 
   useEffect(() => {
+    mountedRef.current = true;
     void refreshPanel();
     const refreshTimer = window.setInterval(() => {
       void refreshPanel();
@@ -118,7 +136,10 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     }).catch(() => undefined);
 
     return () => {
+      mountedRef.current = false;
+      actionFeedbackSequenceRef.current += 1;
       window.clearInterval(refreshTimer);
+      clearJumpNoticeTimer();
       unlistenMenu?.();
     };
   }, []);
@@ -157,7 +178,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
       : panelOpen
         ? panelHeight
         : PANEL_STRIP_HEIGHT;
-    void resizePanelWindow(nextHeight);
+    queuePanelWindowResize(nextHeight);
   }, [panelHeight, panelOpen, view]);
 
   useEffect(() => {
@@ -218,6 +239,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }, [model.visibleRows, model.hiddenRows]);
 
   async function dismissSession(row: StatusPanelRow) {
+    const actionFeedbackSequence = beginActionFeedback();
     const sessionId = row.sessionId;
     const sessionIds = row.dismissSessionIds ?? [row.sessionId];
     const dismissedIds = new Set(sessionIds);
@@ -228,21 +250,30 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
         dismissedIds.has(row.sessionId) ? { ...row, dismissed: true, handled: true, pinned: false } : row,
       ),
     );
-    setErrorMessage(null);
-
     try {
       const updatedRows = await dismissSessionCommand(sessionId, previousRows, sessionIds);
+      if (!mountedRef.current) {
+        return;
+      }
       setRows(updatedRows);
-      setCommandMessage("dismissed");
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        showCommandMessage("dismissed");
+      }
     } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
       setRows(previousRows);
-      setErrorMessage(error instanceof Error ? error.message : "Dismiss command failed.");
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        setErrorMessage(messageFromUnknownError(error, "Dismiss command failed."));
+      }
     } finally {
       clearPendingAction(sessionId);
     }
   }
 
   async function togglePinnedSession(row: ReturnType<typeof buildStatusPanelModel>["visibleRows"][number]) {
+    const actionFeedbackSequence = beginActionFeedback();
     const previousRows = rows;
     const nextPinned = !row.pinned;
     setPendingAction(row.sessionId, nextPinned ? "pin" : "unpin");
@@ -251,33 +282,51 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
         currentRow.sessionId === row.sessionId ? { ...currentRow, pinned: nextPinned } : currentRow,
       ),
     );
-    setErrorMessage(null);
-
     try {
       const updatedRows = nextPinned
         ? await pinSessionCommand(row.sessionId, previousRows)
         : await unpinSessionCommand(row.sessionId, previousRows);
+      if (!mountedRef.current) {
+        return;
+      }
       setRows(updatedRows);
-      setCommandMessage(nextPinned ? "pinned" : "unpinned");
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        showCommandMessage(nextPinned ? "pinned" : "unpinned");
+      }
     } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
       setRows(previousRows);
-      setErrorMessage(error instanceof Error ? error.message : "Pin command failed.");
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        setErrorMessage(messageFromUnknownError(error, "Pin command failed."));
+      }
     } finally {
       clearPendingAction(row.sessionId);
     }
   }
 
   async function jumpToSession(sessionId: string, acknowledgedSessionIds = [sessionId]) {
+    const actionFeedbackSequence = beginActionFeedback();
     setPendingAction(sessionId, "jump");
-    setCommandMessage("opening session");
-    setErrorMessage(null);
+    showJumpNotice("opening session");
 
     try {
       const result = await jumpToSessionCommand(sessionId, acknowledgedSessionIds);
-      setCommandMessage(result.message);
       await refreshPanel();
+      if (!isLatestActionFeedback(actionFeedbackSequence)) {
+        return;
+      }
+
+      if (result.succeeded) {
+        showTransientJumpNotice(result.message);
+      } else {
+        showJumpNotice(result.message);
+      }
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Jump command failed.");
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        showJumpNotice(messageFromUnknownError(error, "Jump command failed."));
+      }
     } finally {
       clearPendingAction(sessionId);
     }
@@ -519,10 +568,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
           </section>
 
           <footer className="panel-footer">
-            <span className={`source-dot source-dot--${health.status}`} />
-            <span>{model.copy.sourceNameLabels[health.sourceName] ?? health.sourceName}</span>
-            <span>{model.copy.sourceStatusLabels[health.status]}</span>
-            <span>{model.copy.localDataLabel}</span>
+            <span className="jump-notice" role="status" aria-atomic="true">{jumpNotice}</span>
             {model.hiddenCount > 0 ? (
               <button
                 type="button"
@@ -554,11 +600,80 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }
 
   function clearPendingAction(sessionId: string) {
+    if (!mountedRef.current) {
+      return;
+    }
     setPendingActions((current) => {
       const next = { ...current };
       delete next[sessionId];
       return next;
     });
+  }
+
+  function queuePanelWindowResize(height: number) {
+    if (resizeInFlightRef.current) {
+      queuedResizeHeightRef.current = height;
+      return;
+    }
+
+    void resizePanelWindowInOrder(height);
+  }
+
+  async function resizePanelWindowInOrder(height: number) {
+    resizeInFlightRef.current = true;
+    await resizePanelWindow(height);
+    resizeInFlightRef.current = false;
+
+    const queuedHeight = queuedResizeHeightRef.current;
+    queuedResizeHeightRef.current = undefined;
+    if (queuedHeight !== undefined) {
+      void resizePanelWindowInOrder(queuedHeight);
+    }
+  }
+
+  function clearJumpNoticeTimer() {
+    if (jumpNoticeTimerRef.current === undefined) return;
+    window.clearTimeout(jumpNoticeTimerRef.current);
+    jumpNoticeTimerRef.current = undefined;
+  }
+
+  function clearJumpNotice() {
+    clearJumpNoticeTimer();
+    setJumpNotice(null);
+  }
+
+  function beginActionFeedback() {
+    actionFeedbackSequenceRef.current += 1;
+    clearJumpNotice();
+    setCommandMessage(null);
+    setErrorMessage(null);
+    return actionFeedbackSequenceRef.current;
+  }
+
+  function isLatestActionFeedback(sequence: number) {
+    return mountedRef.current && actionFeedbackSequenceRef.current === sequence;
+  }
+
+  function showCommandMessage(message: string) {
+    clearJumpNotice();
+    setCommandMessage(message);
+  }
+
+  function showJumpNotice(message: string) {
+    clearJumpNoticeTimer();
+    setCommandMessage(null);
+    setJumpNotice(message);
+  }
+
+  function showTransientJumpNotice(message: string) {
+    showJumpNotice(message);
+    const timerId = window.setTimeout(() => {
+      if (jumpNoticeTimerRef.current === timerId) {
+        jumpNoticeTimerRef.current = undefined;
+        setJumpNotice(null);
+      }
+    }, COMMAND_MESSAGE_DISMISS_DELAY_MS);
+    jumpNoticeTimerRef.current = timerId;
   }
 
   function setStatusColor(state: keyof StatusPanelConfig["statusColors"], value: string) {
@@ -598,16 +713,28 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }
 
   async function installHooks() {
+    const actionFeedbackSequence = beginActionFeedback();
     setHookInstallPending(true);
-    setErrorMessage(null);
     try {
       const nextStatus = await installCodexHooks();
+      if (!mountedRef.current) {
+        return;
+      }
       setHookStatus(nextStatus);
-      setCommandMessage(nextStatus.detail);
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        showCommandMessage(nextStatus.detail);
+      }
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Codex hook installation failed.");
+      if (!mountedRef.current) {
+        return;
+      }
+      if (isLatestActionFeedback(actionFeedbackSequence)) {
+        setErrorMessage(messageFromUnknownError(error, "Codex hook installation failed."));
+      }
     } finally {
-      setHookInstallPending(false);
+      if (mountedRef.current) {
+        setHookInstallPending(false);
+      }
     }
   }
 
@@ -947,6 +1074,14 @@ function panelWindowHeight(visibleItemCount: number, hasMessage = false) {
     PANEL_MAX_HEIGHT,
     baseHeight + (hasMessage ? PANEL_MESSAGE_HEIGHT : 0),
   );
+}
+
+function messageFromUnknownError(error: unknown, fallback: string) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return typeof error === "string" ? error : fallback;
 }
 
 async function resizePanelWindow(height: number) {
