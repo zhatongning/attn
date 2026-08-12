@@ -1,15 +1,15 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import {
+  createCodexSessionsDevSource,
   defaultCodexSessionsRoot,
   defaultCodexStateDbPath,
-  discoverCodexSessions,
-  jumpToSession,
   sourceHealth,
 } from "./scripts/codexSessionsDevSource.mjs";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+const previewSource = createCodexSessionsDevSource();
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -45,8 +45,13 @@ function codexSessionsDevApi() {
   return {
     name: "codex-sessions-dev-api",
     configureServer(server: any) {
-      server.middlewares.use("/api/sessions", (_req: any, res: any) => {
-        sendJson(res, discoverCodexSessions());
+      server.middlewares.use("/api/sessions", (req: any, res: any) => {
+        const url = new URL(req.url ?? "/", "http://127.0.0.1");
+        sendJson(res, previewSource.discoverCodexSessions({
+          followUpToIdleMinutes: followUpToIdleMinutesFromRequestValue(
+            url.searchParams.get("followUpToIdleMinutes"),
+          ),
+        }));
       });
 
       server.middlewares.use("/api/source-health", (_req: any, res: any) => {
@@ -60,8 +65,10 @@ function codexSessionsDevApi() {
           return;
         }
 
-        readJsonBody(req)
-          .then(({ sessionId }) => jumpToSession(sessionId))
+        return readJsonBody(req)
+          .then(({ sessionId, followUpToIdleMinutes }) => previewSource.jumpToSession(sessionId, {
+            followUpToIdleMinutes: followUpToIdleMinutesFromRequestValue(followUpToIdleMinutes),
+          }))
           .then((result) => sendJson(res, result))
           .catch((error) => {
             res.statusCode = 500;
@@ -75,6 +82,12 @@ function codexSessionsDevApi() {
       });
     },
   };
+}
+
+function followUpToIdleMinutesFromRequestValue(value: unknown) {
+  if (typeof value === "number") return value;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  return Number(value);
 }
 
 function sendJson(res: any, payload: unknown) {
