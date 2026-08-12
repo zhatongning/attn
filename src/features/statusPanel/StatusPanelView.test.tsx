@@ -1797,30 +1797,106 @@ describe("StatusPanelView", () => {
     });
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => {
+      expect(lastInvokeCall("list_sessions")).toEqual([
+        "list_sessions",
+        { followUpToIdleMinutes: 45 },
+      ]);
+    });
+    tauriCoreMock.invoke.mockClear();
 
     fireEvent.click(await screen.findByTitle("Pin session"));
     await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("pin_session", { sessionId: row.sessionId });
       expect(lastInvokeCall("list_sessions")).toEqual([
         "list_sessions",
         { followUpToIdleMinutes: 45 },
       ]);
     });
 
+    tauriCoreMock.invoke.mockClear();
     fireEvent.click(await screen.findByTitle("Unpin session"));
     await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("unpin_session", { sessionId: row.sessionId });
       expect(lastInvokeCall("list_sessions")).toEqual([
         "list_sessions",
         { followUpToIdleMinutes: 45 },
       ]);
     });
 
+    tauriCoreMock.invoke.mockClear();
     fireEvent.click(await screen.findByTitle("Dismiss"));
     await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("dismiss_sessions", { sessionIds: [row.sessionId] });
       expect(lastInvokeCall("list_sessions")).toEqual([
         "list_sessions",
         { followUpToIdleMinutes: 45 },
       ]);
     });
+  });
+
+  it("does not let a pre-mutation refresh overwrite the post-mutation snapshot", async () => {
+    const initialRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "mutation-refresh-row",
+      label: "Initial mutation row",
+      state: "inspect",
+      pinned: false,
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const staleRow: SessionRow = {
+      ...initialRow,
+      label: "Stale pre-mutation row",
+      pinned: false,
+    };
+    const freshRow: SessionRow = {
+      ...initialRow,
+      label: "Post-mutation row",
+      pinned: true,
+    };
+    let resolveStaleRefresh: ((rows: SessionRow[]) => void) | undefined;
+    const staleRefresh = new Promise<SessionRow[]>((resolve) => {
+      resolveStaleRefresh = resolve;
+    });
+    let listCallCount = 0;
+
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      followUpToIdleMinutes: 45,
+      panelMode: "persistent",
+    }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation((command: string) => {
+      if (command === "list_sessions") {
+        listCallCount += 1;
+        return listCallCount === 1 ? staleRefresh : Promise.resolve([freshRow]);
+      }
+      if (command === "pin_session") return Promise.resolve([freshRow]);
+      return Promise.resolve(null);
+    });
+
+    render(<StatusPanelView initialRows={[initialRow]} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => {
+      expect(listCallCount).toBe(1);
+    });
+    expandPanel();
+
+    fireEvent.click(await screen.findByTitle("Pin session"));
+
+    await waitFor(() => {
+      expect(listCallCount).toBe(2);
+    });
+    expect(await screen.findByText("Post-mutation row")).toBeTruthy();
+    expect(screen.getByTitle("Unpin session")).toBeTruthy();
+
+    await act(async () => {
+      resolveStaleRefresh?.([staleRow]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Post-mutation row")).toBeTruthy();
+    expect(screen.getByTitle("Unpin session")).toBeTruthy();
+    expect(screen.queryByText("Stale pre-mutation row")).toBeNull();
   });
 
   it("keeps pinned rows in inspect after jump refresh returns acknowledged state", async () => {

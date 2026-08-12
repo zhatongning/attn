@@ -267,6 +267,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       setRows(updatedRows);
+      await refreshPanel(configRef.current.followUpToIdleMinutes);
+      if (!mountedRef.current) {
+        return;
+      }
       if (isLatestActionFeedback(actionFeedbackSequence)) {
         showCommandMessage("dismissed");
       }
@@ -301,6 +305,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       setRows(updatedRows);
+      await refreshPanel(configRef.current.followUpToIdleMinutes);
+      if (!mountedRef.current) {
+        return;
+      }
       if (isLatestActionFeedback(actionFeedbackSequence)) {
         showCommandMessage(nextPinned ? "pinned" : "unpinned");
       }
