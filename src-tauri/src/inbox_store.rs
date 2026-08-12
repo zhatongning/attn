@@ -12,7 +12,7 @@ use crate::domain::classification::classify_observation;
 use crate::domain::confidence::Confidence;
 use crate::domain::dismissability::evaluate_dismissability;
 use crate::codex_source::{
-    discover_codex_observation_by_id, discover_codex_observation_by_id_and_follow_up_window,
+    discover_codex_observation_by_id_and_follow_up_window,
     discover_codex_observations_with_state_db_and_follow_up_window, parse_utc_timestamp,
 };
 use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
@@ -194,13 +194,14 @@ impl InboxStore {
         let now = SystemTime::now();
         let now_ms = current_time_millis();
         let live_cli_sessions = find_live_codex_cli_sessions();
+        let follow_up_window = Duration::from_millis(follow_up_window_ms);
 
         let rows = discover_codex_observations_with_state_db_and_follow_up_window(
             &codex_state_db_path(),
             &codex_sessions_root(),
             80,
             now,
-            Duration::from_millis(follow_up_window_ms),
+            follow_up_window,
         )
             .into_iter()
             .map(|observation| {
@@ -213,9 +214,13 @@ impl InboxStore {
                 row
             })
             .collect();
-        let rows = merge_live_cli_sessions_with_row_builder(rows, live_cli_sessions, |live_session| {
-            live_cli_session_row(live_session, now)
-        });
+        let rows = merge_live_cli_sessions_with_codex_rows(
+            rows,
+            live_cli_sessions,
+            &codex_state_db_path(),
+            now,
+            follow_up_window,
+        );
 
         let mut rows = rows
             .into_iter()
@@ -458,11 +463,13 @@ impl InboxStore {
         let live_cli_sessions = find_live_codex_cli_sessions();
         let follow_up_to_idle_minutes =
             normalize_follow_up_to_idle_minutes(follow_up_to_idle_minutes);
+        let follow_up_window =
+            Duration::from_millis(follow_up_window_millis(follow_up_to_idle_minutes));
         let observation = discover_codex_observation_by_id_and_follow_up_window(
             &codex_state_db_path(),
             session_id,
             now,
-            Duration::from_millis(follow_up_window_millis(follow_up_to_idle_minutes)),
+            follow_up_window,
         )?;
         let mut row = classify_observation(observation);
         row = apply_live_cli_activity_signal(
@@ -470,9 +477,13 @@ impl InboxStore {
             |row| live_cli_tty_for_row_from_sessions(row, &live_cli_sessions),
             now,
         );
-        row = merge_live_cli_sessions_with_row_builder(vec![row], live_cli_sessions, |live_session| {
-            live_cli_session_row(live_session, now)
-        })
+        row = merge_live_cli_sessions_with_codex_rows(
+            vec![row],
+            live_cli_sessions,
+            &codex_state_db_path(),
+            now,
+            follow_up_window,
+        )
         .into_iter()
         .find(|row| row.session_id == session_id)?;
         let jump_availability = if row.workspace_path.is_some() {
@@ -873,6 +884,23 @@ fn merge_live_cli_sessions_with_row_builder(
     rows
 }
 
+fn merge_live_cli_sessions_with_codex_rows(
+    rows: Vec<SessionRow>,
+    live_sessions: Vec<LiveCliSession>,
+    state_db: &std::path::Path,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> Vec<SessionRow> {
+    merge_live_cli_sessions_with_row_builder(rows, live_sessions, |live_session| {
+        live_cli_session_row_with_state_db_and_follow_up_window(
+            live_session,
+            state_db,
+            now,
+            follow_up_window,
+        )
+    })
+}
+
 fn mark_live_cli_session_running(row: SessionRow, tty: &str) -> SessionRow {
     if !should_promote_live_cli_row(row.state) {
         return row;
@@ -896,11 +924,23 @@ fn should_promote_live_cli_row(state: SessionState) -> bool {
     matches!(state, SessionState::Unknown | SessionState::Idle)
 }
 
-fn live_cli_session_row(live_session: &LiveCliSession, now: SystemTime) -> SessionRow {
+fn live_cli_session_row_with_state_db_and_follow_up_window(
+    live_session: &LiveCliSession,
+    state_db: &std::path::Path,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> SessionRow {
     let row = live_session
         .session_id
         .as_deref()
-        .and_then(|session_id| discover_codex_observation_by_id(&codex_state_db_path(), session_id, now))
+        .and_then(|session_id| {
+            discover_codex_observation_by_id_and_follow_up_window(
+                state_db,
+                session_id,
+                now,
+                follow_up_window,
+            )
+        })
         .map(classify_observation)
         .unwrap_or_else(|| fallback_live_cli_session_row(live_session));
 
@@ -2251,6 +2291,53 @@ mod tests {
                 .state,
             SessionState::Inspect
         );
+    }
+
+    #[test]
+    fn live_cli_missing_rows_use_the_configured_follow_up_window() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let rollout_path = temp.path().join("rollout-019live.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019live","cwd":"/repo","originator":"codex-tui"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(format!(
+                "create table threads (id text primary key, rollout_path text not null, updated_at integer not null, updated_at_ms integer, source text not null, cwd text not null, title text not null, archived integer not null default 0, agent_nickname text, thread_source text, preview text);
+                 insert into threads (id, rollout_path, updated_at, updated_at_ms, source, cwd, title, archived, thread_source, preview)
+                 values ('019live', '{}', 1780648200, 1780648200000, 'cli', '/repo', 'CLI task', 0, 'user', 'CLI task');",
+                rollout_path.display()
+            ))
+            .status()
+            .expect("create state db");
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("019live".to_string()),
+            session_ids: vec!["019live".to_string()],
+            workspace_path: "/repo".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+
+        let rows = super::merge_live_cli_sessions_with_codex_rows(
+            Vec::new(),
+            live_sessions,
+            &state_db,
+            UNIX_EPOCH + Duration::from_secs(1_780_650_900),
+            Duration::from_secs(45 * 60),
+        );
+
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == "019live")
+            .expect("live CLI row");
+        assert_eq!(row.state, SessionState::NeedsAttention);
+        assert_eq!(row.jump_target, JumpTarget::Cli);
     }
 
     #[test]
