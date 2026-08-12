@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::domain::classification::classify_observation;
 use crate::domain::confidence::Confidence;
 use crate::domain::dismissability::evaluate_dismissability;
-use crate::codex_source::{discover_codex_observation_by_id, discover_codex_observations, parse_utc_timestamp};
+use crate::codex_source::{
+    discover_codex_observation_by_id, discover_codex_observation_by_id_and_follow_up_window,
+    discover_codex_observations_with_state_db_and_follow_up_window, parse_utc_timestamp,
+};
 use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
 use crate::domain::source_health::{SourceCapability, SourceHealth, SourceStatus};
 
@@ -192,7 +195,13 @@ impl InboxStore {
         let now_ms = current_time_millis();
         let live_cli_sessions = find_live_codex_cli_sessions();
 
-        let rows = discover_codex_observations(&codex_sessions_root(), 80)
+        let rows = discover_codex_observations_with_state_db_and_follow_up_window(
+            &codex_state_db_path(),
+            &codex_sessions_root(),
+            80,
+            now,
+            Duration::from_millis(follow_up_window_ms),
+        )
             .into_iter()
             .map(|observation| {
                 let mut row = classify_observation(observation);
@@ -443,14 +452,17 @@ impl InboxStore {
     fn fast_session_row_for_jump(
         &self,
         session_id: &str,
-        _follow_up_to_idle_minutes: Option<u64>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) -> Option<SessionRow> {
         let now = SystemTime::now();
         let live_cli_sessions = find_live_codex_cli_sessions();
-        let observation = discover_codex_observation_by_id(
+        let follow_up_to_idle_minutes =
+            normalize_follow_up_to_idle_minutes(follow_up_to_idle_minutes);
+        let observation = discover_codex_observation_by_id_and_follow_up_window(
             &codex_state_db_path(),
             session_id,
             now,
+            Duration::from_millis(follow_up_window_millis(follow_up_to_idle_minutes)),
         )?;
         let mut row = classify_observation(observation);
         row = apply_live_cli_activity_signal(

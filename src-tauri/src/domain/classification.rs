@@ -31,7 +31,7 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
         ObservationKind::Completed => (
             SessionState::NeedsAttention,
             Confidence::Exact,
-            "completed task was opened; keep it quiet during the 30-minute follow-up window".to_string(),
+            "completed task was opened; keep it quiet during the follow-up window".to_string(),
         ),
         ObservationKind::CompletedStale => (
             SessionState::Idle,
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(row.confidence, Confidence::Exact);
         assert_eq!(
             row.status_reason,
-            "completed task was opened; keep it quiet during the 30-minute follow-up window"
+            "completed task was opened; keep it quiet during the follow-up window"
         );
     }
 

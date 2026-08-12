@@ -12,6 +12,7 @@ use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 const UNREAD_COMPLETION_RETENTION: Duration = Duration::from_secs(12 * 60 * 60);
 const SESSION_TAIL_READ_BYTES: u64 = 128 * 1024;
 const HOOK_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_FOLLOW_UP_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone)]
 struct SessionFileSummary {
@@ -63,12 +64,29 @@ pub fn discover_codex_observations_with_state_db(
     limit: usize,
     now: SystemTime,
 ) -> Vec<SourceObservation> {
-    discover_codex_observations_with_state_db_and_hooks(
+    discover_codex_observations_with_state_db_and_follow_up_window(
+        state_db,
+        sessions_root,
+        limit,
+        now,
+        DEFAULT_FOLLOW_UP_WINDOW,
+    )
+}
+
+pub fn discover_codex_observations_with_state_db_and_follow_up_window(
+    state_db: &Path,
+    sessions_root: &Path,
+    limit: usize,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> Vec<SourceObservation> {
+    discover_codex_observations_with_state_db_and_hooks_and_follow_up_window(
         state_db,
         sessions_root,
         &codex_hook_events_path(),
         limit,
         now,
+        follow_up_window,
     )
 }
 
@@ -78,6 +96,24 @@ pub fn discover_codex_observations_with_state_db_and_hooks(
     hook_events_path: &Path,
     limit: usize,
     now: SystemTime,
+) -> Vec<SourceObservation> {
+    discover_codex_observations_with_state_db_and_hooks_and_follow_up_window(
+        state_db,
+        sessions_root,
+        hook_events_path,
+        limit,
+        now,
+        DEFAULT_FOLLOW_UP_WINDOW,
+    )
+}
+
+fn discover_codex_observations_with_state_db_and_hooks_and_follow_up_window(
+    state_db: &Path,
+    sessions_root: &Path,
+    hook_events_path: &Path,
+    limit: usize,
+    now: SystemTime,
+    follow_up_window: Duration,
 ) -> Vec<SourceObservation> {
     let Some(threads) = discover_threads_from_state_db(state_db, limit) else {
         return discover_codex_observations_with_now(sessions_root, limit, now);
@@ -89,7 +125,7 @@ pub fn discover_codex_observations_with_state_db_and_hooks(
         .into_iter()
         .filter_map(|thread| {
             let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
-            observation_from_thread(thread, hook_signal, now)
+            observation_from_thread(thread, hook_signal, now, follow_up_window)
         })
         .collect()
 }
@@ -99,10 +135,24 @@ pub fn discover_codex_observation_by_id(
     session_id: &str,
     now: SystemTime,
 ) -> Option<SourceObservation> {
+    discover_codex_observation_by_id_and_follow_up_window(
+        state_db,
+        session_id,
+        now,
+        DEFAULT_FOLLOW_UP_WINDOW,
+    )
+}
+
+pub fn discover_codex_observation_by_id_and_follow_up_window(
+    state_db: &Path,
+    session_id: &str,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> Option<SourceObservation> {
     let thread = discover_thread_from_state_db_by_id(state_db, session_id)?;
     let hook_signals = load_latest_hook_signals(&codex_hook_events_path());
     let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
-    observation_from_thread(thread, hook_signal, now)
+    observation_from_thread(thread, hook_signal, now, follow_up_window)
 }
 
 pub fn discover_codex_observations_with_now(
@@ -703,6 +753,7 @@ fn observation_from_thread(
     thread: ThreadSummary,
     hook_signal: Option<&CodexHookSignal>,
     now: SystemTime,
+    follow_up_window: Duration,
 ) -> Option<SourceObservation> {
     let parsed_jsonl = parse_session_file_tail_detailed(&thread.rollout_path, now).ok().flatten();
     let jsonl_observation = parsed_jsonl.as_ref().map(|parsed| &parsed.observation);
@@ -743,7 +794,11 @@ fn observation_from_thread(
         .and_then(|last_activity| now.duration_since(last_activity).ok())
         .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
     let jsonl_kind = jsonl_observation.as_ref().map(|observation| observation.kind);
-    let thread_completion_kind = completion_kind_from_last_activity_at(last_activity_at.as_deref(), now);
+    let thread_completion_kind = completion_kind_from_last_activity_at(
+        last_activity_at.as_deref(),
+        now,
+        follow_up_window,
+    );
     let has_recent_hook_activity = hook_signal
         .filter(|signal| is_hook_activity_event(&signal.event_name))
         .and_then(|signal| now.duration_since(signal.timestamp_time).ok())
@@ -858,14 +913,18 @@ fn observation_from_thread(
     Some(observation)
 }
 
-fn completion_kind_from_last_activity_at(last_activity_at: Option<&str>, now: SystemTime) -> ObservationKind {
+fn completion_kind_from_last_activity_at(
+    last_activity_at: Option<&str>,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> ObservationKind {
     let completion_age = last_activity_at
         .and_then(parse_utc_timestamp)
         .and_then(|last_activity| now.duration_since(last_activity).ok());
 
     if completion_age.is_some_and(|age| age <= Duration::from_secs(5 * 60)) {
         ObservationKind::CompletedImmediate
-    } else if completion_age.is_some_and(|age| age <= Duration::from_secs(30 * 60)) {
+    } else if completion_age.is_some_and(|age| age <= follow_up_window) {
         ObservationKind::Completed
     } else {
         ObservationKind::CompletedStale
@@ -1181,6 +1240,7 @@ mod tests {
     use crate::codex_source::{
         discover_codex_observation_by_id, discover_codex_observations_with_now,
         discover_codex_observations_with_state_db,
+        discover_codex_observations_with_state_db_and_follow_up_window,
         discover_codex_observations_with_state_db_and_hooks,
     };
     use crate::domain::session::{JumpTarget, ObservationKind};
@@ -1928,6 +1988,51 @@ mod tests {
             rows[0].last_activity_at.as_deref(),
             Some("2026-06-05T08:30:00.000Z")
         );
+    }
+
+    #[test]
+    fn sqlite_thread_update_uses_configured_follow_up_boundary() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T16-00-00-019read.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019read","cwd":"/Users/edy/agent-session-inbox","originator":"Codex Desktop","source":"vscode"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019read",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/agent-session-inbox",
+            "按照迁移过来的文档继续吧",
+            1_780_648_200_000,
+        );
+
+        let at_boundary = discover_codex_observations_with_state_db_and_follow_up_window(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_650_900),
+            Duration::from_secs(45 * 60),
+        );
+        let after_boundary = discover_codex_observations_with_state_db_and_follow_up_window(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_780_650_900_001),
+            Duration::from_secs(45 * 60),
+        );
+
+        assert_eq!(at_boundary[0].kind, ObservationKind::Completed);
+        assert_eq!(after_boundary[0].kind, ObservationKind::CompletedStale);
     }
 
     #[test]
