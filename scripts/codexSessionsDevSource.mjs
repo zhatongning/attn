@@ -14,6 +14,18 @@ export function normalizeFollowUpToIdleMinutes(value) {
   return Math.max(minFollowUpToIdleMinutes, Math.trunc(value));
 }
 
+function followUpWindowMs(followUpToIdleMinutes) {
+  const windowMs = followUpToIdleMinutes * 60 * 1000;
+  return Number.isFinite(windowMs) && windowMs <= Number.MAX_SAFE_INTEGER
+    ? windowMs
+    : Number.POSITIVE_INFINITY;
+}
+
+function isWithinFollowUpWindow(nowMs, acknowledgedAtMs, followUpToIdleMinutes) {
+  const windowMs = followUpWindowMs(followUpToIdleMinutes);
+  return windowMs === Number.POSITIVE_INFINITY || nowMs - acknowledgedAtMs <= windowMs;
+}
+
 export function defaultCodexSessionsRoot() {
   return path.join(os.homedir(), ".codex", "sessions");
 }
@@ -367,7 +379,7 @@ function terminalOrInputKind(kind) {
 function completionKindFromLastActivityAt(lastActivityAt, nowMs, followUpToIdleMinutes) {
   const ageMs = lastActivityAt ? nowMs - Date.parse(lastActivityAt) : Number.POSITIVE_INFINITY;
   if (ageMs <= 5 * 60 * 1000) return "completedImmediate";
-  if (ageMs <= followUpToIdleMinutes * 60 * 1000) return "completed";
+  if (ageMs <= followUpWindowMs(followUpToIdleMinutes)) return "completed";
   return "completedStale";
 }
 
@@ -776,7 +788,11 @@ function applyAcknowledgedSessionState(
   if (row.state === "waitingForInput") return row;
 
   const acknowledgedAtMs = acknowledgedSignals.get(acknowledgedSignal(row));
-  if (typeof acknowledgedAtMs === "number" && nowMs - acknowledgedAtMs <= followUpToIdleMinutes * 60 * 1000) {
+  if (typeof acknowledgedAtMs === "number" && isWithinFollowUpWindow(
+    nowMs,
+    acknowledgedAtMs,
+    followUpToIdleMinutes,
+  )) {
     return {
       ...row,
       state: "needsAttention",

@@ -513,6 +513,42 @@ describe("codexSessionsDevSource", () => {
     expect(normalizeFollowUpToIdleMinutes(Number.POSITIVE_INFINITY)).toBe(30);
   });
 
+  it("keeps acknowledged rows in the extreme finite follow-up window", async () => {
+    const temp = tempDir();
+    const acknowledgedAtMs = Date.parse("2026-06-06T04:00:00.000Z");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019extreme-window.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019extreme-window","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    const source = createCodexSessionsDevSource({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: () => acknowledgedAtMs,
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      liveCliTtyForWorkspace: () => undefined,
+      executeJump: async () => undefined,
+    });
+
+    await source.jumpToSession("019extreme-window");
+    const rows = source.discoverCodexSessions({
+      nowMs: Number.MAX_SAFE_INTEGER,
+      followUpToIdleMinutes: 1e20,
+    });
+
+    expect(normalizeFollowUpToIdleMinutes(1e20)).toBe(1e20);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019extreme-window",
+      state: "needsAttention",
+      handled: true,
+    });
+  });
+
   it("resumes exact CLI sessions in a previous iTerm tab instead of only focusing it", async () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");

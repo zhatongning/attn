@@ -11,7 +11,7 @@ use tauri::{Emitter, LogicalPosition, Manager, Monitor, Runtime, WebviewWindow};
 #[tauri::command]
 async fn list_sessions(
     state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
-    follow_up_to_idle_minutes: Option<u64>,
+    follow_up_to_idle_minutes: Option<f64>,
 ) -> Result<Vec<domain::session::SessionRow>, String> {
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
@@ -100,7 +100,7 @@ async fn jump_to_session(
     state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
     session_id: String,
     acknowledged_session_ids: Option<Vec<String>>,
-    follow_up_to_idle_minutes: Option<u64>,
+    follow_up_to_idle_minutes: Option<f64>,
 ) -> Result<inbox_store::JumpResult, String> {
     let state = Arc::clone(state.inner());
     let fallback_session_id = session_id.clone();
