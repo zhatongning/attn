@@ -11,9 +11,12 @@ use tauri::{Emitter, LogicalPosition, Manager, Monitor, Runtime, WebviewWindow};
 #[tauri::command]
 async fn list_sessions(
     state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
+    follow_up_to_idle_minutes: Option<u64>,
 ) -> Result<Vec<domain::session::SessionRow>, String> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.list_sessions())
+    tauri::async_runtime::spawn_blocking(move || {
+        state.list_sessions_with_follow_up_to_idle_minutes(follow_up_to_idle_minutes)
+    })
         .await
         .map_err(|error| format!("session worker failed: {error}"))
 }
@@ -97,11 +100,16 @@ async fn jump_to_session(
     state: tauri::State<'_, Arc<inbox_store::InboxStore>>,
     session_id: String,
     acknowledged_session_ids: Option<Vec<String>>,
+    follow_up_to_idle_minutes: Option<u64>,
 ) -> Result<inbox_store::JumpResult, String> {
     let state = Arc::clone(state.inner());
     let fallback_session_id = session_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        state.jump_to_session(&session_id, acknowledged_session_ids.as_deref())
+        state.jump_to_session(
+            &session_id,
+            acknowledged_session_ids.as_deref(),
+            follow_up_to_idle_minutes,
+        )
     })
         .await
         .map_err(|error| format!("jump worker failed: {error}"))

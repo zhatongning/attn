@@ -18,6 +18,19 @@ use crate::domain::source_health::{SourceCapability, SourceHealth, SourceStatus}
 const SESSION_ROWS_CACHE_TTL: Duration = Duration::from_millis(5500);
 const PENDING_CLI_INPUT_FRESHNESS: Duration = Duration::from_secs(30 * 60);
 
+pub const DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES: u64 = 30;
+pub const MIN_FOLLOW_UP_TO_IDLE_MINUTES: u64 = 20;
+
+pub fn normalize_follow_up_to_idle_minutes(minutes: Option<u64>) -> u64 {
+    minutes
+        .unwrap_or(DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES)
+        .max(MIN_FOLLOW_UP_TO_IDLE_MINUTES)
+}
+
+fn follow_up_window_millis(minutes: u64) -> u64 {
+    minutes.saturating_mul(60).saturating_mul(1000)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JumpResult {
@@ -120,30 +133,43 @@ impl AcknowledgedSignal {
 struct CachedSessionRows {
     rows: Vec<SessionRow>,
     loaded_at: Instant,
+    follow_up_to_idle_minutes: u64,
 }
 
 impl InboxStore {
     pub fn list_sessions(&self) -> Vec<SessionRow> {
+        self.list_sessions_with_follow_up_to_idle_minutes(None)
+    }
+
+    pub fn list_sessions_with_follow_up_to_idle_minutes(
+        &self,
+        follow_up_to_idle_minutes: Option<u64>,
+    ) -> Vec<SessionRow> {
+        let follow_up_to_idle_minutes =
+            normalize_follow_up_to_idle_minutes(follow_up_to_idle_minutes);
         let mut cache = self
             .session_rows_cache
             .lock()
             .expect("session row cache lock poisoned");
         if let Some(cached) = cache.as_ref() {
-            if cached.loaded_at.elapsed() <= SESSION_ROWS_CACHE_TTL {
+            if cached.loaded_at.elapsed() <= SESSION_ROWS_CACHE_TTL
+                && cached.follow_up_to_idle_minutes == follow_up_to_idle_minutes
+            {
                 return cached.rows.clone();
             }
         }
 
-        let rows = self.compute_session_rows();
+        let rows = self.compute_session_rows(follow_up_window_millis(follow_up_to_idle_minutes));
         *cache = Some(CachedSessionRows {
             rows: rows.clone(),
             loaded_at: Instant::now(),
+            follow_up_to_idle_minutes,
         });
 
         rows
     }
 
-    fn compute_session_rows(&self) -> Vec<SessionRow> {
+    fn compute_session_rows(&self, follow_up_window_ms: u64) -> Vec<SessionRow> {
         self.refresh_persisted_acknowledged_signals();
         self.refresh_persisted_pinned_session_ids();
         self.refresh_persisted_dismissed_session_ids();
@@ -191,6 +217,7 @@ impl InboxStore {
                     &dismissed_session_ids,
                     &pinned_session_ids,
                     now_ms,
+                    follow_up_window_ms,
                 )
             })
             .collect::<Vec<_>>();
@@ -307,11 +334,12 @@ impl InboxStore {
         &self,
         session_id: &str,
         acknowledged_session_ids: Option<&[String]>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) -> JumpResult {
         let row = self
-            .fast_session_row_for_jump(session_id)
+            .fast_session_row_for_jump(session_id, follow_up_to_idle_minutes)
             .or_else(|| {
-                self.list_sessions()
+                self.list_sessions_with_follow_up_to_idle_minutes(follow_up_to_idle_minutes)
                     .into_iter()
                     .find(|row| row.session_id == session_id)
             });
@@ -329,7 +357,11 @@ impl InboxStore {
         let execution = plan.clone().map(execute_jump_command_plan);
         if matches!(execution, Some(Ok(()))) {
             if let Some(row) = row.as_ref() {
-                self.acknowledge_session_signals(row, acknowledged_session_ids);
+                self.acknowledge_session_signals(
+                    row,
+                    acknowledged_session_ids,
+                    follow_up_to_idle_minutes,
+                );
                 self.invalidate_session_rows_cache();
             }
         }
@@ -377,6 +409,7 @@ impl InboxStore {
         &self,
         row: &SessionRow,
         acknowledged_session_ids: Option<&[String]>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) {
         let mut acknowledged_signals = self
             .acknowledged_signals
@@ -389,7 +422,9 @@ impl InboxStore {
                 if session_id == &row.session_id {
                     continue;
                 }
-                let Some(row) = self.fast_session_row_for_jump(session_id) else {
+                let Some(row) =
+                    self.fast_session_row_for_jump(session_id, follow_up_to_idle_minutes)
+                else {
                     continue;
                 };
                 acknowledged_signals.replace(AcknowledgedSignal::from_row_at(&row, acknowledged_at_ms));
@@ -405,7 +440,11 @@ impl InboxStore {
             .expect("session row cache lock poisoned") = None;
     }
 
-    fn fast_session_row_for_jump(&self, session_id: &str) -> Option<SessionRow> {
+    fn fast_session_row_for_jump(
+        &self,
+        session_id: &str,
+        _follow_up_to_idle_minutes: Option<u64>,
+    ) -> Option<SessionRow> {
         let now = SystemTime::now();
         let live_cli_sessions = find_live_codex_cli_sessions();
         let observation = discover_codex_observation_by_id(
@@ -514,6 +553,7 @@ fn finalize_session_row(
     dismissed_session_ids: &HashSet<String>,
     pinned_session_ids: &HashSet<String>,
     now_ms: u64,
+    follow_up_window_ms: u64,
 ) -> SessionRow {
     let dismissability = evaluate_dismissability(&row);
     let jump_availability = jump_availability_for_row(&row);
@@ -524,7 +564,7 @@ fn finalize_session_row(
     let row = if row.pinned {
         row
     } else {
-        apply_acknowledged_session_state(row, acknowledged_signals, now_ms)
+        apply_acknowledged_session_state(row, acknowledged_signals, now_ms, follow_up_window_ms)
     };
     apply_dismissed_session_state(row, dismissed_session_ids)
 }
@@ -638,6 +678,7 @@ fn apply_acknowledged_session_state(
     row: SessionRow,
     acknowledged_signals: &HashSet<AcknowledgedSignal>,
     now_ms: u64,
+    follow_up_window_ms: u64,
 ) -> SessionRow {
     let Some(signal) = acknowledged_signals.get(&AcknowledgedSignal::from_row(&row)) else {
         return row;
@@ -661,11 +702,11 @@ fn apply_acknowledged_session_state(
         };
     };
 
-    if now_ms.saturating_sub(acknowledged_at_ms) <= 30 * 60 * 1000 {
+    if now_ms.saturating_sub(acknowledged_at_ms) <= follow_up_window_ms {
         return SessionRow {
             state: SessionState::NeedsAttention,
             confidence: Confidence::Exact,
-            status_reason: "Read recently; keep it quiet during the 30-minute follow-up window.".to_string(),
+            status_reason: "Read recently; keep it quiet during the follow-up window.".to_string(),
             handled: true,
             dismissed: false,
             ..row
@@ -1735,7 +1776,7 @@ mod tests {
     fn jump_reports_unavailable_for_unknown_rows() {
         let store = InboxStore::default();
 
-        let result = store.jump_to_session("missing", None);
+        let result = store.jump_to_session("missing", None, None);
 
         assert_eq!(result.availability, JumpAvailability::Unavailable);
         assert_eq!(result.target, JumpTarget::Unknown);
@@ -2372,6 +2413,7 @@ mod tests {
             &dismissed_session_ids,
             &pinned_session_ids,
             1_780_000_000_000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
 
         assert_eq!(row.state, SessionState::Inspect);
@@ -2397,6 +2439,7 @@ mod tests {
             &dismissed_session_ids,
             &pinned_session_ids,
             acknowledged_at_ms + 29 * 60 * 1000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
 
         assert_eq!(row.state, SessionState::Inspect);
@@ -2457,6 +2500,7 @@ mod tests {
                 &dismissed_session_ids,
                 &pinned_session_ids,
                 1_780_000_000_000,
+                super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
             )
         })
         .collect::<Vec<_>>();
@@ -2495,6 +2539,7 @@ mod tests {
             session_rows_cache: std::sync::Mutex::new(Some(super::CachedSessionRows {
                 rows: vec![cached_row.clone()],
                 loaded_at: std::time::Instant::now(),
+                follow_up_to_idle_minutes: super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES,
             })),
             dismissed_sessions_path: temp.path().join("dismissed-sessions.json"),
         };
@@ -2517,6 +2562,7 @@ mod tests {
             row,
             &acknowledged,
             acknowledged_at_ms + 29 * 60 * 1000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
 
         assert_eq!(confirmed_row.state, SessionState::NeedsAttention);
@@ -2525,7 +2571,7 @@ mod tests {
         assert!(!confirmed_row.dismissed);
         assert_eq!(
             confirmed_row.status_reason,
-            "Read recently; keep it quiet during the 30-minute follow-up window."
+            "Read recently; keep it quiet during the follow-up window."
         );
 
         let row = SessionRow::new("s6", "Needs input", SessionState::Inspect, Confidence::Exact)
@@ -2534,6 +2580,7 @@ mod tests {
             row,
             &acknowledged,
             acknowledged_at_ms + 31 * 60 * 1000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
 
         assert_eq!(expired_row.state, SessionState::Idle);
@@ -2543,10 +2590,51 @@ mod tests {
 
         let changed_row = SessionRow::new("s6", "Needs input", SessionState::Inspect, Confidence::Exact)
             .with_last_activity("2026-06-04T04:01:00.000Z");
-        let changed_row = super::apply_acknowledged_session_state(changed_row, &acknowledged, acknowledged_at_ms);
+        let changed_row = super::apply_acknowledged_session_state(
+            changed_row,
+            &acknowledged,
+            acknowledged_at_ms,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
+        );
 
         assert_eq!(changed_row.state, SessionState::Inspect);
         assert!(!changed_row.handled);
+    }
+
+    #[test]
+    fn normalizes_follow_up_to_idle_minutes_without_a_product_maximum() {
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(None), 30);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(19)), 20);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(20)), 20);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(180)), 180);
+    }
+
+    #[test]
+    fn acknowledged_rows_use_the_configured_follow_up_boundary() {
+        let row = SessionRow::new("s6", "Inspect", SessionState::Inspect, Confidence::Exact)
+            .with_last_activity("2026-06-04T04:00:00.000Z");
+        let acknowledged_at_ms = 1_780_000_000_000;
+        let acknowledged = HashSet::from([super::AcknowledgedSignal::from_row_at(
+            &row,
+            acknowledged_at_ms,
+        )]);
+        let duration_ms = 45 * 60 * 1000;
+
+        let at_boundary = super::apply_acknowledged_session_state(
+            row.clone(),
+            &acknowledged,
+            acknowledged_at_ms + duration_ms,
+            duration_ms,
+        );
+        let after_boundary = super::apply_acknowledged_session_state(
+            row,
+            &acknowledged,
+            acknowledged_at_ms + duration_ms + 1,
+            duration_ms,
+        );
+
+        assert_eq!(at_boundary.state, SessionState::NeedsAttention);
+        assert_eq!(after_boundary.state, SessionState::Idle);
     }
 
     #[test]
@@ -2565,11 +2653,13 @@ mod tests {
             parent,
             &acknowledged,
             acknowledged_at_ms + 5 * 60 * 1000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
         let confirmed_child = super::apply_acknowledged_session_state(
             child,
             &acknowledged,
             acknowledged_at_ms + 5 * 60 * 1000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
 
         assert_eq!(confirmed_parent.state, SessionState::NeedsAttention);
@@ -2595,6 +2685,7 @@ mod tests {
             row,
             &acknowledged,
             acknowledged_at_ms + 29 * 60 * 1000,
+            super::follow_up_window_millis(super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES),
         );
 
         assert_eq!(confirmed_row.state, SessionState::WaitingForInput);
