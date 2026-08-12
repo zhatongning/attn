@@ -95,8 +95,8 @@ These are the rules implemented today.
 Completion attention is time-bounded and read-driven:
 
 - `inspect`: completed result is at most 12 hours old and has not been opened/read yet.
-- `follow-up`: completed result was opened/read within the last 30 minutes; keep it quiet and out of Alerts, but use it to fill an unused configured panel slot after primary rows.
-- `idle`: completed result is older than 12 hours, or was opened/read more than 30 minutes ago.
+- `follow-up`: completed result was opened/read within the configured follow-up window (30 minutes by default; 20-minute minimum); keep it quiet and out of Alerts, but use it to fill an unused configured panel slot after primary rows.
+- `idle`: completed result is older than 12 hours, or was opened/read more than the configured follow-up duration ago.
 
 Unread-completion retention is 12 hours. After this window, a terminal unread completion becomes `CompletedStale` and stays quiet unless newer source evidence appears.
 
@@ -108,7 +108,7 @@ Generic non-terminal activity is still considered recent for 2 hours.
 | --- | --- |
 | JSONL says `CompletedImmediate`, `Completed`, `Failed`, or `WaitingForInput` | Use JSONL terminal/input state. |
 | JSONL says unread `task_complete` within 12 hours | Keep as `CompletedImmediate` until read or the 12-hour retention window expires. |
-| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat the completed result as read/opened and apply the 30-minute `follow-up` window from `updated_at_ms`. |
+| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat the completed result as read/opened and apply the configured `follow-up` window (30 minutes by default; 20-minute minimum) from `updated_at_ms`. |
 | Thread is archived without explicit unread completion evidence | Apply completion-age fallback, usually `CompletedStale` for old archived threads. |
 | Desktop thread has recent activity | `Running` |
 | Desktop thread is old and unarchived | `Idle` |
@@ -174,7 +174,7 @@ For this app, user-level hooks are likely the right default because the status p
 | `Idle` | `idle` | `inferred` | `no recent activity observed; idle until the next source signal` |
 | `WaitingForInput` | `waitingForInput` | `exact` | `waiting for user input` |
 | `CompletedImmediate` | `inspect` | `exact` | `completed task ready to inspect; open it to mark read` |
-| `Completed` | `needsAttention` | `exact` | `completed task was opened; keep it quiet during the 30-minute follow-up window` |
+| `Completed` | `needsAttention` | `exact` | `completed task was opened; keep it quiet during the follow-up window` |
 | `CompletedStale` | `idle` | `inferred` | `completed task is no longer recent; idle until the next source signal` |
 | `Failed` | `inspect` | `exact` | `failed task can be manually reviewed and cleared` |
 | `InsufficientEvidence` | `unknown` | `unknown` | `missing source evidence for status classification` |
@@ -199,10 +199,10 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 
 | User action | Current transition |
 | --- | --- |
-| Click Jump back on an `inspect` row | Mark the current signal as read, then keep it as quiet `follow-up` for 30 minutes. |
+| Click Jump back on an `inspect` row | Mark the current signal as read, then keep it as quiet `follow-up` for the configured duration (30 minutes by default; 20-minute minimum). |
 | Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
 | Unread completion exceeds 12 hours | Show the row as `idle` until newer source evidence arrives. |
-| Read window exceeds 30 minutes | Show the row as `idle` until newer source evidence arrives. |
+| Read window exceeds the configured follow-up duration | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `running` or `idle` | No state transition. |
 | Dismiss an `inspect`, `stopped`, or `unknown` row | Hide it until the display status becomes `running`; any later `follow-up` remains quiet. |
 | Dismiss a `running` or `follow-up` row | A running row is restored immediately on the next list; an unpinned follow-up remains quiet. |
@@ -215,7 +215,7 @@ If the same session gets newer activity, the read acknowledgement no longer appl
 These are the areas that currently feel wrong or need product decisions.
 
 1. Completion attention is bounded by freshness and read state.
-   A completed result stays `inspect` for at most 12 hours unless opened/read earlier; reading shows quiet `follow-up` for 30 minutes, then `idle`.
+   A completed result stays `inspect` for at most 12 hours unless opened/read earlier; reading shows quiet `follow-up` for the configured duration (30 minutes by default; 20-minute minimum), then `idle`.
 
 2. `inspect` still combines successful completion and failure/manual-clear cases.
    These may need separate reasons later, but the shared user action is still "open and inspect."
@@ -223,8 +223,8 @@ These are the areas that currently feel wrong or need product decisions.
 3. `idle` has two meanings.
    It can mean "old inactive session" or "user confirmed this session." These are both quiet, but they may need different reasons or sorting.
 
-4. Time windows are hard-coded.
-   `recent = 2 hours` is a technical default, not yet a product decision.
+4. Some time windows are hard-coded.
+   `recent = 2 hours` is a technical default, not yet a product decision; the follow-up duration is configurable (30 minutes by default; 20-minute minimum).
 
 5. The panel still behaves partly like a list of sessions.
    The product goal is an intervention watchlist. Old quiet rows should probably be hidden or collapsed more aggressively.
@@ -243,7 +243,7 @@ These are the areas that currently feel wrong or need product decisions.
 We should decide these before more code changes.
 
 1. When should `task_complete` become visible?
-   Current decision: unread completed results stay `inspect`; reading them starts a quiet 30-minute `follow-up` window, then they become `idle`.
+   Current decision: unread completed results stay `inspect`; reading them starts a quiet configurable `follow-up` window (30 minutes by default; 20-minute minimum), then they become `idle`.
 
 2. What does `inspect` mean?
    It means a result was produced and should be checked while context is fresh.
@@ -263,7 +263,7 @@ We should decide these before more code changes.
    Current behavior keeps `running` visible because live work is important context. `follow-up` can fill unused configured capacity after primary rows, while `idle` stays in the quiet count because it does not require action.
 
 5. What is the retention rule for completed sessions?
-   Current decision: unread completions older than 12 hours become `idle`; acknowledged completions become `idle` after their 30-minute follow-up window.
+   Current decision: unread completions older than 12 hours become `idle`; acknowledged completions become `idle` after their configured follow-up duration (30 minutes by default; 20-minute minimum).
 
 6. How should the hook writer be installed?
    Current implementation provides `scripts/attn-codex-hook.cjs`, reads its output, and can merge user-level `~/.codex/hooks.json` after the user confirms from the management page.
@@ -281,7 +281,7 @@ stateDiagram-v2
     Inspect --> Needed: user opens/reads result
     Inspect --> Needed: SQLite updated_at_ms advances after task_complete
     Inspect --> Idle: unread window exceeds 12 hours
-    Needed --> Idle: read window exceeds 30 minutes
+    Needed --> Idle: read window exceeds configured follow-up duration
     Working --> Idle: task_complete older than 12 hours
     Working --> Idle: old activity without intervention signal
     Working --> Input: waiting for user intervention

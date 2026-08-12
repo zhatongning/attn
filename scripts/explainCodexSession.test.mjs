@@ -58,7 +58,7 @@ describe("explainCodexSession", () => {
       sqliteUpdatedAt: "2026-06-06T04:10:00.000Z",
       sqliteUpdatedAfterTaskComplete: true,
       state: "needsAttention",
-      statusReason: "completed task was opened; keep it quiet during the 30-minute follow-up window",
+      statusReason: "completed task was opened; keep it quiet during the follow-up window",
       evidenceSummary: "local Codex JSONL activity observed",
     });
   });
