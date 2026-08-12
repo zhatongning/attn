@@ -51,7 +51,6 @@ export interface StatusPanelModel {
   expandableHiddenCount: number;
   interventionCount: number;
   workingCount: number;
-  idleCount: number;
   theme: AtomInterventionTheme;
   copy: StatusPanelCopy;
 }
@@ -59,8 +58,6 @@ export interface StatusPanelModel {
 export interface StatusPanelCopy {
   alertsLabel: string;
   workingLabel: string;
-  idleLabel: string;
-  quietLabel: string;
   hiddenAlertsLabel: string;
   hiddenPinnedLabel: string;
   collapseLabel: string;
@@ -87,6 +84,7 @@ export interface StatusPanelCopy {
   installCodexHooksLabel: string;
   installingLabel: string;
   codexHooksInstalledLabel: string;
+  codexHooksNotInstalledLabel: string;
   applySettingsLabel: string;
   backLabel: string;
   emptyPanelLabel: string;
@@ -95,12 +93,25 @@ export interface StatusPanelCopy {
   collapsePanelLabel: string;
   jumpBackLabel: string;
   openingSessionLabel: string;
+  openedDesktopSessionLabel: string;
+  openedCliSessionLabel: string;
+  openedSessionLabel: string;
+  jumpUnavailableLabel: string;
+  jumpFailedLabel: string;
   pinLabel: string;
   unpinLabel: string;
   pinningLabel: string;
   unpinningLabel: string;
+  pinnedSessionLabel: string;
+  unpinnedSessionLabel: string;
+  pinFailedLabel: string;
   dismissLabel: string;
   dismissingLabel: string;
+  dismissedSessionLabel: string;
+  dismissFailedLabel: string;
+  loadSourceFailedLabel: string;
+  loadHookStatusFailedLabel: string;
+  installHooksFailedLabel: string;
   subagentAnomalyLabel: string;
   showEvidenceLabel: (label: string) => string;
   subtaskSummaryLabel: (summary: SubtaskSummary) => string;
@@ -220,8 +231,6 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   en: {
     alertsLabel: "alerts",
     workingLabel: "running",
-    idleLabel: "idle",
-    quietLabel: "quiet",
     hiddenAlertsLabel: "alerts",
     hiddenPinnedLabel: "pinned",
     collapseLabel: "collapse",
@@ -248,6 +257,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     installCodexHooksLabel: "Install Codex hooks",
     installingLabel: "Installing...",
     codexHooksInstalledLabel: "Codex hooks installed",
+    codexHooksNotInstalledLabel: "Codex hooks are not installed",
     applySettingsLabel: "Apply settings",
     backLabel: "Back",
     emptyPanelLabel: "no active Codex sessions",
@@ -256,12 +266,25 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     collapsePanelLabel: "Collapse status panel",
     jumpBackLabel: "Jump back",
     openingSessionLabel: "Opening session",
+    openedDesktopSessionLabel: "Opened Codex Desktop session.",
+    openedCliSessionLabel: "Opened Codex CLI session.",
+    openedSessionLabel: "Opened session.",
+    jumpUnavailableLabel: "Jump-back unavailable.",
+    jumpFailedLabel: "Jump command failed.",
     pinLabel: "Pin session",
     unpinLabel: "Unpin session",
     pinningLabel: "Pinning session",
     unpinningLabel: "Unpinning session",
+    pinnedSessionLabel: "Pinned session",
+    unpinnedSessionLabel: "Unpinned session",
+    pinFailedLabel: "Pin command failed.",
     dismissLabel: "Dismiss",
     dismissingLabel: "Dismissing session",
+    dismissedSessionLabel: "Dismissed session",
+    dismissFailedLabel: "Dismiss command failed.",
+    loadSourceFailedLabel: "Unable to load Codex source.",
+    loadHookStatusFailedLabel: "Unable to load Codex hook status.",
+    installHooksFailedLabel: "Codex hook installation failed.",
     subagentAnomalyLabel: "subagent anomaly",
     showEvidenceLabel: (label) => `Show status evidence for ${label}`,
     subtaskSummaryLabel: (summary) => {
@@ -305,8 +328,6 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   zh: {
     alertsLabel: "需关注",
     workingLabel: "进行中",
-    idleLabel: "空闲",
-    quietLabel: "安静",
     hiddenAlertsLabel: "需关注",
     hiddenPinnedLabel: "已固定",
     collapseLabel: "收起",
@@ -329,10 +350,11 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     workingColorLabel: "进行中颜色",
     idleColorLabel: "空闲颜色",
     codexHooksLabel: "Codex 钩子",
-    checkingCodexHooksLabel: "正在检查 Codex hook 状态...",
+    checkingCodexHooksLabel: "正在检查 Codex 钩子状态...",
     installCodexHooksLabel: "安装 Codex 钩子",
     installingLabel: "安装中...",
     codexHooksInstalledLabel: "Codex 钩子已安装",
+    codexHooksNotInstalledLabel: "尚未安装 Codex 钩子",
     applySettingsLabel: "应用设置",
     backLabel: "返回",
     emptyPanelLabel: "没有活跃的 Codex 会话",
@@ -341,12 +363,25 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     collapsePanelLabel: "收起状态面板",
     jumpBackLabel: "返回会话",
     openingSessionLabel: "正在打开会话",
+    openedDesktopSessionLabel: "已打开 Codex 桌面端会话。",
+    openedCliSessionLabel: "已打开 Codex 命令行会话。",
+    openedSessionLabel: "已打开会话。",
+    jumpUnavailableLabel: "无法打开会话。",
+    jumpFailedLabel: "打开会话失败。",
     pinLabel: "固定会话",
     unpinLabel: "取消固定会话",
     pinningLabel: "正在固定会话",
     unpinningLabel: "正在取消固定会话",
+    pinnedSessionLabel: "已固定会话",
+    unpinnedSessionLabel: "已取消固定会话",
+    pinFailedLabel: "固定会话失败。",
     dismissLabel: "忽略",
     dismissingLabel: "正在忽略",
+    dismissedSessionLabel: "已忽略会话",
+    dismissFailedLabel: "忽略会话失败。",
+    loadSourceFailedLabel: "无法加载 Codex 数据。",
+    loadHookStatusFailedLabel: "无法加载 Codex 钩子状态。",
+    installHooksFailedLabel: "安装 Codex 钩子失败。",
     subagentAnomalyLabel: "子任务异常",
     showEvidenceLabel: (label) => `查看 ${label} 的状态依据`,
     subtaskSummaryLabel: (summary) => {
@@ -428,7 +463,6 @@ export function buildStatusPanelModel(
     expandableHiddenCount: expandableHiddenRows.length,
     interventionCount: rolledUpRows.filter((row) => row.statusTone === "alert").length,
     workingCount: quietRows.filter((row) => row.displayStatus === "working").length,
-    idleCount: rolledUpRows.filter((row) => row.displayStatus === "idle").length,
     theme,
     copy,
   };

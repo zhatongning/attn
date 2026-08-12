@@ -93,8 +93,6 @@ describe("buildStatusPanelModel", () => {
     expect(model.quietHiddenCount).toBe(2);
     expect(model.copy.alertsLabel).toBe("需关注");
     expect(model.copy.workingLabel).toBe("进行中");
-    expect(model.copy.idleLabel).toBe("空闲");
-    expect(model.copy.quietLabel).toBe("安静");
   });
 
   it("hides stale unknown sessions without intervention evidence", () => {
@@ -145,7 +143,6 @@ describe("buildStatusPanelModel", () => {
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual([]);
     expect(model.visibleRows.find((item) => item.sessionId === "needed")?.statusTone).toBe("quiet");
-    expect(model.idleCount).toBe(1);
     expect(model.quietHiddenCount).toBe(1);
     expect(model.hiddenCount).toBe(1);
     expect(model.interventionCount).toBe(2);
@@ -267,7 +264,6 @@ describe("buildStatusPanelModel", () => {
     expect(model.hiddenRows).toEqual([]);
     expect(model.hiddenCount).toBe(0);
     expect(model.quietHiddenCount).toBe(0);
-    expect(model.idleCount).toBe(1);
   });
 
   it("uses the Atom intervention theme", () => {

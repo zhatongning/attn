@@ -17,6 +17,7 @@ import {
   defaultStatusPanelConfig,
   type InterventionStatus,
   type StatusPanelConfig,
+  type StatusPanelCopy,
   type StatusPanelRow,
 } from "./statusPanel";
 
@@ -104,7 +105,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (refreshId !== latestRefreshIdRef.current) {
         return;
       }
-      setErrorMessage(messageFromUnknownError(error, "Unable to load Codex source."));
+      setErrorMessage(messageFromUnknownError(error, model.copy.loadSourceFailedLabel));
     }
   }
 
@@ -123,7 +124,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         installed: false,
         hooksPath: "~/.codex/hooks.json",
         eventStorePath: "~/.codex/agent-session-inbox/hook-events.jsonl",
-          detail: messageFromUnknownError(error, "Unable to load Codex hook status."),
+          detail: messageFromUnknownError(error, model.copy.loadHookStatusFailedLabel),
       });
     }
   }
@@ -272,7 +273,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        showCommandMessage("dismissed");
+        showCommandMessage(model.copy.dismissedSessionLabel);
       }
     } catch (error) {
       if (!mountedRef.current) {
@@ -280,7 +281,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
       setRows(previousRows);
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        setErrorMessage(messageFromUnknownError(error, "Dismiss command failed."));
+        setErrorMessage(messageFromUnknownError(error, model.copy.dismissFailedLabel));
       }
     } finally {
       clearPendingAction(sessionId);
@@ -310,7 +311,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        showCommandMessage(nextPinned ? "pinned" : "unpinned");
+        showCommandMessage(nextPinned ? model.copy.pinnedSessionLabel : model.copy.unpinnedSessionLabel);
       }
     } catch (error) {
       if (!mountedRef.current) {
@@ -318,7 +319,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
       setRows(previousRows);
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        setErrorMessage(messageFromUnknownError(error, "Pin command failed."));
+        setErrorMessage(messageFromUnknownError(error, model.copy.pinFailedLabel));
       }
     } finally {
       clearPendingAction(row.sessionId);
@@ -328,7 +329,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   async function jumpToSession(sessionId: string, acknowledgedSessionIds = [sessionId]) {
     const actionFeedbackSequence = beginActionFeedback();
     setPendingAction(sessionId, "jump");
-    showJumpNotice("opening session");
+    showJumpNotice(model.copy.openingSessionLabel);
 
     try {
       const result = await jumpToSessionCommand(
@@ -342,13 +343,18 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
 
       if (result.succeeded) {
-        showTransientJumpNotice(result.message);
+        showTransientJumpNotice(
+          configRef.current.language === "zh" ? successfulJumpNotice(result.target, model.copy) : result.message,
+        );
       } else {
-        showJumpNotice(result.message);
+        const failureLabel = result.availability === "unavailable"
+          ? model.copy.jumpUnavailableLabel
+          : model.copy.jumpFailedLabel;
+        showJumpNotice(configRef.current.language === "zh" ? failureLabel : result.message);
       }
     } catch (error) {
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        showJumpNotice(messageFromUnknownError(error, "Jump command failed."));
+        showJumpNotice(messageFromUnknownError(error, model.copy.jumpFailedLabel));
       }
     } finally {
       clearPendingAction(sessionId);
@@ -531,7 +537,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
           <section className="hook-settings" aria-label={model.copy.codexHooksLabel}>
             <div>
               <h2>{model.copy.codexHooksLabel}</h2>
-              <p>{hookStatus?.detail ?? model.copy.checkingCodexHooksLabel}</p>
+              <p>{hookStatusDetail(hookStatus, configRef.current.language, model.copy)}</p>
               <code>{hookStatus?.hooksPath ?? "~/.codex/hooks.json"}</code>
             </div>
             <button
@@ -569,7 +575,6 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         <div className="panel-counters" aria-label="Session counters">
           <span>{model.interventionCount} {model.copy.alertsLabel}</span>
           <span>{model.workingCount} {model.copy.workingLabel}</span>
-          <span>{model.idleCount} {model.copy.idleLabel}</span>
         </div>
         <button
           type="button"
@@ -609,16 +614,11 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
 
           <footer className="panel-footer">
             <span className="jump-notice" role="status" aria-atomic="true">{jumpNotice}</span>
-            {!hasPendingJump && model.hiddenCount > 0 ? (
+            {!hasPendingJump && model.expandableHiddenCount > 0 ? (
               <button
                 type="button"
                 className="hidden-toggle"
-                disabled={model.expandableHiddenCount === 0}
-                onClick={() => {
-                  if (model.expandableHiddenCount > 0) {
-                    setExpanded((value) => !value);
-                  }
-                }}
+                onClick={() => setExpanded((value) => !value)}
               >
                 {expanded ? model.copy.collapseLabel : hiddenToggleLabel()}
               </button>
@@ -764,14 +764,18 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
       setHookStatus(nextStatus);
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        showCommandMessage(nextStatus.detail);
+        showCommandMessage(
+          configRef.current.language === "zh"
+            ? nextStatus.installed ? model.copy.codexHooksInstalledLabel : model.copy.installHooksFailedLabel
+            : nextStatus.detail,
+        );
       }
     } catch (error) {
       if (!mountedRef.current) {
         return;
       }
       if (isLatestActionFeedback(actionFeedbackSequence)) {
-        setErrorMessage(messageFromUnknownError(error, "Codex hook installation failed."));
+        setErrorMessage(messageFromUnknownError(error, model.copy.installHooksFailedLabel));
       }
     } finally {
       if (mountedRef.current) {
@@ -785,27 +789,14 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       (row) => row.pinned && row.statusTone === "quiet",
     ).length;
     const hiddenAlertCount = model.expandableHiddenCount - hiddenPinnedCount;
-    const hiddenQuietCount = model.quietHiddenCount - hiddenPinnedCount;
-
     if (hiddenPinnedCount > 0) {
       const alertLabel = hiddenAlertCount > 0
         ? `+${hiddenAlertCount} ${model.copy.hiddenAlertsLabel}, `
         : "";
-      const quietLabel = hiddenQuietCount > 0
-        ? `, +${hiddenQuietCount} ${model.copy.quietLabel}`
-        : "";
-      return `${alertLabel}+${hiddenPinnedCount} ${model.copy.hiddenPinnedLabel}${quietLabel}`;
+      return `${alertLabel}+${hiddenPinnedCount} ${model.copy.hiddenPinnedLabel}`;
     }
 
-    if (model.quietHiddenCount > 0 && model.quietHiddenCount === model.hiddenCount) {
-      return `+${model.quietHiddenCount} ${model.copy.quietLabel}`;
-    }
-
-    if (model.quietHiddenCount > 0) {
-      return `+${model.expandableHiddenCount} ${model.copy.hiddenAlertsLabel}`;
-    }
-
-    return `+${model.expandableHiddenCount}`;
+    return `+${hiddenAlertCount} ${model.copy.hiddenAlertsLabel}`;
   }
 
   function setManualPanelOpen(nextOpen: boolean) {
@@ -1116,6 +1107,31 @@ function panelWindowHeight(visibleItemCount: number, hasMessage = false) {
     PANEL_MAX_HEIGHT,
     baseHeight + (hasMessage ? PANEL_MESSAGE_HEIGHT : 0),
   );
+}
+
+function successfulJumpNotice(target: SessionRow["jumpTarget"], copy: StatusPanelCopy) {
+  if (target === "desktop") return copy.openedDesktopSessionLabel;
+  if (target === "cli") return copy.openedCliSessionLabel;
+  return copy.openedSessionLabel;
+}
+
+function hookStatusDetail(
+  status: CodexHookIntegrationStatus | null,
+  language: StatusPanelConfig["language"],
+  copy: StatusPanelCopy,
+) {
+  if (!status) return copy.checkingCodexHooksLabel;
+  if (language !== "zh") return status.detail;
+  if (status.detail === "Attn hook commands are installed.") {
+    return copy.codexHooksInstalledLabel;
+  }
+  if (
+    status.detail === "Attn hook commands are not installed."
+    || status.detail === "Codex hooks.json was not found; Attn can create it."
+  ) {
+    return copy.codexHooksNotInstalledLabel;
+  }
+  return status.detail;
 }
 
 function messageFromUnknownError(error: unknown, fallback: string) {

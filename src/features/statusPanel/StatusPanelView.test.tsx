@@ -63,7 +63,7 @@ afterEach(() => {
 });
 
 describe("StatusPanelView", () => {
-  it("renders an Atom intervention watchlist with a hidden quiet count", () => {
+  it("keeps quiet-only overflow out of the compact watchlist", () => {
     render(
       <StatusPanelView
         initialRows={[
@@ -87,7 +87,8 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("Attn")).toBeTruthy();
     expect(screen.queryByText("$")).toBeNull();
     expect(statusRows).toHaveLength(1);
-    expect(screen.getByText(/quiet/)).toBeTruthy();
+    expect(screen.queryByText("1 idle")).toBeNull();
+    expect(document.querySelector(".panel-footer .hidden-toggle")).toBeNull();
   });
 
   it("starts collapsed as a compact status strip", () => {
@@ -164,7 +165,7 @@ describe("StatusPanelView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Expand status panel" }));
     expect(await screen.findByText("Timed follow-up row")).toBeTruthy();
     expect(screen.getByText("0 alerts")).toBeTruthy();
-    expect(screen.getByText("+1 quiet")).toBeTruthy();
+    expect(document.querySelector(".panel-footer .hidden-toggle")).toBeNull();
     expect(screen.getByText("follow-up")).toBeTruthy();
   });
 
@@ -703,7 +704,7 @@ describe("StatusPanelView", () => {
 
     expect(screen.getByText("1 需关注")).toBeTruthy();
     expect(screen.getByText("1 进行中")).toBeTruthy();
-    expect(screen.getByText("1 空闲")).toBeTruthy();
+    expect(screen.queryByText("1 空闲")).toBeNull();
     expandPanel();
     expect(screen.getByText("待介入")).toBeTruthy();
   });
@@ -793,7 +794,7 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("Attn")).toBeTruthy();
     expect(screen.getByText("1 需关注")).toBeTruthy();
     expect(screen.getByText("1 进行中")).toBeTruthy();
-    expect(screen.getByText("1 空闲")).toBeTruthy();
+    expect(screen.queryByText("1 空闲")).toBeNull();
     expect(screen.queryByText("Codex 桌面端")).toBeNull();
     expect(screen.queryByText("本地数据")).toBeNull();
     expect(screen.queryByText("降级")).toBeNull();
@@ -822,6 +823,174 @@ describe("StatusPanelView", () => {
     expect(screen.getByRole("button", { name: "返回" })).toBeTruthy();
     expect(screen.queryByText("Language")).toBeNull();
     expect(screen.queryByText("Apply settings")).toBeNull();
+  });
+
+  it("localizes jump feedback when Chinese is selected", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "zh-jump-feedback",
+      label: "Chinese jump feedback",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    let resolveJump: ((response: Response) => void) | undefined;
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      ...defaultZhConfig(),
+      panelMode: "persistent",
+    }));
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/jump") {
+        return new Promise<Response>((resolve) => {
+          resolveJump = resolve;
+        });
+      }
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row]));
+      if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
+      return Promise.resolve(jsonResponse({}, 404));
+    }));
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByTitle("返回会话"));
+    expect(screen.getByTitle("正在打开会话")).toBeTruthy();
+    expect(within(document.querySelector(".panel-footer") as HTMLElement).getByText("正在打开会话")).toBeTruthy();
+
+    resolveJump?.(jsonResponse({
+      sessionId: row.sessionId,
+      availability: "exact",
+      target: "desktop",
+      succeeded: true,
+      message: "Opened Codex Desktop session.",
+    }));
+
+    expect(await screen.findByText("已打开 Codex 桌面端会话。")).toBeTruthy();
+  });
+
+  it("uses Chinese feedback for an unavailable jump target", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "zh-jump-unavailable",
+      label: "Chinese unavailable jump",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      ...defaultZhConfig(),
+      panelMode: "persistent",
+    }));
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/jump") {
+        return jsonResponse({
+          sessionId: row.sessionId,
+          availability: "unavailable",
+          target: "unknown",
+          succeeded: false,
+          message: "Jump-back unavailable: missing reliable target signal.",
+        });
+      }
+      if (pathname === "/api/sessions") return jsonResponse([row]);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByTitle("返回会话"));
+
+    expect(await screen.findByText("无法打开会话。")).toBeTruthy();
+    expect(screen.queryByText("Jump-back unavailable: missing reliable target signal.")).toBeNull();
+  });
+
+  it("localizes completed pin feedback when Chinese is selected", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "zh-pin-feedback",
+      label: "Chinese pin feedback",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      ...defaultZhConfig(),
+      panelMode: "persistent",
+    }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let pinned = false;
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return [{ ...row, pinned }];
+      if (command === "pin_session") {
+        pinned = true;
+        return [{ ...row, pinned }];
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByTitle("固定会话"));
+
+    expect(await screen.findByText("已固定会话")).toBeTruthy();
+  });
+
+  it("uses Chinese feedback after installing Codex hooks", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      ...defaultZhConfig(),
+      panelMode: "persistent",
+    }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command === "codex_hook_integration_status") {
+        return { installed: false, hooksPath: "", eventStorePath: "", detail: "Attn hook commands are not installed." };
+      }
+      if (command === "install_codex_hooks") {
+        return { installed: true, hooksPath: "", eventStorePath: "", detail: "Attn hook commands are installed." };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByText("尚未安装 Codex 钩子")).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: "安装 Codex 钩子" }));
+
+    expect((await screen.findAllByText("Codex 钩子已安装")).length).toBe(2);
+    expect(screen.queryByText("Attn hook commands are installed.")).toBeNull();
+  });
+
+  it("keeps an unexpected Codex hook diagnostic visible in Chinese", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      ...defaultZhConfig(),
+      panelMode: "persistent",
+    }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command === "codex_hook_integration_status") {
+        return { installed: false, hooksPath: "", eventStorePath: "", detail: "read hooks failed: permission denied" };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    expect(await screen.findByText("read hooks failed: permission denied")).toBeTruthy();
   });
 
   it("loads settings from the legacy agent-session-inbox storage key", () => {
@@ -1024,7 +1193,7 @@ describe("StatusPanelView", () => {
     expect(panelShellBlock).toContain("grid-template-rows: 28px minmax(0, auto) 22px;");
   });
 
-  it("keeps jump feedback inline before the quiet count without resizing the panel", async () => {
+  it("keeps jump feedback inline without a quiet overflow control or resize", async () => {
     const row: SessionRow = {
       ...initialSessions[0],
       sessionId: "jump-message-row",
@@ -1055,7 +1224,7 @@ describe("StatusPanelView", () => {
     render(<StatusPanelView initialRows={[row, quietRow]} sourceHealth={fakeSourceHealth} />);
     expandPanel();
     const footer = document.querySelector(".panel-footer") as HTMLElement;
-    expect(within(footer).getByRole("button", { name: "+1 quiet" })).toBeTruthy();
+    expect(within(footer).queryByRole("button")).toBeNull();
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
         height: 128,
@@ -1066,7 +1235,7 @@ describe("StatusPanelView", () => {
 
     fireEvent.click(screen.getByTitle("Jump back"));
 
-    expect(within(footer).getByText("opening session")).toBeTruthy();
+    expect(within(footer).getByText("Opening session")).toBeTruthy();
     expect(document.querySelector(".panel-message")).toBeNull();
 
     resolveJump?.(jsonResponse({
@@ -1078,9 +1247,8 @@ describe("StatusPanelView", () => {
     }));
 
     expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
-    const footerChildren = Array.from(footer.children);
-    expect(footerChildren[0]?.textContent).toBe("Opened Codex Desktop session.");
-    expect(footerChildren[1]).toBe(within(footer).getByRole("button", { name: "+1 quiet" }));
+    expect(Array.from(footer.children)).toHaveLength(1);
+    expect(footer.firstElementChild?.textContent).toBe("Opened Codex Desktop session.");
     expect(document.querySelector(".panel-message")).toBeNull();
     expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
   });
@@ -1130,7 +1298,7 @@ describe("StatusPanelView", () => {
     expect((jumpButton as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByTitle("Opening session")).toBeTruthy();
     const pendingFooter = document.querySelector(".panel-footer") as HTMLElement;
-    expect(within(pendingFooter).getByText("opening session")).toBeTruthy();
+    expect(within(pendingFooter).getByText("Opening session")).toBeTruthy();
     expect(within(pendingFooter).queryByRole("button")).toBeNull();
     expect(document.querySelector(".panel-message")).toBeNull();
     expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
@@ -1153,7 +1321,7 @@ describe("StatusPanelView", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
-    expect(screen.getByText("opening session")).toBeTruthy();
+    expect(screen.getByText("Opening session")).toBeTruthy();
     expect((jumpButton as HTMLButtonElement).disabled).toBe(true);
 
     await act(async () => {
