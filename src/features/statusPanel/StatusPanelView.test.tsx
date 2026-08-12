@@ -121,7 +121,7 @@ describe("StatusPanelView", () => {
       },
     ];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/sessions") {
         return jsonResponse(nextRows);
       }
@@ -151,7 +151,7 @@ describe("StatusPanelView", () => {
       },
     ];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/sessions") return jsonResponse(nextRows);
       if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
       return jsonResponse({}, 404);
@@ -184,7 +184,7 @@ describe("StatusPanelView", () => {
       },
     ];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/sessions") return jsonResponse(nextRows);
       if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
       return jsonResponse({}, 404);
@@ -267,6 +267,63 @@ describe("StatusPanelView", () => {
 
     const persistedConfig = JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
     expect(persistedConfig.preventAutoCollapseStatuses).toEqual(["stopped"]);
+  });
+
+  it("applies the configured follow-up idle duration and refreshes immediately", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "codex_hook_integration_status") {
+        return { installed: false, hooksPath: "", eventStorePath: "", detail: "" };
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+
+    const input = await screen.findByLabelText("Follow-up to idle minutes") as HTMLInputElement;
+    expect(input.min).toBe("20");
+    expect(input.step).toBe("1");
+    expect(input.getAttribute("max")).toBeNull();
+    fireEvent.change(input, { target: { value: "45" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    await waitFor(() => {
+      expect(lastInvokeCall("list_sessions")).toEqual([
+        "list_sessions",
+        { followUpToIdleMinutes: 45 },
+      ]);
+    });
+    expect(readPersistedConfig().followUpToIdleMinutes).toBe(45);
+  });
+
+  it("normalizes persisted follow-up idle duration to the minimum without capping valid values", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let handler: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (_event, callback) => {
+      handler = callback as (event: { payload: string }) => void;
+      return () => undefined;
+    });
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ followUpToIdleMinutes: 12 }));
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+    expect((await screen.findByLabelText("Follow-up to idle minutes") as HTMLInputElement).value).toBe("20");
+    rendered.unmount();
+
+    window.localStorage.clear();
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ followUpToIdleMinutes: 180 }));
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    handler?.({ payload: "management" });
+    expect((await screen.findByLabelText("Follow-up to idle minutes") as HTMLInputElement).value).toBe("180");
   });
 
   it("drops legacy follow-up keep-open settings when applying management changes", async () => {
@@ -582,7 +639,7 @@ describe("StatusPanelView", () => {
       statusReason: "completed task ready to inspect; confirm to mark idle",
     };
     vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
       if (pathname === "/api/sessions") {
         return Promise.resolve(jsonResponse([inspectRow]));
@@ -803,7 +860,7 @@ describe("StatusPanelView", () => {
       statusReason: "running signal observed",
     }));
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/sessions") return jsonResponse(rows);
       if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
       return jsonResponse({}, 404);
@@ -844,7 +901,7 @@ describe("StatusPanelView", () => {
       },
     ];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/sessions") return jsonResponse(rows);
       if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
       return jsonResponse({}, 404);
@@ -877,7 +934,7 @@ describe("StatusPanelView", () => {
     };
     let resolveJump: ((response: Response) => void) | undefined;
     vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/jump" && init?.method === "POST") {
         return new Promise<Response>((resolve) => {
           resolveJump = resolve;
@@ -1041,6 +1098,7 @@ describe("StatusPanelView", () => {
       expect(tauriCoreMock.invoke).toHaveBeenCalledWith("jump_to_session", {
         sessionId: "parent",
         acknowledgedSessionIds: ["parent", "child-inspect"],
+        followUpToIdleMinutes: 30,
       });
     });
   });
@@ -1098,6 +1156,7 @@ describe("StatusPanelView", () => {
       expect(tauriCoreMock.invoke).toHaveBeenCalledWith("jump_to_session", {
         sessionId: "child-inspect",
         acknowledgedSessionIds: ["child-inspect"],
+        followUpToIdleMinutes: 30,
       });
     });
   });
@@ -1172,7 +1231,7 @@ describe("StatusPanelView", () => {
     };
     let jumped = false;
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/jump") {
         jumped = true;
         return jsonResponse({
@@ -1206,6 +1265,46 @@ describe("StatusPanelView", () => {
     expect(screen.queryByText("+1 quiet")).toBeNull();
   });
 
+  it("sends the configured follow-up idle duration to preview list and jump requests", async () => {
+    const row = { ...initialSessions[0], sessionId: "preview-duration-row", label: "Preview duration row" };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      followUpToIdleMinutes: 45,
+      panelMode: "persistent",
+    }));
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/sessions") return jsonResponse([row]);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      if (pathname === "/api/jump") {
+        return jsonResponse({
+          sessionId: row.sessionId,
+          availability: "exact",
+          target: "desktop",
+          message: "Opened Codex Desktop session.",
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    fireEvent.click(await screen.findByTitle("Jump back"));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/sessions?followUpToIdleMinutes=45",
+        undefined,
+      );
+      expect(fetchMock).toHaveBeenCalledWith("/api/jump", expect.objectContaining({
+        body: JSON.stringify({
+          sessionId: row.sessionId,
+          acknowledgedSessionIds: [row.sessionId],
+          followUpToIdleMinutes: 45,
+        }),
+      }));
+    });
+  });
+
   it("pins and unpins a row from the status panel", async () => {
     const row: SessionRow = {
       ...initialSessions[0],
@@ -1219,11 +1318,18 @@ describe("StatusPanelView", () => {
       configurable: true,
       value: {},
     });
+    let pinned = false;
     tauriCoreMock.invoke.mockImplementation(async (command: string) => {
-      if (command === "list_sessions") return [row];
+      if (command === "list_sessions") return [{ ...row, pinned }];
       if (command === "source_health") return fakeSourceHealth;
-      if (command === "pin_session") return [{ ...row, pinned: true }];
-      if (command === "unpin_session") return [row];
+      if (command === "pin_session") {
+        pinned = true;
+        return [{ ...row, pinned }];
+      }
+      if (command === "unpin_session") {
+        pinned = false;
+        return [{ ...row, pinned }];
+      }
       return null;
     });
 
@@ -1239,6 +1345,66 @@ describe("StatusPanelView", () => {
 
     expect(tauriCoreMock.invoke).toHaveBeenCalledWith("unpin_session", { sessionId: "pin-row" });
     expect(await screen.findByTitle("Pin session")).toBeTruthy();
+  });
+
+  it("refreshes mutation results with the configured follow-up idle duration", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "configured-duration-row",
+      label: "Configured duration row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      followUpToIdleMinutes: 45,
+      panelMode: "persistent",
+    }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let pinned = false;
+    let dismissed = false;
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return [{ ...row, pinned, dismissed, handled: dismissed }];
+      if (command === "source_health") return fakeSourceHealth;
+      if (command === "pin_session") {
+        pinned = true;
+        return [{ ...row, pinned }];
+      }
+      if (command === "unpin_session") {
+        pinned = false;
+        return [{ ...row, pinned }];
+      }
+      if (command === "dismiss_sessions") {
+        dismissed = true;
+        return [{ ...row, dismissed, handled: dismissed }];
+      }
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByTitle("Pin session"));
+    await waitFor(() => {
+      expect(lastInvokeCall("list_sessions")).toEqual([
+        "list_sessions",
+        { followUpToIdleMinutes: 45 },
+      ]);
+    });
+
+    fireEvent.click(await screen.findByTitle("Unpin session"));
+    await waitFor(() => {
+      expect(lastInvokeCall("list_sessions")).toEqual([
+        "list_sessions",
+        { followUpToIdleMinutes: 45 },
+      ]);
+    });
+
+    fireEvent.click(await screen.findByTitle("Dismiss"));
+    await waitFor(() => {
+      expect(lastInvokeCall("list_sessions")).toEqual([
+        "list_sessions",
+        { followUpToIdleMinutes: 45 },
+      ]);
+    });
   });
 
   it("keeps pinned rows in inspect after jump refresh returns acknowledged state", async () => {
@@ -1290,7 +1456,7 @@ describe("StatusPanelView", () => {
     const row = { ...initialSessions[0], sessionId: "dismiss-lag", label: "Dismiss lag row" };
     let resolveDismiss: ((response: Response) => void) | undefined;
     vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row]));
       if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
       if (pathname === "/api/dismiss") {
@@ -1318,7 +1484,7 @@ describe("StatusPanelView", () => {
     const row = { ...initialSessions[0], sessionId: "jump-lag", label: "Jump lag row" };
     let resolveJump: ((response: Response) => void) | undefined;
     vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
-      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      const pathname = requestPath(url);
       if (pathname === "/api/jump") {
         return new Promise<Response>((resolve) => {
           resolveJump = resolve;
@@ -1509,6 +1675,20 @@ function defaultZhConfig() {
       idle: "#5c6370",
     },
   };
+}
+
+function lastInvokeCall(command: string) {
+  const matchingCalls = tauriCoreMock.invoke.mock.calls.filter(([name]) => name === command);
+  return matchingCalls[matchingCalls.length - 1];
+}
+
+function readPersistedConfig() {
+  return JSON.parse(window.localStorage.getItem("attn.statusPanelConfig") ?? "{}");
+}
+
+function requestPath(url: string | URL | Request) {
+  const rawUrl = typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+  return new URL(rawUrl, window.location.origin).pathname;
 }
 
 function jsonResponse(payload: unknown, status = 200) {

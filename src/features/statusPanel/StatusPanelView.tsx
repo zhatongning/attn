@@ -73,9 +73,12 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
   }, [model.hiddenRows, model.visibleRows]);
   const previousDisplayStatusRef = useRef<Record<string, string>>({});
 
-  async function refreshPanel() {
+  async function refreshPanel(followUpToIdleMinutes = configRef.current.followUpToIdleMinutes) {
     try {
-      const [loadedRows, loadedHealth] = await Promise.all([loadSessions(), loadSourceHealth()]);
+      const [loadedRows, loadedHealth] = await Promise.all([
+        loadSessions(followUpToIdleMinutes),
+        loadSourceHealth(),
+      ]);
       setRows(loadedRows);
       setHealth(loadedHealth);
       setErrorMessage(null);
@@ -230,6 +233,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     try {
       const updatedRows = await dismissSessionCommand(sessionId, previousRows, sessionIds);
       setRows(updatedRows);
+      await refreshPanel();
       setCommandMessage("dismissed");
     } catch (error) {
       setRows(previousRows);
@@ -255,6 +259,7 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
         ? await pinSessionCommand(row.sessionId, previousRows)
         : await unpinSessionCommand(row.sessionId, previousRows);
       setRows(updatedRows);
+      await refreshPanel();
       setCommandMessage(nextPinned ? "pinned" : "unpinned");
     } catch (error) {
       setRows(previousRows);
@@ -270,7 +275,11 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     setErrorMessage(null);
 
     try {
-      const result = await jumpToSessionCommand(sessionId, acknowledgedSessionIds);
+      const result = await jumpToSessionCommand(
+        sessionId,
+        acknowledgedSessionIds,
+        configRef.current.followUpToIdleMinutes,
+      );
       setCommandMessage(result.message);
       await refreshPanel();
     } catch (error) {
@@ -380,6 +389,23 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
                 const nextSeconds = Number(event.target.value);
                 if (!Number.isNaN(nextSeconds)) {
                   updateDraftConfig((current) => ({ ...current, autoCollapseDelayMs: nextSeconds * 1000 }));
+                }
+              }}
+            />
+          </label>
+
+          <label className="setting-field">
+            <span>{model.copy.followUpToIdleMinutesLabel}</span>
+            <input
+              aria-label={model.copy.followUpToIdleMinutesLabel}
+              type="number"
+              min={20}
+              step={1}
+              value={draftConfig.followUpToIdleMinutes}
+              onChange={(event) => {
+                const nextMinutes = Number(event.target.value);
+                if (!Number.isNaN(nextMinutes)) {
+                  updateDraftConfig((current) => ({ ...current, followUpToIdleMinutes: nextMinutes }));
                 }
               }}
             />
@@ -588,10 +614,12 @@ export function StatusPanelView({ initialRows, sourceHealth }: StatusPanelViewPr
     const nextConfig = normalizeConfig(draftConfigRef.current);
     const nextModel = buildStatusPanelModel(rows, nextConfig);
     clearAutoCollapseTimer();
+    configRef.current = nextConfig;
     setConfig(nextConfig);
     setPanelOpen(nextConfig.panelMode === "persistent" || hasPreventAutoCollapseStatus(nextModel, nextConfig));
     updateDraftConfig(nextConfig);
     setView("panel");
+    void refreshPanel(nextConfig.followUpToIdleMinutes);
   }
 
   async function installHooks() {
@@ -1041,6 +1069,7 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
   const autoCollapseDelayMs = typeof value.autoCollapseDelayMs === "number"
     ? Math.min(120000, Math.max(1000, value.autoCollapseDelayMs))
     : defaultStatusPanelConfig.autoCollapseDelayMs;
+  const followUpToIdleMinutes = normalizeFollowUpToIdleMinutes(value.followUpToIdleMinutes);
 
   return {
     styleFamily: value.styleFamily === "atom" ? value.styleFamily : defaultStatusPanelConfig.styleFamily,
@@ -1049,6 +1078,7 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
     visibleItemCount,
     panelMode: value.panelMode === "persistent" ? "persistent" : "auto",
     autoCollapseDelayMs,
+    followUpToIdleMinutes,
     preventAutoCollapseStatuses,
     statusColors: {
       blocked: colorValue(statusColors.blocked, defaultStatusPanelConfig.statusColors.blocked),
@@ -1060,6 +1090,13 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
       idle: colorValue(statusColors.idle, defaultStatusPanelConfig.statusColors.idle),
     },
   };
+}
+
+function normalizeFollowUpToIdleMinutes(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return defaultStatusPanelConfig.followUpToIdleMinutes;
+  }
+  return Math.max(20, Math.trunc(value));
 }
 
 function hasPreventAutoCollapseStatus(

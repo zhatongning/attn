@@ -19,14 +19,25 @@ function hasTauriRuntime() {
   return "__TAURI_INTERNALS__" in window;
 }
 
-export async function loadSessions(): Promise<SessionRow[]> {
+export async function loadSessions(followUpToIdleMinutes?: number): Promise<SessionRow[]> {
   if (!hasTauriRuntime()) {
-    return fetchDevJson<SessionRow[]>("/api/sessions", initialSessions);
+    return fetchDevJson<SessionRow[]>(
+      sessionsPreviewUrl(followUpToIdleMinutes),
+      initialSessions,
+    );
   }
 
-  return invoke<SessionRow[]>("list_sessions").catch(() =>
-    fetchDevJson<SessionRow[]>("/api/sessions", initialSessions),
+  return invoke<SessionRow[]>("list_sessions", { followUpToIdleMinutes }).catch(() =>
+    fetchDevJson<SessionRow[]>(
+      sessionsPreviewUrl(followUpToIdleMinutes),
+      initialSessions,
+    ),
   );
+}
+
+function sessionsPreviewUrl(followUpToIdleMinutes?: number) {
+  if (followUpToIdleMinutes === undefined) return "/api/sessions";
+  return `/api/sessions?followUpToIdleMinutes=${encodeURIComponent(String(followUpToIdleMinutes))}`;
 }
 
 export async function loadSourceHealth(): Promise<SourceHealth> {
@@ -131,6 +142,7 @@ export async function unpinSession(sessionId: string, currentRows: SessionRow[])
 export async function jumpToSession(
   sessionId: string,
   acknowledgedSessionIds = [sessionId],
+  followUpToIdleMinutes?: number,
 ): Promise<JumpResult> {
   if (!hasTauriRuntime()) {
     return fetchDevJson<JumpResult>("/api/jump", {
@@ -141,11 +153,15 @@ export async function jumpToSession(
     }, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, acknowledgedSessionIds }),
+      body: JSON.stringify({ sessionId, acknowledgedSessionIds, followUpToIdleMinutes }),
     });
   }
 
-  return invoke<JumpResult>("jump_to_session", { sessionId, acknowledgedSessionIds }).catch(() =>
+  return invoke<JumpResult>("jump_to_session", {
+    sessionId,
+    acknowledgedSessionIds,
+    followUpToIdleMinutes,
+  }).catch(() =>
     fetchDevJson<JumpResult>("/api/jump", {
       sessionId,
       availability: "unavailable",
@@ -154,7 +170,7 @@ export async function jumpToSession(
     }, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, acknowledgedSessionIds }),
+      body: JSON.stringify({ sessionId, acknowledgedSessionIds, followUpToIdleMinutes }),
     }),
   );
 }

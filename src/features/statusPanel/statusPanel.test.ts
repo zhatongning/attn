@@ -57,6 +57,7 @@ describe("buildStatusPanelModel", () => {
   it("defaults to an auto-collapsing panel that does not stay open for any status", () => {
     expect(defaultStatusPanelConfig.panelMode).toBe("auto");
     expect(defaultStatusPanelConfig.autoCollapseDelayMs).toBe(8000);
+    expect(defaultStatusPanelConfig.followUpToIdleMinutes).toBe(30);
     expect(defaultStatusPanelConfig.preventAutoCollapseStatuses).toEqual([]);
   });
 

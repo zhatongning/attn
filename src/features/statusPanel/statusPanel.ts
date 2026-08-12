@@ -9,6 +9,7 @@ export interface StatusPanelConfig {
   visibleItemCount: number;
   panelMode: "auto" | "persistent";
   autoCollapseDelayMs: number;
+  followUpToIdleMinutes: number;
   preventAutoCollapseStatuses: InterventionStatus[];
   statusColors: Record<InterventionStatus, string>;
 }
@@ -72,6 +73,7 @@ export interface StatusPanelCopy {
   autoCollapseLabel: string;
   persistentLabel: string;
   alertDisplaySecondsLabel: string;
+  followUpToIdleMinutesLabel: string;
   preventAutoCollapseStatusesLabel: string;
   statusColorsLabel: string;
   blockedColorLabel: string;
@@ -128,6 +130,7 @@ export const defaultStatusPanelConfig: StatusPanelConfig = {
   visibleItemCount: 1,
   panelMode: "auto",
   autoCollapseDelayMs: 8000,
+  followUpToIdleMinutes: 30,
   preventAutoCollapseStatuses: [],
   statusColors: {
     blocked: "#e06c75",
@@ -231,6 +234,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     autoCollapseLabel: "Auto collapse",
     persistentLabel: "Persistent",
     alertDisplaySecondsLabel: "Alert display seconds",
+    followUpToIdleMinutesLabel: "Follow-up to idle minutes",
     preventAutoCollapseStatusesLabel: "Keep open for statuses",
     statusColorsLabel: "Status colors",
     blockedColorLabel: "Blocked color",
@@ -315,6 +319,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     autoCollapseLabel: "自动收起",
     persistentLabel: "常驻",
     alertDisplaySecondsLabel: "提醒显示秒数",
+    followUpToIdleMinutesLabel: "待跟进转空闲分钟",
     preventAutoCollapseStatusesLabel: "包含这些状态时不收起",
     statusColorsLabel: "状态颜色",
     blockedColorLabel: "受阻颜色",
