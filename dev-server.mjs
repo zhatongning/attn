@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   createCodexSessionsDevSource,
   sourceHealth,
@@ -8,53 +9,67 @@ import {
 
 const port = 1420;
 const root = process.cwd();
-const previewSource = createCodexSessionsDevSource();
+export const previewSource = createCodexSessionsDevSource();
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+export function createPreviewServer({ source = previewSource } = {}) {
+  return http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
 
-  if (url.pathname === "/api/sessions") {
-    return sendJson(res, previewSource.discoverCodexSessions({
-      followUpToIdleMinutes: Number(url.searchParams.get("followUpToIdleMinutes")),
-    }));
-  }
+    if (url.pathname === "/api/sessions") {
+      return sendJson(res, source.discoverCodexSessions({
+        followUpToIdleMinutes: followUpToIdleMinutesFromRequestValue(
+          url.searchParams.get("followUpToIdleMinutes"),
+        ),
+      }));
+    }
 
-  if (url.pathname === "/api/source-health") {
-    return sendJson(res, sourceHealth());
-  }
+    if (url.pathname === "/api/source-health") {
+      return sendJson(res, sourceHealth());
+    }
 
-  if (url.pathname === "/api/jump" && req.method === "POST") {
-    return readJsonBody(req)
-      .then(({ sessionId, followUpToIdleMinutes }) =>
-        previewSource.jumpToSession(sessionId, { followUpToIdleMinutes }),
-      )
-      .then((result) => sendJson(res, result))
-      .catch((error) => {
-        res.statusCode = 500;
-        sendJson(res, {
-          sessionId: "",
-          availability: "unavailable",
-          target: "unknown",
-          message: error instanceof Error ? error.message : "Jump command failed.",
+    if (url.pathname === "/api/jump" && req.method === "POST") {
+      return readJsonBody(req)
+        .then(({ sessionId, followUpToIdleMinutes }) =>
+          source.jumpToSession(sessionId, {
+            followUpToIdleMinutes: followUpToIdleMinutesFromRequestValue(followUpToIdleMinutes),
+          }),
+        )
+        .then((result) => sendJson(res, result))
+        .catch((error) => {
+          res.statusCode = 500;
+          sendJson(res, {
+            sessionId: "",
+            availability: "unavailable",
+            target: "unknown",
+            message: error instanceof Error ? error.message : "Jump command failed.",
+          });
         });
-      });
-  }
+    }
 
-  const filePath = staticFilePath(url.pathname);
-  if (!filePath) {
-    res.statusCode = 404;
-    return res.end("Not found");
-  }
+    const filePath = staticFilePath(url.pathname);
+    if (!filePath) {
+      res.statusCode = 404;
+      return res.end("Not found");
+    }
 
-  res.statusCode = 200;
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Content-Type", contentType(filePath));
-  fs.createReadStream(filePath).pipe(res);
-});
+    res.statusCode = 200;
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Type", contentType(filePath));
+    fs.createReadStream(filePath).pipe(res);
+  });
+}
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Agent Session Inbox preview: http://127.0.0.1:${port}/`);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  createPreviewServer().listen(port, "127.0.0.1", () => {
+    console.log(`Agent Session Inbox preview: http://127.0.0.1:${port}/`);
+  });
+}
+
+function followUpToIdleMinutesFromRequestValue(value) {
+  if (typeof value === "number") return value;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  return Number(value);
+}
 
 function staticFilePath(pathname) {
   if (pathname === "/") return existingFile(path.join(root, "dist", "index.html"), path.join(root, "index.html"));
