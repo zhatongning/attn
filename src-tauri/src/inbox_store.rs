@@ -24,7 +24,13 @@ const PENDING_CLI_INPUT_FRESHNESS: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES: u64 = 30;
 pub const MIN_FOLLOW_UP_TO_IDLE_MINUTES: u64 = 20;
 
-pub fn normalize_follow_up_to_idle_minutes(minutes: Option<f64>) -> u64 {
+pub fn normalize_follow_up_to_idle_minutes(minutes: Option<u64>) -> u64 {
+    minutes
+        .unwrap_or(DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES)
+        .max(MIN_FOLLOW_UP_TO_IDLE_MINUTES)
+}
+
+pub fn normalize_follow_up_to_idle_minutes_from_transport(minutes: Option<f64>) -> u64 {
     let Some(minutes) = minutes.filter(|minutes| minutes.is_finite()) else {
         return DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES;
     };
@@ -35,7 +41,7 @@ pub fn normalize_follow_up_to_idle_minutes(minutes: Option<f64>) -> u64 {
         minutes.max(0.0).trunc() as u64
     };
 
-    truncated_minutes.max(MIN_FOLLOW_UP_TO_IDLE_MINUTES)
+    normalize_follow_up_to_idle_minutes(Some(truncated_minutes))
 }
 
 fn follow_up_window_millis(minutes: u64) -> u64 {
@@ -154,7 +160,7 @@ impl InboxStore {
 
     pub fn list_sessions_with_follow_up_to_idle_minutes(
         &self,
-        follow_up_to_idle_minutes: Option<f64>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) -> Vec<SessionRow> {
         let follow_up_to_idle_minutes =
             normalize_follow_up_to_idle_minutes(follow_up_to_idle_minutes);
@@ -356,7 +362,7 @@ impl InboxStore {
         &self,
         session_id: &str,
         acknowledged_session_ids: Option<&[String]>,
-        follow_up_to_idle_minutes: Option<f64>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) -> JumpResult {
         let row = self
             .fast_session_row_for_jump(session_id, follow_up_to_idle_minutes)
@@ -431,7 +437,7 @@ impl InboxStore {
         &self,
         row: &SessionRow,
         acknowledged_session_ids: Option<&[String]>,
-        follow_up_to_idle_minutes: Option<f64>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) {
         let mut acknowledged_signals = self
             .acknowledged_signals
@@ -465,7 +471,7 @@ impl InboxStore {
     fn fast_session_row_for_jump(
         &self,
         session_id: &str,
-        follow_up_to_idle_minutes: Option<f64>,
+        follow_up_to_idle_minutes: Option<u64>,
     ) -> Option<SessionRow> {
         let now = SystemTime::now();
         let live_cli_sessions = find_live_codex_cli_sessions();
@@ -2709,18 +2715,46 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_follow_up_to_idle_minutes_without_a_product_maximum() {
+    fn preserves_integer_follow_up_duration_api_without_a_product_maximum() {
+        let _: fn(&super::InboxStore, Option<u64>) -> Vec<SessionRow> =
+            super::InboxStore::list_sessions_with_follow_up_to_idle_minutes;
+        let _: fn(&super::InboxStore, &str, Option<&[String]>, Option<u64>) -> super::JumpResult =
+            super::InboxStore::jump_to_session;
+
         assert_eq!(super::normalize_follow_up_to_idle_minutes(None), 30);
-        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(19.0)), 20);
-        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(20.0)), 20);
-        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(180.0)), 180);
-        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(f64::NAN)), 30);
-        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(f64::INFINITY)), 30);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(19)), 20);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(20)), 20);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(30)), 30);
+        assert_eq!(super::normalize_follow_up_to_idle_minutes(Some(180)), 180);
+
+        let store = InboxStore::default();
+        assert!(store
+            .list_sessions_with_follow_up_to_idle_minutes(Some(30))
+            .len()
+            <= 80);
     }
 
     #[test]
-    fn saturates_extreme_finite_follow_up_duration_without_expiring_the_window() {
-        let duration_minutes = super::normalize_follow_up_to_idle_minutes(Some(1e20));
+    fn transport_normalization_saturates_extreme_finite_follow_up_duration() {
+        assert_eq!(
+            super::normalize_follow_up_to_idle_minutes_from_transport(None),
+            30
+        );
+        assert_eq!(
+            super::normalize_follow_up_to_idle_minutes_from_transport(Some(f64::NAN)),
+            30
+        );
+        assert_eq!(
+            super::normalize_follow_up_to_idle_minutes_from_transport(Some(f64::INFINITY)),
+            30
+        );
+        assert_eq!(
+            super::normalize_follow_up_to_idle_minutes_from_transport(Some(19.9)),
+            20
+        );
+
+        let duration_minutes =
+            super::normalize_follow_up_to_idle_minutes_from_transport(Some(1e20));
         let duration_ms = super::follow_up_window_millis(duration_minutes);
         assert_eq!(duration_minutes, u64::MAX);
         assert_eq!(duration_ms, u64::MAX);

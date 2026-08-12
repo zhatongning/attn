@@ -14,6 +14,11 @@ async fn list_sessions(
     follow_up_to_idle_minutes: Option<f64>,
 ) -> Result<Vec<domain::session::SessionRow>, String> {
     let state = Arc::clone(state.inner());
+    let follow_up_to_idle_minutes = Some(
+        inbox_store::normalize_follow_up_to_idle_minutes_from_transport(
+            follow_up_to_idle_minutes,
+        ),
+    );
     tauri::async_runtime::spawn_blocking(move || {
         state.list_sessions_with_follow_up_to_idle_minutes(follow_up_to_idle_minutes)
     })
@@ -104,6 +109,11 @@ async fn jump_to_session(
 ) -> Result<inbox_store::JumpResult, String> {
     let state = Arc::clone(state.inner());
     let fallback_session_id = session_id.clone();
+    let follow_up_to_idle_minutes = Some(
+        inbox_store::normalize_follow_up_to_idle_minutes_from_transport(
+            follow_up_to_idle_minutes,
+        ),
+    );
     tauri::async_runtime::spawn_blocking(move || {
         state.jump_to_session(
             &session_id,
