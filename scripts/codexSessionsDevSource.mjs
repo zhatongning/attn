@@ -174,17 +174,29 @@ export async function jumpToSession(sessionId, options = {}) {
       sessionId: sessionId ?? "",
       availability: "unavailable",
       target: row?.jumpTarget ?? "unknown",
+      succeeded: false,
       message: "Jump-back unavailable: missing reliable target signal.",
     };
   }
 
   const plan = buildJumpPlan(row, normalizedOptions);
-  await (normalizedOptions.executeJump ?? executeJump)(row, plan);
+  try {
+    await (normalizedOptions.executeJump ?? executeJump)(row, plan);
+  } catch (error) {
+    return {
+      sessionId: row.sessionId,
+      availability: row.jumpAvailability,
+      target: row.jumpTarget,
+      succeeded: false,
+      message: `Jump-back failed: ${jumpErrorDetail(error)}`,
+    };
+  }
 
   return {
     sessionId: row.sessionId,
     availability: row.jumpAvailability,
     target: row.jumpTarget,
+    succeeded: true,
     message: jumpMessage(plan),
   };
 }
@@ -244,7 +256,7 @@ export function createCodexSessionsDevSource({
         ...resolvedOptions,
         executeJump: executeJumpOverride,
       });
-      if (result.availability !== "unavailable" && !result.message.startsWith("Jump-back failed")) {
+      if (result.succeeded) {
         if (row) acknowledgedSignals.set(acknowledgedSignal(row), resolvedOptions.nowMs);
       }
       return result;
@@ -877,6 +889,8 @@ function truncate(value, maxLength) {
 }
 
 function buildJumpPlan(row, options = {}) {
+  if (row.jumpTarget === "desktop") return { kind: "desktop" };
+
   const liveCliSessions = options.liveCliSessions ?? (options.liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions());
   const liveTty = liveCliTtyForJumpPlan(
     row,
@@ -885,7 +899,7 @@ function buildJumpPlan(row, options = {}) {
   );
   if (liveTty) return { kind: "iterm", tty: liveTty, liveCodex: true };
 
-  if (row.jumpTarget === "desktop" || row.jumpTarget === "unknown") return { kind: "desktop" };
+  if (row.jumpTarget === "unknown") return { kind: "desktop" };
 
   const resumeTty = row.workspacePath
     ? (options.previousITermTtyForWorkspace ?? findPreviousITermTtyForWorkspace)(row.workspacePath)
@@ -922,11 +936,16 @@ function jumpMessage(plan) {
   return "Opened Codex Desktop session.";
 }
 
+function jumpErrorDetail(error) {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
+
 async function executeJump(row, plan) {
   if (plan.kind === "iterm") return activateITermTty(plan.tty);
   if (plan.kind === "iterm-resume") return openITermCodexResume(plan.workspacePath, plan.threadId, plan.tty);
 
-  return runDetached("open", [codexThreadDeeplink(row.sessionId)]);
+  return runWithTimeout("open", [codexThreadDeeplink(row.sessionId)], 6_000);
 }
 
 function findLiveCodexTtyForWorkspace(workspacePath) {

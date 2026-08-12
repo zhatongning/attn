@@ -356,6 +356,27 @@ describe("buildStatusPanelModel", () => {
     expect(model.hiddenRows).toEqual([]);
   });
 
+  it("rolls a parent-linked inspect row up when its subagent source field is unavailable", () => {
+    const model = buildStatusPanelModel(
+      [
+        {
+          ...row("parent", "running", "running signal observed"),
+          workspacePath: "/Users/edy/project",
+          threadSource: "user",
+        },
+        {
+          ...row("child-inspect", "inspect", "completed task ready to inspect; open it to mark read"),
+          workspacePath: "/Users/edy/project",
+          parentSessionId: "parent",
+        },
+      ],
+      { ...defaultStatusPanelConfig, visibleItemCount: 2 },
+    );
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["parent"]);
+    expect(model.visibleRows[0].subtaskSummary).toBe("1 subtask: 1 inspect");
+  });
+
   it("rolls a stopped descendant through its known subagent parent to the root task", () => {
     const model = buildStatusPanelModel(
       [

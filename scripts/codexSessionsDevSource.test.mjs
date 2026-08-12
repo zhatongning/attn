@@ -467,7 +467,8 @@ describe("codexSessionsDevSource", () => {
       state: "inspect",
     });
 
-    await source.jumpToSession("019read-window");
+    const result = await source.jumpToSession("019read-window");
+    expect(result.succeeded).toBe(true);
     expect(source.discoverCodexSessions()[0]).toMatchObject({
       sessionId: "019read-window",
       state: "needsAttention",
@@ -549,6 +550,49 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
+  it("does not acknowledge an inspect row when jump execution fails", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019failed-ack.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019failed-ack","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    const source = createCodexSessionsDevSource({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T06:00:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+      executeJump: async () => {
+        throw new Error("activation failed");
+      },
+    });
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019failed-ack",
+      state: "inspect",
+      handled: false,
+    });
+
+    await expect(source.jumpToSession("019failed-ack")).resolves.toMatchObject({
+      succeeded: false,
+      message: "Jump-back failed: activation failed",
+    });
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019failed-ack",
+      state: "inspect",
+      handled: false,
+    });
+  });
+
   it("resumes exact CLI sessions in a previous iTerm tab instead of only focusing it", async () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
@@ -583,6 +627,128 @@ describe("codexSessionsDevSource", () => {
       },
     ]);
     expect(result.message).toBe("Resumed Codex session in previous iTerm tab.");
+    expect(result.succeeded).toBe(true);
+  });
+
+  it("reports an unsuccessful outcome when no jump target is available", async () => {
+    const result = await jumpToSession("missing", {
+      stateDbPath: "/missing/state_5.sqlite",
+      sessionsRoot: "/missing/sessions",
+    });
+
+    expect(result).toMatchObject({
+      sessionId: "missing",
+      availability: "unavailable",
+      target: "unknown",
+      succeeded: false,
+      message: "Jump-back unavailable: missing reliable target signal.",
+    });
+  });
+
+  it("reports an unsuccessful outcome when the desktop opener cannot start", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019jump-failed.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019jump-failed","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = "/missing-command-path";
+    try {
+      await expect(jumpToSession("019jump-failed", {
+        stateDbPath: path.join(temp, "missing.sqlite"),
+        sessionsRoot: path.join(temp, "sessions"),
+        nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+        unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+        liveCliTtyForWorkspace: () => undefined,
+      })).resolves.toMatchObject({
+        sessionId: "019jump-failed",
+        availability: "exact",
+        target: "desktop",
+        succeeded: false,
+        message: expect.stringContaining("Jump-back failed:"),
+      });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
+  it("reports an unsuccessful outcome when live iTerm Codex activation cannot start", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019iterm-failed.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019iterm-failed","cwd":"/Users/edy/wmhcar","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = "/missing-command-path";
+    try {
+      await expect(jumpToSession("019iterm-failed", {
+        stateDbPath: path.join(temp, "missing.sqlite"),
+        sessionsRoot: path.join(temp, "sessions"),
+        nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+        unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+        liveCliTtyForWorkspace: () => "ttys009",
+      })).resolves.toMatchObject({
+        sessionId: "019iterm-failed",
+        target: "cli",
+        succeeded: false,
+        message: expect.stringContaining("osascript"),
+      });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
+  it("reports an unsuccessful outcome when iTerm resume cannot start", async () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019iterm-resume-failed.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019iterm-resume-failed","cwd":"/Users/edy/wmhcar","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = "/missing-command-path";
+    try {
+      await expect(jumpToSession("019iterm-resume-failed", {
+        stateDbPath: path.join(temp, "missing.sqlite"),
+        sessionsRoot: path.join(temp, "sessions"),
+        nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+        unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+        liveCliTtyForWorkspace: () => undefined,
+        previousITermTtyForWorkspace: () => undefined,
+      })).resolves.toMatchObject({
+        sessionId: "019iterm-resume-failed",
+        succeeded: false,
+        message: expect.stringContaining("Jump-back failed:"),
+      });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
   });
 
   it("starts a CLI session with codex resume when no iTerm item is alive", async () => {
@@ -621,7 +787,7 @@ describe("codexSessionsDevSource", () => {
     expect(result.message).toBe("Started iTerm Codex resume session.");
   });
 
-  it("jumps Desktop-sourced rows to a live CLI terminal in the same workspace", async () => {
+  it("keeps Desktop-sourced rows on the Desktop when a live CLI shares the workspace", async () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
     fs.mkdirSync(sessionDir, { recursive: true });
@@ -646,8 +812,8 @@ describe("codexSessionsDevSource", () => {
       executeJump: async (_row, plan) => executed.push(plan),
     });
 
-    expect(executed).toEqual([{ kind: "iterm", tty: "ttys009", liveCodex: true }]);
-    expect(result.message).toBe("Focused live iTerm Codex session.");
+    expect(executed).toEqual([{ kind: "desktop" }]);
+    expect(result.message).toBe("Opened Codex Desktop session.");
   });
 
   it("targets the matching live CLI session when multiple sessions share a workspace", async () => {

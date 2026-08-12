@@ -12,6 +12,7 @@ interface JumpResult {
   sessionId: string;
   availability: JumpAvailability;
   target: JumpTarget;
+  succeeded: boolean;
   message: string;
 }
 
@@ -27,12 +28,7 @@ export async function loadSessions(followUpToIdleMinutes?: number): Promise<Sess
     );
   }
 
-  return invoke<SessionRow[]>("list_sessions", { followUpToIdleMinutes }).catch(() =>
-    fetchDevJson<SessionRow[]>(
-      sessionsPreviewUrl(followUpToIdleMinutes),
-      initialSessions,
-    ),
-  );
+  return invoke<SessionRow[]>("list_sessions", { followUpToIdleMinutes });
 }
 
 function sessionsPreviewUrl(followUpToIdleMinutes?: number) {
@@ -45,9 +41,7 @@ export async function loadSourceHealth(): Promise<SourceHealth> {
     return fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth);
   }
 
-  return invoke<SourceHealth>("source_health").catch(() =>
-    fetchDevJson<SourceHealth>("/api/source-health", fakeSourceHealth),
-  );
+  return invoke<SourceHealth>("source_health");
 }
 
 export async function loadCodexHookIntegrationStatus(): Promise<CodexHookIntegrationStatus> {
@@ -149,6 +143,7 @@ export async function jumpToSession(
       sessionId,
       availability: "unavailable",
       target: "unknown",
+      succeeded: false,
       message: "Jump-back unavailable: local preview API is not connected.",
     }, {
       method: "POST",
@@ -161,18 +156,7 @@ export async function jumpToSession(
     sessionId,
     acknowledgedSessionIds,
     followUpToIdleMinutes,
-  }).catch(() =>
-    fetchDevJson<JumpResult>("/api/jump", {
-      sessionId,
-      availability: "unavailable",
-      target: "unknown",
-      message: "Jump-back unavailable: local preview API is not connected.",
-    }, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, acknowledgedSessionIds, followUpToIdleMinutes }),
-    }),
-  );
+  });
 }
 
 async function fetchDevJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {

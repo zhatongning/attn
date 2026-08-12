@@ -545,7 +545,7 @@ function parentRowsByWorkspace(rows: StatusPanelRow[]) {
 }
 
 function isSubagentRow(row: SessionRow) {
-  return row.threadSource === "subagent";
+  return row.threadSource === "subagent" || Boolean(row.parentSessionId);
 }
 
 function shouldPromoteSubagentRow(row: StatusPanelRow) {

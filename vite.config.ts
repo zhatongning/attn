@@ -76,6 +76,7 @@ function codexSessionsDevApi() {
               sessionId: "",
               availability: "unavailable",
               target: "unknown",
+              succeeded: false,
               message: error instanceof Error ? error.message : "Jump command failed.",
             });
           });

@@ -9,7 +9,7 @@ import { fakeSourceHealth, initialSessions } from "../inbox/fakeSessions";
 import { StatusPanelView } from "./StatusPanelView";
 
 const tauriWindowMock = vi.hoisted(() => ({
-  setSize: vi.fn(async () => undefined),
+  setSize: vi.fn<(size: { width: number; height: number }) => Promise<void>>(async () => undefined),
   setPosition: vi.fn(async () => undefined),
   startDragging: vi.fn(async () => undefined),
   onMoved: vi.fn(async (_handler: unknown) => vi.fn()),
@@ -48,8 +48,9 @@ vi.mock("@tauri-apps/api/dpi", () => ({
 }));
 
 afterEach(() => {
-  vi.useRealTimers();
+  cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   window.localStorage.clear();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   tauriWindowMock.setSize.mockClear();
@@ -58,7 +59,6 @@ afterEach(() => {
   tauriWindowMock.onMoved.mockReset();
   tauriWindowMock.onMoved.mockImplementation(async (_handler: unknown) => vi.fn());
   tauriCoreMock.invoke.mockReset();
-  cleanup();
   vi.unstubAllGlobals();
 });
 
@@ -160,14 +160,11 @@ describe("StatusPanelView", () => {
 
     render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
 
-    await waitFor(() => {
-      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
-    });
     expect(screen.getByRole("main").className).toContain("panel-shell--collapsed");
     fireEvent.click(screen.getByRole("button", { name: "Expand status panel" }));
+    expect(await screen.findByText("Timed follow-up row")).toBeTruthy();
     expect(screen.getByText("0 alerts")).toBeTruthy();
     expect(screen.getByText("+1 quiet")).toBeTruthy();
-    expect(screen.getByText("Timed follow-up row")).toBeTruthy();
     expect(screen.getByText("follow-up")).toBeTruthy();
   });
 
@@ -459,12 +456,17 @@ describe("StatusPanelView", () => {
             statusReason: "completed task is no longer recent; idle until the next source signal",
           },
         ]}
-        sourceHealth={fakeSourceHealth}
+        sourceHealth={{ ...fakeSourceHealth, status: "available" }}
       />,
     );
     expandPanel();
 
-    fireEvent.click(screen.getByText(/\+\d+ alerts/));
+    const footer = document.querySelector(".panel-footer");
+    expect(footer).toBeTruthy();
+    expect(within(footer as HTMLElement).queryByText("Codex desktop")).toBeNull();
+    expect(within(footer as HTMLElement).queryByText("available")).toBeNull();
+    expect(within(footer as HTMLElement).queryByText("local data")).toBeNull();
+    fireEvent.click(within(footer as HTMLElement).getByRole("button", { name: "+2 alerts" }));
 
     expect(screen.queryByText("Quiet historical session")).toBeNull();
     expect(screen.getAllByRole("article")).toHaveLength(3);
@@ -792,9 +794,9 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("1 需关注")).toBeTruthy();
     expect(screen.getByText("1 进行中")).toBeTruthy();
     expect(screen.getByText("1 空闲")).toBeTruthy();
-    expect(screen.getByText("Codex 桌面端")).toBeTruthy();
-    expect(screen.getByText("本地数据")).toBeTruthy();
-    expect(screen.getByText("降级")).toBeTruthy();
+    expect(screen.queryByText("Codex 桌面端")).toBeNull();
+    expect(screen.queryByText("本地数据")).toBeNull();
+    expect(screen.queryByText("降级")).toBeNull();
     expect(screen.getByText("精确")).toBeTruthy();
     expect(screen.getAllByTitle("返回会话")).toHaveLength(2);
     expect(screen.getAllByTitle("忽略")).toHaveLength(2);
@@ -884,7 +886,29 @@ describe("StatusPanelView", () => {
     });
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 292,
+        height: 324,
+        width: 420,
+      }));
+    });
+  });
+
+  it("makes the status list scrollable when configured rows reach the window height cap", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 8 }));
+    const rows: SessionRow[] = Array.from({ length: 8 }, (_, index) => ({
+      ...initialSessions[0],
+      sessionId: `capped-row-${index + 1}`,
+      label: `Capped row ${index + 1}`,
+      state: "running",
+      statusReason: "running signal observed",
+    }));
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    expect(screen.getByLabelText("Codex status panel").className).toContain("status-list--scrollable");
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 420,
         width: 420,
       }));
     });
@@ -918,19 +942,102 @@ describe("StatusPanelView", () => {
     expandPanel();
     await waitFor(() => {
       expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 124,
+        height: 128,
         width: 420,
       }));
     });
   });
 
-  it("reserves panel height for jump command feedback", async () => {
+  it("keeps the latest multi-row native height when an earlier resize resolves late", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      visibleItemCount: 2,
+      panelMode: "persistent",
+    }));
+    const initialRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "initial-resize-row",
+      label: "Initial resize row",
+      state: "running",
+      statusReason: "running signal observed",
+    };
+    const refreshedRows: SessionRow[] = [
+      initialRow,
+      {
+        ...initialSessions[0],
+        sessionId: "refreshed-resize-row",
+        label: "Refreshed resize row",
+        state: "inspect",
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    let resolveInitialNativeResize: (() => void) | undefined;
+    let nativeWindowHeight: number | undefined;
+    let resizeCallCount = 0;
+    tauriWindowMock.setSize.mockImplementation((size: { height: number }) => {
+      resizeCallCount += 1;
+      if (resizeCallCount === 1) {
+        return new Promise<void>((resolve) => {
+          resolveInitialNativeResize = () => {
+            nativeWindowHeight = size.height;
+            resolve();
+          };
+        });
+      }
+
+      nativeWindowHeight = size.height;
+      return Promise.resolve();
+    });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/sessions") return jsonResponse(refreshedRows);
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={[initialRow]} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("article")).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(resolveInitialNativeResize).toBeTypeOf("function");
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 128,
+        width: 420,
+      }));
+    });
+
+    await act(async () => {
+      resolveInitialNativeResize?.();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(nativeWindowHeight).toBe(177);
+    });
+  });
+
+  it("reserves a footer track so jump feedback cannot add a grid row", () => {
+    // @ts-expect-error This test reads local CSS without adding Node types to the app build.
+    const css = readFileSync(join(process.cwd(), "src/App.css"), "utf8");
+    const panelShellBlock = css.match(/\.panel-shell \{[^}]+\}/)?.[0];
+
+    expect(panelShellBlock).toContain("grid-template-rows: 28px minmax(0, auto) 22px;");
+  });
+
+  it("keeps jump feedback inline before the quiet count without resizing the panel", async () => {
     const row: SessionRow = {
       ...initialSessions[0],
       sessionId: "jump-message-row",
       label: "Jump message row",
       state: "inspect",
       statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const quietRow: SessionRow = {
+      ...initialSessions[2],
+      sessionId: "quiet-after-jump",
+      label: "Quiet after jump",
+      state: "idle",
+      statusReason: "completed task observed; idle until the next source signal",
     };
     let resolveJump: ((response: Response) => void) | undefined;
     vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
@@ -940,29 +1047,335 @@ describe("StatusPanelView", () => {
           resolveJump = resolve;
         });
       }
-      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row]));
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row, quietRow]));
+      if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
+      return Promise.resolve(jsonResponse({}, 404));
+    }));
+
+    render(<StatusPanelView initialRows={[row, quietRow]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+    const footer = document.querySelector(".panel-footer") as HTMLElement;
+    expect(within(footer).getByRole("button", { name: "+1 quiet" })).toBeTruthy();
+    await waitFor(() => {
+      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+        height: 128,
+        width: 420,
+      }));
+    });
+    tauriWindowMock.setSize.mockClear();
+
+    fireEvent.click(screen.getByTitle("Jump back"));
+
+    expect(within(footer).getByText("opening session")).toBeTruthy();
+    expect(document.querySelector(".panel-message")).toBeNull();
+
+    resolveJump?.(jsonResponse({
+      sessionId: row.sessionId,
+      availability: "exact",
+      target: "desktop",
+      succeeded: true,
+      message: "Opened Codex Desktop session.",
+    }));
+
+    expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
+    const footerChildren = Array.from(footer.children);
+    expect(footerChildren[0]?.textContent).toBe("Opened Codex Desktop session.");
+    expect(footerChildren[1]).toBe(within(footer).getByRole("button", { name: "+1 quiet" }));
+    expect(document.querySelector(".panel-message")).toBeNull();
+    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+  });
+
+  it("clears completed jump feedback after three seconds", async () => {
+    vi.useFakeTimers();
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "jump-feedback-timeout",
+      label: "Jump feedback timeout row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    let resolveJump: ((response: Response) => void) | undefined;
+    let resolveRefresh: ((response: Response) => void) | undefined;
+    let sessionRequestCount = 0;
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/jump") {
+        return new Promise<Response>((resolve) => {
+          resolveJump = resolve;
+        });
+      }
+      if (pathname === "/api/sessions") {
+        sessionRequestCount += 1;
+        if (sessionRequestCount === 1) return Promise.resolve(jsonResponse([row]));
+        return new Promise<Response>((resolve) => {
+          resolveRefresh = resolve;
+        });
+      }
       if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
       return Promise.resolve(jsonResponse({}, 404));
     }));
 
     render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
     expandPanel();
-    fireEvent.click(screen.getByTitle("Jump back"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const jumpButton = screen.getByTitle("Jump back");
+    tauriWindowMock.setSize.mockClear();
+    fireEvent.click(jumpButton);
 
-    resolveJump?.(jsonResponse({
-      sessionId: row.sessionId,
-      availability: "exact",
-      target: "desktop",
-      message: "Opened Codex Desktop session.",
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect((jumpButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTitle("Opening session")).toBeTruthy();
+    const pendingFooter = document.querySelector(".panel-footer") as HTMLElement;
+    expect(within(pendingFooter).getByText("opening session")).toBeTruthy();
+    expect(within(pendingFooter).queryByRole("button")).toBeNull();
+    expect(document.querySelector(".panel-message")).toBeNull();
+    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveJump?.(jsonResponse({
+        sessionId: row.sessionId,
+        availability: "exact",
+        target: "desktop",
+        succeeded: true,
+        message: "Opened Codex Desktop session.",
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(sessionRequestCount).toBe(2);
+    expect(resolveRefresh).toBeTruthy();
+    const resolveJumpRefresh = resolveRefresh;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByText("opening session")).toBeTruthy();
+    expect((jumpButton as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      resolveJumpRefresh?.(jsonResponse([row]));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Opened Codex Desktop session.")).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2999);
+    });
+    expect(screen.getByText("Opened Codex Desktop session.")).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(screen.queryByText("Opened Codex Desktop session.")).toBeNull();
+    const footer = document.querySelector(".panel-footer") as HTMLElement;
+    expect(footer).toBeTruthy();
+    expect(within(footer).queryByText("Opened Codex Desktop session.")).toBeNull();
+    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+  });
+
+  it("keeps failed jump feedback visible when its target is exact", async () => {
+    vi.useFakeTimers();
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "jump-feedback-failed",
+      label: "Jump feedback failed row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/jump") {
+        return Promise.resolve(jsonResponse({
+          sessionId: row.sessionId,
+          availability: "exact",
+          target: "desktop",
+          succeeded: false,
+          message: "Jump-back failed: open failed.",
+        }));
+      }
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row]));
+      return Promise.resolve(jsonResponse({}, 404));
     }));
 
-    expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
-    await waitFor(() => {
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 154,
-        width: 420,
-      }));
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
     });
+    expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
+      height: 128,
+      width: 420,
+    }));
+    tauriWindowMock.setSize.mockClear();
+    fireEvent.click(screen.getByTitle("Jump back"));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const footer = document.querySelector(".panel-footer") as HTMLElement;
+    expect(within(footer).getByText("Jump-back failed: open failed.")).toBeTruthy();
+    expect(document.querySelector(".panel-message")).toBeNull();
+    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(within(footer).getByText("Jump-back failed: open failed.")).toBeTruthy();
+  });
+
+  it("shows a Tauri session-loading string rejection verbatim", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockRejectedValue("Native session source is unavailable.");
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    expect(await screen.findByText("Native session source is unavailable.")).toBeTruthy();
+  });
+
+  it("shows a Tauri jump string rejection verbatim", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "native-jump-error",
+      label: "Native jump error",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") return [row];
+      if (command === "jump_to_session") throw "Native desktop jump was rejected.";
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+    fireEvent.click(await screen.findByTitle("Jump back"));
+
+    expect(await screen.findByText("Native desktop jump was rejected.")).toBeTruthy();
+  });
+
+  it("keeps the latest jump result when multiple rows open concurrently", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 2 }));
+    const firstRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "first-concurrent-jump",
+      label: "First concurrent jump",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const secondRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "second-concurrent-jump",
+      label: "Second concurrent jump",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const resolveJump = new Map<string, (response: Response) => void>();
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/jump") {
+        const { sessionId } = JSON.parse(String(init?.body)) as { sessionId: string };
+        return new Promise<Response>((resolve) => {
+          resolveJump.set(sessionId, resolve);
+        });
+      }
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([firstRow, secondRow]));
+      return Promise.resolve(jsonResponse({}, 404));
+    }));
+
+    render(<StatusPanelView initialRows={[firstRow, secondRow]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+
+    fireEvent.click(within(screen.getByTestId(`status-row-${firstRow.sessionId}`)).getByTitle("Jump back"));
+    fireEvent.click(within(screen.getByTestId(`status-row-${secondRow.sessionId}`)).getByTitle("Jump back"));
+
+    await act(async () => {
+      resolveJump.get(secondRow.sessionId)?.(jsonResponse({
+        sessionId: secondRow.sessionId,
+        availability: "exact",
+        target: "desktop",
+        succeeded: true,
+        message: "Opened second session.",
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText("Opened second session.")).toBeTruthy();
+
+    await act(async () => {
+      resolveJump.get(firstRow.sessionId)?.(jsonResponse({
+        sessionId: firstRow.sessionId,
+        availability: "exact",
+        target: "desktop",
+        succeeded: true,
+        message: "Opened first session.",
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Opened second session.")).toBeTruthy();
+    expect(screen.queryByText("Opened first session.")).toBeNull();
+  });
+
+  it("does not schedule jump feedback after the panel unmounts", async () => {
+    vi.useFakeTimers();
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "jump-after-unmount",
+      label: "Jump after unmount",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    let resolveJump: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request) => {
+      const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
+      if (pathname === "/api/jump") {
+        return new Promise<Response>((resolve) => {
+          resolveJump = resolve;
+        });
+      }
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([row]));
+      return Promise.resolve(jsonResponse({}, 404));
+    }));
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+
+    const { unmount } = render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    expandPanel();
+    fireEvent.click(screen.getByTitle("Jump back"));
+    const timersBeforeUnmount = setTimeoutSpy.mock.calls.length;
+    unmount();
+
+    await act(async () => {
+      resolveJump?.(jsonResponse({
+        sessionId: row.sessionId,
+        availability: "exact",
+        target: "desktop",
+        succeeded: true,
+        message: "Opened Codex Desktop session.",
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setTimeoutSpy).toHaveBeenCalledTimes(timersBeforeUnmount);
   });
 
   it("uses small Atom status markers for visible rows", () => {
@@ -1082,6 +1495,7 @@ describe("StatusPanelView", () => {
           sessionId: args?.sessionId,
           availability: "exact",
           target: "desktop",
+          succeeded: true,
           message: "Opened parent session.",
         };
       }
@@ -1137,6 +1551,7 @@ describe("StatusPanelView", () => {
           sessionId: args?.sessionId,
           availability: "exact",
           target: "desktop",
+          succeeded: true,
           message: "Opened child session.",
         };
       }
@@ -1238,6 +1653,7 @@ describe("StatusPanelView", () => {
           sessionId: attentionRow.sessionId,
           availability: "exact",
           target: "desktop",
+          succeeded: true,
           message: "Opened Codex Desktop session.",
         });
       }
@@ -1436,6 +1852,7 @@ describe("StatusPanelView", () => {
           sessionId: pinnedRow.sessionId,
           availability: "exact",
           target: "desktop",
+          succeeded: true,
           message: "Opened Codex Desktop session.",
         };
       }
@@ -1508,6 +1925,7 @@ describe("StatusPanelView", () => {
       sessionId: row.sessionId,
       availability: "exact",
       target: "desktop",
+      succeeded: true,
       message: "Opened Codex Desktop session.",
     }));
     await waitFor(() => {
@@ -1536,6 +1954,14 @@ describe("StatusPanelView", () => {
     expect(css).toContain("width: min(100vw - 8px, 412px);");
     expect(css).toContain("max-height: calc(100vh - 8px);");
     expect(css).toContain("inset 0 1px 0 rgba(171, 178, 191, 0.08);");
+  });
+
+  it("keeps the native minimum height aligned with the collapsed strip", () => {
+    // @ts-expect-error This test reads local JSON without adding Node types to the app build.
+    const tauriConfig = JSON.parse(readFileSync(join(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"));
+
+    expect(tauriConfig.app.windows[0].minHeight).toBe(50);
+    expect(tauriConfig.app.windows[0].maxHeight).toBe(420);
   });
 
   it("keeps the strip toggle from shifting header layout", () => {

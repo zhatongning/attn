@@ -200,7 +200,8 @@ p {
   padding-left: 2px;
 }
 
-.status-list--expanded {
+.status-list--expanded,
+.status-list--scrollable {
   overflow-y: auto;
 }
 
@@ -542,36 +543,17 @@ p {
   overflow: hidden;
 }
 
-.panel-footer > span {
-  flex: 0 1 auto;
+.jump-notice {
+  color: #abb2bf;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.source-dot {
-  background: #7f848e;
-  border-radius: 50%;
-  display: inline-block;
-  flex: 0 0 7px;
-  height: 7px;
-  width: 7px;
-}
-
-.source-dot--available {
-  background: #98c379;
-}
-
-.source-dot--degraded {
-  background: #d19a66;
-}
-
-.source-dot--unknown {
-  background: #7f848e;
-}
-
 .hidden-toggle {
+  flex: 0 0 auto;
   height: 22px;
   margin-left: auto;
   min-width: 40px;
