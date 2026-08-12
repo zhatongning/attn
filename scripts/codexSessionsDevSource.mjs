@@ -5,7 +5,14 @@ import path from "node:path";
 
 const defaultUnreadCompletionTrackingStartMs = Date.parse("2026-06-05T08:00:00.000Z");
 const pendingCliInputFreshnessMs = 30 * 60 * 1000;
+export const defaultFollowUpToIdleMinutes = 30;
+export const minFollowUpToIdleMinutes = 20;
 const defaultDevSource = createCodexSessionsDevSource();
+
+export function normalizeFollowUpToIdleMinutes(value) {
+  if (!Number.isFinite(value)) return defaultFollowUpToIdleMinutes;
+  return Math.max(minFollowUpToIdleMinutes, Math.trunc(value));
+}
 
 export function defaultCodexSessionsRoot() {
   return path.join(os.homedir(), ".codex", "sessions");
@@ -66,17 +73,20 @@ export function discoverCodexSessions({
   sessionsRoot = defaultCodexSessionsRoot(),
   limit = 80,
   nowMs = Date.now(),
+  followUpToIdleMinutes,
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
   liveCliTtyForWorkspace,
   liveCliSessions,
 } = {}) {
   if (arguments.length === 0) return defaultDevSource.discoverCodexSessions();
+  const normalizedFollowUpToIdleMinutes = normalizeFollowUpToIdleMinutes(followUpToIdleMinutes);
   liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
 
   const threadRows = discoverCodexThreads({
     stateDbPath,
     limit,
     nowMs,
+    followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
     unreadCompletionTrackingStartMs: trackingStartMs,
     liveCliSessions,
     liveCliTtyForWorkspace,
@@ -87,6 +97,7 @@ export function discoverCodexSessions({
         liveCliSessionRow(liveSession, {
           stateDbPath,
           nowMs,
+          followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
           unreadCompletionTrackingStartMs: trackingStartMs,
           liveCliSessions,
           liveCliTtyForWorkspace,
@@ -108,11 +119,13 @@ export function discoverCodexSessions({
 export function discoverCodexThreadById(sessionId, {
   stateDbPath = defaultCodexStateDbPath(),
   nowMs = Date.now(),
+  followUpToIdleMinutes,
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
   liveCliTtyForWorkspace,
   liveCliSessions,
 } = {}) {
   if (!fs.existsSync(stateDbPath)) return null;
+  const normalizedFollowUpToIdleMinutes = normalizeFollowUpToIdleMinutes(followUpToIdleMinutes);
   liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
 
   const query = `${threadSummaryJsonSelect()} from threads where id = '${sqliteStringLiteral(sessionId)}' limit 1;`;
@@ -124,6 +137,7 @@ export function discoverCodexThreadById(sessionId, {
     .filter(Boolean)
     .map((line) => parseThreadRow(line, {
       nowMs,
+      followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
       unreadCompletionTrackingStartMs: trackingStartMs,
       liveCliTtyForWorkspace,
       liveCliSessions,
@@ -134,9 +148,14 @@ export function discoverCodexThreadById(sessionId, {
 export async function jumpToSession(sessionId, options = {}) {
   if (arguments.length === 1) return defaultDevSource.jumpToSession(sessionId);
 
+  const normalizedOptions = {
+    ...options,
+    followUpToIdleMinutes: normalizeFollowUpToIdleMinutes(options.followUpToIdleMinutes),
+  };
+
   const row = sessionId
-    ? discoverCodexThreadById(sessionId, options)
-      ?? discoverCodexSessions(options).find((session) => session.sessionId === sessionId)
+    ? discoverCodexThreadById(sessionId, normalizedOptions)
+      ?? discoverCodexSessions(normalizedOptions).find((session) => session.sessionId === sessionId)
     : null;
   if (!row || !row.workspacePath) {
     return {
@@ -147,8 +166,8 @@ export async function jumpToSession(sessionId, options = {}) {
     };
   }
 
-  const plan = buildJumpPlan(row, options);
-  await (options.executeJump ?? executeJump)(row, plan);
+  const plan = buildJumpPlan(row, normalizedOptions);
+  await (normalizedOptions.executeJump ?? executeJump)(row, plan);
 
   return {
     sessionId: row.sessionId,
@@ -163,6 +182,7 @@ export function createCodexSessionsDevSource({
   sessionsRoot = defaultCodexSessionsRoot(),
   limit = 80,
   nowMs = Date.now(),
+  followUpToIdleMinutes,
   unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
   liveCliTtyForWorkspace = findLiveCodexTtyForWorkspace,
   liveCliSessions,
@@ -175,34 +195,52 @@ export function createCodexSessionsDevSource({
     sessionsRoot,
     limit,
     nowMs: typeof nowMs === "function" ? nowMs() : nowMs,
+    followUpToIdleMinutes: normalizeFollowUpToIdleMinutes(followUpToIdleMinutes),
     unreadCompletionTrackingStartMs: trackingStartMs,
     liveCliTtyForWorkspace,
     liveCliSessions,
     previousITermTtyForWorkspace,
   });
+  const mergedOptions = (overrides = {}) => {
+    const defaults = options();
+    return {
+      ...defaults,
+      ...overrides,
+      followUpToIdleMinutes: normalizeFollowUpToIdleMinutes(
+        overrides.followUpToIdleMinutes ?? defaults.followUpToIdleMinutes,
+      ),
+    };
+  };
 
   return {
-    discoverCodexSessions() {
-      return discoverCodexSessions(options()).map((row) =>
-        applyAcknowledgedSessionState(row, acknowledgedSignals, options().nowMs),
+    discoverCodexSessions(overrides) {
+      const resolvedOptions = mergedOptions(overrides);
+      return discoverCodexSessions(resolvedOptions).map((row) =>
+        applyAcknowledgedSessionState(
+          row,
+          acknowledgedSignals,
+          resolvedOptions.nowMs,
+          resolvedOptions.followUpToIdleMinutes,
+        ),
       );
     },
-    async jumpToSession(sessionId) {
-      const row = discoverCodexThreadById(sessionId, options())
-        ?? discoverCodexSessions(options()).find((session) => session.sessionId === sessionId);
+    async jumpToSession(sessionId, overrides) {
+      const resolvedOptions = mergedOptions(overrides);
+      const row = discoverCodexThreadById(sessionId, resolvedOptions)
+        ?? discoverCodexSessions(resolvedOptions).find((session) => session.sessionId === sessionId);
       const result = await jumpToSession(sessionId, {
-        ...options(),
+        ...resolvedOptions,
         executeJump: executeJumpOverride,
       });
       if (result.availability !== "unavailable" && !result.message.startsWith("Jump-back failed")) {
-        if (row) acknowledgedSignals.set(acknowledgedSignal(row), options().nowMs);
+        if (row) acknowledgedSignals.set(acknowledgedSignal(row), resolvedOptions.nowMs);
       }
       return result;
     },
   };
 }
 
-function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
+function discoverCodexThreads({ stateDbPath, limit, nowMs, followUpToIdleMinutes, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
   if (!fs.existsSync(stateDbPath)) return null;
 
   const query = `${threadSummaryJsonSelect()} from threads where archived = 0 order by coalesce(updated_at_ms, updated_at * 1000) desc limit ${limit};`;
@@ -212,7 +250,13 @@ function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrack
   return result.stdout
     .split("\n")
     .filter(Boolean)
-    .map((line) => parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }))
+    .map((line) => parseThreadRow(line, {
+      nowMs,
+      followUpToIdleMinutes,
+      unreadCompletionTrackingStartMs,
+      liveCliSessions,
+      liveCliTtyForWorkspace,
+    }))
     .filter(Boolean);
 }
 
@@ -235,7 +279,13 @@ function sqliteStringLiteral(value) {
   return String(value).replaceAll("'", "''");
 }
 
-function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
+function parseThreadRow(line, {
+  nowMs,
+  followUpToIdleMinutes,
+  unreadCompletionTrackingStartMs,
+  liveCliSessions,
+  liveCliTtyForWorkspace,
+}) {
   let thread;
   try {
     thread = JSON.parse(line);
@@ -254,7 +304,7 @@ function parseThreadRow(line, { nowMs, unreadCompletionTrackingStartMs, liveCliS
   const hasRecentActivity = lastActivityAt
     ? nowMs - Date.parse(lastActivityAt) <= 2 * 60 * 60 * 1000
     : false;
-  const threadCompletionKind = completionKindFromLastActivityAt(lastActivityAt, nowMs);
+  const threadCompletionKind = completionKindFromLastActivityAt(lastActivityAt, nowMs, followUpToIdleMinutes);
   const kind = threadUpdatedAfterTaskComplete && jsonlKind === "completedImmediate"
     ? threadCompletionKind
     : (terminalOrInputKind(jsonlKind)
@@ -314,10 +364,10 @@ function terminalOrInputKind(kind) {
     || kind === "waitingForInput";
 }
 
-function completionKindFromLastActivityAt(lastActivityAt, nowMs) {
+function completionKindFromLastActivityAt(lastActivityAt, nowMs, followUpToIdleMinutes) {
   const ageMs = lastActivityAt ? nowMs - Date.parse(lastActivityAt) : Number.POSITIVE_INFINITY;
   if (ageMs <= 5 * 60 * 1000) return "completedImmediate";
-  if (ageMs <= 30 * 60 * 1000) return "completed";
+  if (ageMs <= followUpToIdleMinutes * 60 * 1000) return "completed";
   return "completedStale";
 }
 
@@ -534,7 +584,7 @@ function classificationForKind(kind) {
     return {
       state: "needsAttention",
       confidence: "exact",
-      reason: "completed task was opened; keep it quiet during the 30-minute follow-up window",
+      reason: "completed task was opened; keep it quiet during the follow-up window",
     };
   }
   if (kind === "completedStale") {
@@ -714,19 +764,24 @@ function rowHasFreshActivity(row, nowMs, freshnessMs) {
   return Boolean(row.lastActivityAt && nowMs - Date.parse(row.lastActivityAt) <= freshnessMs);
 }
 
-function applyAcknowledgedSessionState(row, acknowledgedSignals, nowMs = Date.now()) {
+function applyAcknowledgedSessionState(
+  row,
+  acknowledgedSignals,
+  nowMs = Date.now(),
+  followUpToIdleMinutes = defaultFollowUpToIdleMinutes,
+) {
   if (!acknowledgedSignals.has(acknowledgedSignal(row))) return row;
   if (row.state === "running") return row;
   if (row.state === "idle") return row;
   if (row.state === "waitingForInput") return row;
 
   const acknowledgedAtMs = acknowledgedSignals.get(acknowledgedSignal(row));
-  if (typeof acknowledgedAtMs === "number" && nowMs - acknowledgedAtMs <= 30 * 60 * 1000) {
+  if (typeof acknowledgedAtMs === "number" && nowMs - acknowledgedAtMs <= followUpToIdleMinutes * 60 * 1000) {
     return {
       ...row,
       state: "needsAttention",
       confidence: "exact",
-      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+      statusReason: "Read recently; keep it quiet during the follow-up window.",
       handled: true,
       dismissed: false,
     };

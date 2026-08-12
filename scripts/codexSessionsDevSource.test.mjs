@@ -8,6 +8,7 @@ import {
   defaultCodexStateDbPath,
   discoverCodexSessions,
   jumpToSession,
+  normalizeFollowUpToIdleMinutes,
   parseCodexProcessLine,
   selectLiveCliPrimarySessionId,
 } from "./codexSessionsDevSource.mjs";
@@ -310,7 +311,7 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
-  it("uses sqlite update after task_complete as a read signal", () => {
+  it("uses the configured follow-up boundary for SQLite read signals", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
     const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
@@ -337,21 +338,38 @@ describe("codexSessionsDevSource", () => {
       updatedAtMs: Date.parse("2026-06-06T04:10:00.000Z"),
     });
 
-    const rows = discoverCodexSessions({
+    const atBoundaryRows = discoverCodexSessions({
       stateDbPath: stateDb,
       sessionsRoot: path.join(temp, "sessions"),
-      nowMs: Date.parse("2026-06-06T04:20:00.000Z"),
+      nowMs: Date.parse("2026-06-06T04:55:00.000Z"),
       unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      followUpToIdleMinutes: 45,
       limit: 20,
       liveCliTtyForWorkspace: () => undefined,
     });
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
+    expect(atBoundaryRows).toHaveLength(1);
+    expect(atBoundaryRows[0]).toMatchObject({
       sessionId: "019read-signal",
       state: "needsAttention",
-      statusReason: "completed task was opened; keep it quiet during the 30-minute follow-up window",
+      statusReason: "completed task was opened; keep it quiet during the follow-up window",
       lastActivityAt: "2026-06-06T04:10:00.000Z",
+    });
+
+    const afterBoundaryRows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:55:00.001Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      followUpToIdleMinutes: 45,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(afterBoundaryRows[0]).toMatchObject({
+      sessionId: "019read-signal",
+      state: "idle",
+      statusReason: "completed task is no longer recent; idle until the next source signal",
     });
   });
 
@@ -418,7 +436,7 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
-  it("moves read completed sessions to needed for 30 minutes, then idle", async () => {
+  it("uses the configured follow-up boundary without losing acknowledged state", async () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "missing.sqlite");
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
@@ -437,6 +455,7 @@ describe("codexSessionsDevSource", () => {
       stateDbPath: stateDb,
       sessionsRoot: path.join(temp, "sessions"),
       nowMs: () => nowMs,
+      followUpToIdleMinutes: 45,
       unreadCompletionTrackingStartMs: earlyTrackingStartMs,
       limit: 20,
       liveCliTtyForWorkspace: () => undefined,
@@ -452,17 +471,46 @@ describe("codexSessionsDevSource", () => {
     expect(source.discoverCodexSessions()[0]).toMatchObject({
       sessionId: "019read-window",
       state: "needsAttention",
-      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+      statusReason: "Read recently; keep it quiet during the follow-up window.",
       handled: true,
     });
 
-    nowMs = Date.parse("2026-06-03T06:31:00.000Z");
+    const acknowledgedAtMs = nowMs;
+    nowMs = acknowledgedAtMs + 45 * 60 * 1000;
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019read-window",
+      state: "needsAttention",
+      handled: true,
+    });
+
+    nowMs += 1;
     expect(source.discoverCodexSessions()[0]).toMatchObject({
       sessionId: "019read-window",
       state: "idle",
       statusReason: "Read window expired; idle until the next source signal.",
       handled: true,
     });
+
+    nowMs = acknowledgedAtMs + 20 * 60 * 1000;
+    expect(source.discoverCodexSessions({ followUpToIdleMinutes: 12 })[0]).toMatchObject({
+      sessionId: "019read-window",
+      state: "needsAttention",
+      handled: true,
+    });
+    nowMs += 1;
+    expect(source.discoverCodexSessions({ followUpToIdleMinutes: 12 })[0]).toMatchObject({
+      sessionId: "019read-window",
+      state: "idle",
+      handled: true,
+    });
+  });
+
+  it("normalizes the follow-up duration without a product maximum", () => {
+    expect(normalizeFollowUpToIdleMinutes()).toBe(30);
+    expect(normalizeFollowUpToIdleMinutes(12)).toBe(20);
+    expect(normalizeFollowUpToIdleMinutes(20)).toBe(20);
+    expect(normalizeFollowUpToIdleMinutes(180.8)).toBe(180);
+    expect(normalizeFollowUpToIdleMinutes(Number.POSITIVE_INFINITY)).toBe(30);
   });
 
   it("resumes exact CLI sessions in a previous iTerm tab instead of only focusing it", async () => {

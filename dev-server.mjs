@@ -2,19 +2,21 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import {
-  discoverCodexSessions,
-  jumpToSession,
+  createCodexSessionsDevSource,
   sourceHealth,
 } from "./scripts/codexSessionsDevSource.mjs";
 
 const port = 1420;
 const root = process.cwd();
+const previewSource = createCodexSessionsDevSource();
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
 
   if (url.pathname === "/api/sessions") {
-    return sendJson(res, discoverCodexSessions());
+    return sendJson(res, previewSource.discoverCodexSessions({
+      followUpToIdleMinutes: Number(url.searchParams.get("followUpToIdleMinutes")),
+    }));
   }
 
   if (url.pathname === "/api/source-health") {
@@ -23,7 +25,9 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === "/api/jump" && req.method === "POST") {
     return readJsonBody(req)
-      .then(({ sessionId }) => jumpToSession(sessionId))
+      .then(({ sessionId, followUpToIdleMinutes }) =>
+        previewSource.jumpToSession(sessionId, { followUpToIdleMinutes }),
+      )
       .then((result) => sendJson(res, result))
       .catch((error) => {
         res.statusCode = 500;
