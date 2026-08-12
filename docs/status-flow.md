@@ -95,8 +95,10 @@ These are the rules implemented today.
 Completion attention is time-bounded and read-driven:
 
 - `inspect`: completed result is at most 12 hours old and has not been opened/read yet.
-- `follow-up`: completed result was opened/read within the configured follow-up window (30 minutes by default; 20-minute minimum); keep it quiet and out of Alerts, but use it to fill an unused configured panel slot after primary rows.
+- `follow-up`: completed result is in the configured post-read follow-up window; keep it quiet and out of Alerts, but use it to fill an unused configured panel slot after primary rows.
 - `idle`: completed result is older than 12 hours, or was opened/read more than the configured follow-up duration ago.
+
+The follow-up duration is configurable: 30 minutes by default, 20 minutes minimum, and intentionally has no product maximum.
 
 Unread-completion retention is 12 hours. After this window, a terminal unread completion becomes `CompletedStale` and stays quiet unless newer source evidence appears.
 
@@ -108,7 +110,7 @@ Generic non-terminal activity is still considered recent for 2 hours.
 | --- | --- |
 | JSONL says `CompletedImmediate`, `Completed`, `Failed`, or `WaitingForInput` | Use JSONL terminal/input state. |
 | JSONL says unread `task_complete` within 12 hours | Keep as `CompletedImmediate` until read or the 12-hour retention window expires. |
-| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat the completed result as read/opened and apply the configured `follow-up` window (30 minutes by default; 20-minute minimum) from `updated_at_ms`. |
+| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat this as external read/open evidence. From `updated_at_ms`, a fixed inclusive 5-minute `CompletedImmediate`/`inspect` period applies first; after that, `Completed`/`needsAttention` lasts through the inclusive configured follow-up boundary, then the row becomes `CompletedStale`/`idle`. |
 | Thread is archived without explicit unread completion evidence | Apply completion-age fallback, usually `CompletedStale` for old archived threads. |
 | Desktop thread has recent activity | `Running` |
 | Desktop thread is old and unarchived | `Idle` |
