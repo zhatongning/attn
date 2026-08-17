@@ -405,16 +405,6 @@ p {
   padding: 0 5px;
 }
 
-.status-subagent-marker {
-  border: 1px solid #5a3d27;
-  border-radius: 999px;
-  color: #d19a66;
-  flex: 0 0 auto;
-  font-size: 10px;
-  padding: 0 5px;
-  white-space: nowrap;
-}
-
 .status-evidence-anchor {
   display: inline-flex;
   flex: 0 0 auto;
@@ -543,6 +533,10 @@ p {
   overflow: hidden;
 }
 
+.panel-footer .panel-counters {
+  flex: 0 0 auto;
+}
+
 .jump-notice {
   color: #abb2bf;
   flex: 1 1 auto;
@@ -596,81 +590,6 @@ p {
   font-size: 12px;
   gap: 5px;
   min-width: 0;
-}
-
-.status-subtasks {
-  background: transparent;
-  border: 0;
-  color: #abb2bf;
-  flex: 1 1 auto;
-  font-size: 11px;
-  height: auto;
-  justify-content: flex-start;
-  line-height: 1.2;
-  min-width: 0;
-  overflow: hidden;
-  padding: 0;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-button.status-subtasks {
-  cursor: pointer;
-}
-
-button.status-subtasks:hover,
-button.status-subtasks:focus-visible {
-  background: transparent;
-  color: #d7dae0;
-}
-
-.status-subtask-list {
-  border-top: 1px solid #323844;
-  display: grid;
-  gap: 5px;
-  grid-column: 2 / 4;
-  margin-top: -2px;
-  max-height: 132px;
-  min-width: 0;
-  overflow-y: auto;
-  padding-top: 6px;
-  scrollbar-width: thin;
-}
-
-.status-subtask {
-  align-items: center;
-  background: #21252b;
-  border: 1px solid #323844;
-  border-radius: 5px;
-  display: grid;
-  gap: 6px;
-  grid-template-columns: 72px minmax(0, 1fr) auto auto;
-  min-height: 28px;
-  min-width: 0;
-  padding: 3px 4px 3px 7px;
-}
-
-.status-subtask-code {
-  color: var(--status-color);
-  font-size: 10px;
-  font-weight: 800;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.status-subtask-title {
-  color: #d7dae0;
-  font-size: 11px;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.status-actions--subtask {
-  min-width: 52px;
 }
 
 .setting-field span {

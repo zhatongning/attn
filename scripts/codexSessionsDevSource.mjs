@@ -55,15 +55,35 @@ function fileModifiedMs(filePath) {
 export function sourceHealth({
   stateDbPath = defaultCodexStateDbPath(),
   sessionsRoot = defaultCodexSessionsRoot(),
+  snapshot,
 } = {}) {
+  const hasSessionsRoot = fs.existsSync(sessionsRoot);
+  const isDegradedSnapshot = snapshot?.isDegraded === true;
+  const hasHealthySqliteSnapshot = snapshot && !isDegradedSnapshot;
+  const status = isDegradedSnapshot
+    ? (hasSessionsRoot ? "degraded" : "unknown")
+    : (hasHealthySqliteSnapshot || hasSessionsRoot ? "available" : "unknown");
+  const threadDiscovery = isDegradedSnapshot
+    ? {
+      availability: hasSessionsRoot ? "inferred" : "unavailable",
+      detail: hasSessionsRoot
+        ? `SQLite thread discovery at ${stateDbPath} failed; JSONL fallback used.${snapshot.sqliteError ? ` ${snapshot.sqliteError}` : ""}`
+        : `SQLite thread discovery at ${stateDbPath} failed, and JSONL sessions are unavailable.${snapshot.sqliteError ? ` ${snapshot.sqliteError}` : ""}`,
+    }
+    : {
+      availability: hasHealthySqliteSnapshot || fs.existsSync(stateDbPath)
+        ? "inferred"
+        : "unavailable",
+      detail: `Reads local Codex thread state from ${stateDbPath}.`,
+    };
+
   return {
     sourceName: "Codex sessions",
-    status: fs.existsSync(sessionsRoot) ? "available" : "unknown",
+    status,
     capabilities: [
       {
         name: "Thread discovery",
-        availability: fs.existsSync(stateDbPath) ? "inferred" : "unavailable",
-        detail: `Reads local Codex thread state from ${stateDbPath}.`,
+        ...threadDiscovery,
       },
       {
         name: "Attention/completion status",
@@ -91,41 +111,109 @@ export function discoverCodexSessions({
   liveCliSessions,
 } = {}) {
   if (arguments.length === 0) return defaultDevSource.discoverCodexSessions();
-  const normalizedFollowUpToIdleMinutes = normalizeFollowUpToIdleMinutes(followUpToIdleMinutes);
-  liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
-
-  const threadRows = discoverCodexThreads({
+  const snapshot = discoverCodexSessionSnapshot({
     stateDbPath,
+    sessionsRoot,
+    limit,
+    nowMs,
+    followUpToIdleMinutes,
+    unreadCompletionTrackingStartMs: trackingStartMs,
+    liveCliTtyForWorkspace,
+    liveCliSessions,
+  });
+  return sessionRowsFromSnapshot(snapshot);
+}
+
+function discoverCodexSessionSnapshot({
+  stateDbPath = defaultCodexStateDbPath(),
+  sessionsRoot = defaultCodexSessionsRoot(),
+  limit = 80,
+  nowMs = Date.now(),
+  followUpToIdleMinutes,
+  unreadCompletionTrackingStartMs: trackingStartMs = defaultUnreadCompletionTrackingStartMs,
+  liveCliTtyForWorkspace,
+  liveCliSessions,
+} = {}) {
+  const normalizedFollowUpToIdleMinutes = normalizeFollowUpToIdleMinutes(followUpToIdleMinutes);
+  const resolvedLiveCliSessions = liveCliSessions
+    ?? (liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions());
+  const options = {
+    stateDbPath,
+    sessionsRoot,
     limit,
     nowMs,
     followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
     unreadCompletionTrackingStartMs: trackingStartMs,
-    liveCliSessions,
     liveCliTtyForWorkspace,
-  });
+    liveCliSessions: resolvedLiveCliSessions,
+  };
+
+  const threadRows = discoverCodexThreads(options);
   if (threadRows !== null) {
-    return sortAndLimitRows(
-      mergeLiveCliSessions(threadRows, liveCliSessions, (liveSession) =>
-        liveCliSessionRow(liveSession, {
-          stateDbPath,
-          nowMs,
-          followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
-          unreadCompletionTrackingStartMs: trackingStartMs,
-          liveCliSessions,
-          liveCliTtyForWorkspace,
-        }),
-      ),
-      limit,
-    );
+    return {
+      observedRows: threadRows.map((row) => ({ kind: stabilityKindForRow(row), row })),
+      isDegraded: false,
+      sqliteError: undefined,
+      options,
+    };
   }
 
-  const jsonlRows = collectJsonlFiles(sessionsRoot)
-    .sort((left, right) => right.modifiedAt - left.modifiedAt)
-    .slice(0, limit)
-    .map((file) => parseSessionFile(file.path, { nowMs, unreadCompletionTrackingStartMs: trackingStartMs }))
-    .filter(Boolean)
-    .map((observation) => toSessionRow(observation, { liveCliSessions, liveCliTtyForWorkspace, nowMs }));
-  return sortAndLimitRows(mergeLiveCliSessions(jsonlRows, liveCliSessions, fallbackLiveCliSessionRow), limit);
+  const observedSessionIds = new Set();
+  const jsonlRows = [];
+  for (const file of collectJsonlFiles(sessionsRoot)
+    .sort((left, right) => right.modifiedAt - left.modifiedAt)) {
+    const observation = parseSessionFile(file.path, {
+      nowMs,
+      unreadCompletionTrackingStartMs: trackingStartMs,
+    });
+    if (!observation || observedSessionIds.has(observation.sessionId)) continue;
+
+    observedSessionIds.add(observation.sessionId);
+    if (isSubagentRow(observation)) continue;
+    jsonlRows.push({
+      kind: observation.kind,
+      row: toSessionRow(observation, {
+        liveCliSessions: resolvedLiveCliSessions,
+        liveCliTtyForWorkspace,
+        nowMs,
+      }),
+    });
+    if (jsonlRows.length >= limit) break;
+  }
+  return {
+    observedRows: jsonlRows,
+    isDegraded: true,
+    sqliteError: sqliteFallbackDetail(stateDbPath),
+    options,
+  };
+}
+
+function sessionRowsFromSnapshot(snapshot, sourceRows = snapshot.observedRows.map(({ row }) => row)) {
+  const { options } = snapshot;
+  return sortAndLimitRows(
+    mergeLiveCliSessions(sourceRows, options.liveCliSessions, (liveSession) =>
+      liveCliSessionRow(liveSession, options))
+      .filter((row) => !isSubagentRow(row)),
+    options.limit,
+  );
+}
+
+function sqliteFallbackDetail(stateDbPath) {
+  return fs.existsSync(stateDbPath)
+    ? "SQLite thread discovery failed; JSONL fallback used."
+    : `SQLite state DB is unavailable at ${stateDbPath}; JSONL fallback used.`;
+}
+
+function stabilityKindForRow(row) {
+  if (row.state === "running") return "running";
+  if (row.state === "unknown") return "insufficientEvidence";
+  if (
+    row.state === "idle"
+    && row.statusReason === "no recent activity observed; idle until the next source signal"
+  ) {
+    return "idle";
+  }
+  return "other";
 }
 
 export function discoverCodexThreadById(sessionId, {
@@ -140,11 +228,13 @@ export function discoverCodexThreadById(sessionId, {
   const normalizedFollowUpToIdleMinutes = normalizeFollowUpToIdleMinutes(followUpToIdleMinutes);
   liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
 
-  const query = `${threadSummaryJsonSelect()} from threads where id = '${sqliteStringLiteral(sessionId)}' limit 1;`;
-  const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDbPath, query], { encoding: "utf8" });
-  if (result.status !== 0) return null;
+  const stdout = readThreadSummariesFromStateDb(
+    stateDbPath,
+    `where threads.id = '${sqliteStringLiteral(sessionId)}' limit 1`,
+  );
+  if (stdout === null) return null;
 
-  return result.stdout
+  return stdout
     .split("\n")
     .filter(Boolean)
     .map((line) => parseThreadRow(line, {
@@ -214,6 +304,8 @@ export function createCodexSessionsDevSource({
   executeJump: executeJumpOverride,
 } = {}) {
   const acknowledgedSignals = new Map();
+  const desktopObservationHistory = new Map();
+  let latestSnapshot;
   const options = () => ({
     stateDbPath,
     sessionsRoot,
@@ -239,7 +331,10 @@ export function createCodexSessionsDevSource({
   return {
     discoverCodexSessions(overrides) {
       const resolvedOptions = mergedOptions(overrides);
-      return discoverCodexSessions(resolvedOptions).map((row) =>
+      const snapshot = discoverCodexSessionSnapshot(resolvedOptions);
+      latestSnapshot = snapshot;
+      const stableRows = stabilizeDesktopRunningRows(snapshot, desktopObservationHistory);
+      return sessionRowsFromSnapshot(snapshot, stableRows).map((row) =>
         applyAcknowledgedSessionState(
           row,
           acknowledgedSignals,
@@ -261,42 +356,242 @@ export function createCodexSessionsDevSource({
       }
       return result;
     },
+    sourceHealth() {
+      const sourceOptions = latestSnapshot?.options ?? options();
+      return sourceHealth({
+        stateDbPath: sourceOptions.stateDbPath,
+        sessionsRoot: sourceOptions.sessionsRoot,
+        snapshot: latestSnapshot,
+      });
+    },
+  };
+}
+
+function stabilizeDesktopRunningRows(snapshot, history) {
+  const observedDesktopIds = new Set();
+  const stableRows = [];
+
+  for (const { kind, row } of snapshot.observedRows) {
+    if (row.jumpTarget !== "desktop") {
+      stableRows.push(row);
+      continue;
+    }
+
+    observedDesktopIds.add(row.sessionId);
+    const previous = history.get(row.sessionId);
+
+    if (
+      snapshot.isDegraded
+      && (kind === "idle" || kind === "insufficientEvidence")
+    ) {
+      if (previous) {
+        if (
+          previous.state === "retainedAfterDegradedSnapshot"
+          || previous.state === "sourceUnavailable"
+        ) {
+          history.set(row.sessionId, { row: previous.row, state: "sourceUnavailable" });
+          stableRows.push(unavailableDesktopSourceRow(previous.row, snapshot.sqliteError));
+        } else {
+          history.set(row.sessionId, { row: previous.row, state: "retainedAfterDegradedSnapshot" });
+          stableRows.push(retainedDesktopRunningRow(previous.row, snapshot.sqliteError));
+        }
+        continue;
+      }
+    }
+
+    if (kind === "running") {
+      history.set(row.sessionId, { row, state: "running" });
+      stableRows.push(annotateDegradedSnapshotRow(row, snapshot.sqliteError));
+      continue;
+    }
+
+    if (
+      !snapshot.isDegraded
+      && kind === "idle"
+      && (
+        previous?.state === "running"
+        || previous?.state === "retainedAfterDegradedSnapshot"
+        || previous?.state === "sourceUnavailable"
+      )
+    ) {
+      history.set(row.sessionId, { row: previous.row, state: "awaitingIdleConfirmation" });
+      stableRows.push(awaitingDesktopIdleConfirmationRow(row, previous.row));
+      continue;
+    }
+
+    history.delete(row.sessionId);
+    stableRows.push(annotateDegradedSnapshotRow(row, snapshot.sqliteError));
+  }
+
+  if (snapshot.isDegraded) {
+    for (const [sessionId, previous] of history) {
+      if (
+        observedDesktopIds.has(sessionId)
+      ) continue;
+      if (
+        previous.state === "retainedAfterDegradedSnapshot"
+        || previous.state === "sourceUnavailable"
+      ) {
+        history.set(sessionId, { row: previous.row, state: "sourceUnavailable" });
+        stableRows.push(unavailableDesktopSourceRow(previous.row, snapshot.sqliteError));
+      } else {
+        history.set(sessionId, { row: previous.row, state: "retainedAfterDegradedSnapshot" });
+        stableRows.push(retainedDesktopRunningRow(previous.row, snapshot.sqliteError));
+      }
+    }
+  } else {
+    for (const [sessionId, previous] of history) {
+      if (observedDesktopIds.has(sessionId)) continue;
+      if (
+        previous.state === "running"
+        || previous.state === "retainedAfterDegradedSnapshot"
+      ) {
+        history.set(sessionId, { row: previous.row, state: "awaitingMissingConfirmation" });
+        stableRows.push(awaitingDesktopMissingConfirmationRow(previous.row));
+      } else {
+        history.delete(sessionId);
+      }
+    }
+  }
+
+  return stableRows;
+}
+
+function awaitingDesktopIdleConfirmationRow(idleRow, previousRunningRow) {
+  return {
+    ...idleRow,
+    state: "running",
+    confidence: "inferred",
+    statusReason: "Desktop source reported idle once; waiting for the next SQLite snapshot to confirm idle.",
+    evidenceSummary: idleRow.evidenceSummary
+      ?? previousRunningRow.evidenceSummary
+      ?? "Recent Desktop running state retained until idle is confirmed.",
+    lastActivityAt: previousRunningRow.lastActivityAt ?? idleRow.lastActivityAt,
+  };
+}
+
+function awaitingDesktopMissingConfirmationRow(previousRunningRow) {
+  return {
+    ...previousRunningRow,
+    state: "running",
+    confidence: "inferred",
+    statusReason: "Desktop session was missing from one SQLite snapshot; waiting for the next snapshot to confirm it stopped.",
+    evidenceSummary: previousRunningRow.evidenceSummary
+      ?? "Recent Desktop running state retained until the missing row is confirmed.",
+    handled: false,
+    dismissed: false,
+  };
+}
+
+function retainedDesktopRunningRow(previousRunningRow, sqliteError) {
+  const fallbackDetail = sqliteError ? ` SQLite fallback: ${sqliteError}` : "";
+  return {
+    ...previousRunningRow,
+    state: "running",
+    confidence: "inferred",
+    statusReason: `Recent Desktop running state retained while the SQLite source is degraded.${fallbackDetail}`,
+    evidenceSummary: `${previousRunningRow.evidenceSummary
+      ?? "Recent Desktop running state retained until SQLite discovery recovers."}${fallbackDetail}`,
+    handled: false,
+    dismissed: false,
+  };
+}
+
+function unavailableDesktopSourceRow(previousRunningRow, sqliteError) {
+  const fallbackDetail = sqliteError ? ` SQLite fallback: ${sqliteError}` : "";
+  return {
+    ...previousRunningRow,
+    state: "unknown",
+    confidence: "unknown",
+    statusReason: `Desktop SQLite source unavailable after consecutive degraded snapshots.${fallbackDetail}`,
+    evidenceSummary: `${previousRunningRow.evidenceSummary
+      ?? "Recent Desktop running state can no longer be verified."}${fallbackDetail}`,
+    handled: false,
+    dismissed: false,
+  };
+}
+
+function annotateDegradedSnapshotRow(row, sqliteError) {
+  if (!sqliteError) return row;
+  return {
+    ...row,
+    evidenceSummary: `${row.evidenceSummary ?? ""}${row.evidenceSummary ? " " : ""}SQLite fallback: ${sqliteError}`,
   };
 }
 
 function discoverCodexThreads({ stateDbPath, limit, nowMs, followUpToIdleMinutes, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
   if (!fs.existsSync(stateDbPath)) return null;
+  if (limit <= 0) return [];
 
-  const query = `${threadSummaryJsonSelect()} from threads where archived = 0 order by coalesce(updated_at_ms, updated_at * 1000) desc limit ${limit};`;
-  const result = spawnSync("sqlite3", ["-batch", "-readonly", stateDbPath, query], { encoding: "utf8" });
-  if (result.status !== 0) return null;
+  const stdout = readThreadSummariesFromStateDb(
+    stateDbPath,
+    `where threads.archived = 0
+      and coalesce(threads.thread_source, '') <> 'subagent'
+      and thread_spawn_edges.parent_thread_id is null
+      order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc`,
+    `where archived = 0
+      and coalesce(thread_source, '') <> 'subagent'
+      order by coalesce(updated_at_ms, updated_at * 1000) desc`,
+  );
+  if (stdout === null) return null;
 
-  return result.stdout
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => parseThreadRow(line, {
+  const rows = [];
+  for (const line of stdout.split("\n")) {
+    if (!line) continue;
+    const row = parseThreadRow(line, {
       nowMs,
       followUpToIdleMinutes,
       unreadCompletionTrackingStartMs,
       liveCliSessions,
       liveCliTtyForWorkspace,
-    }))
-    .filter(Boolean);
+    });
+    if (!row || isSubagentRow(row)) continue;
+    rows.push(row);
+    if (rows.length >= limit) break;
+  }
+  return rows;
 }
 
-function threadSummaryJsonSelect() {
+function readThreadSummariesFromStateDb(stateDbPath, querySuffix, legacyQuerySuffix = querySuffix) {
+  const joinedQuery = `${threadSummaryJsonSelect()} ${threadSummaryFromSql()} ${querySuffix};`;
+  const joinedResult = runSqliteReadQuery(stateDbPath, joinedQuery);
+  if (joinedResult.status === 0) return joinedResult.stdout;
+  if (!incompatibleThreadSpawnEdgesSchema(joinedResult.stderr)) return null;
+
+  const fallbackQuery = `${threadSummaryJsonSelect({ includeParentSessionId: false })} from threads ${legacyQuerySuffix};`;
+  const fallbackResult = runSqliteReadQuery(stateDbPath, fallbackQuery);
+  return fallbackResult.status === 0 ? fallbackResult.stdout : null;
+}
+
+function runSqliteReadQuery(stateDbPath, query) {
+  return spawnSync("sqlite3", ["-batch", "-readonly", stateDbPath, query], { encoding: "utf8" });
+}
+
+function incompatibleThreadSpawnEdgesSchema(stderr) {
+  return /no such table:\s*thread_spawn_edges|no such column:\s*thread_spawn_edges\./i.test(stderr ?? "");
+}
+
+function threadSummaryJsonSelect({ includeParentSessionId = true } = {}) {
+  const parentSessionId = includeParentSessionId
+    ? ",\n    'parent_session_id', thread_spawn_edges.parent_thread_id"
+    : "";
   return `select json_object(
-    'id', id,
-    'rollout_path', rollout_path,
-    'updated_at_ms', updated_at_ms,
-    'source', source,
-    'cwd', cwd,
-    'title', title,
-    'archived', archived,
-    'agent_nickname', agent_nickname,
-    'thread_source', thread_source,
-    'preview', preview
+    'id', threads.id,
+    'rollout_path', threads.rollout_path,
+    'updated_at_ms', threads.updated_at_ms,
+    'source', threads.source,
+    'cwd', threads.cwd,
+    'title', threads.title,
+    'archived', threads.archived,
+    'agent_nickname', threads.agent_nickname,
+    'thread_source', threads.thread_source,
+    'preview', threads.preview${parentSessionId}
   )`;
+}
+
+function threadSummaryFromSql() {
+  return `from threads
+    left join thread_spawn_edges on thread_spawn_edges.child_thread_id = threads.id`;
 }
 
 function sqliteStringLiteral(value) {
@@ -357,8 +652,8 @@ function parseThreadRow(line, {
       thread.thread_source,
       thread.source,
     ),
-    threadSource: emptyToUndefined(thread.thread_source),
-    parentSessionId: jsonlObservation?.parentSessionId,
+    threadSource: effectiveThreadSource(thread.thread_source, jsonlObservation?.threadSource),
+    parentSessionId: firstNonEmpty(jsonlObservation?.parentSessionId, thread.parent_session_id),
     projectName: workspaceName,
     workspacePath,
     lastActivityAt,
@@ -401,8 +696,11 @@ function parseSessionFile(filePath, {
 }) {
   if (!fs.existsSync(filePath)) return null;
 
-  let sessionId;
+  // Rollout files may contain parent metadata after their own session metadata.
+  // Prefer the file identity and only apply metadata belonging to that session.
+  let sessionId = sessionIdFromJsonlPath(filePath);
   let parentSessionId;
+  let threadSource;
   let workspacePath;
   let agentName;
   let sessionName;
@@ -424,19 +722,31 @@ function parseSessionFile(filePath, {
       continue;
     }
 
-    if (typeof value.timestamp === "string") {
-      lastActivityAt = value.timestamp;
-    }
-
     if (value.type === "session_meta") {
-      sessionId = value.payload?.id ?? sessionId;
+      const metadataSessionId = typeof value.payload?.id === "string"
+        ? value.payload.id.trim()
+        : "";
+      if (!metadataSessionId || (sessionId && metadataSessionId !== sessionId)) continue;
+
+      sessionId ??= metadataSessionId;
       parentSessionId = parentThreadIdFromSessionMeta(value.payload) ?? parentSessionId;
+      threadSource = firstNonEmpty(
+        value.payload?.thread_source,
+        value.thread_source,
+        threadSource,
+      );
       workspacePath = value.payload?.cwd ?? workspacePath;
       agentName = firstNonEmpty(value.payload?.agent_nickname, value.payload?.originator, agentName);
       jumpTarget = jumpTargetFromSessionMeta(value.payload) ?? jumpTarget;
+      if (typeof value.timestamp === "string") {
+        lastActivityAt = value.timestamp;
+      }
     }
 
     if (value.type === "event_msg") {
+      if (typeof value.timestamp === "string") {
+        lastActivityAt = value.timestamp;
+      }
       const eventType = value.payload?.type;
       const turnId = typeof value.payload?.turn_id === "string" ? value.payload.turn_id : "";
       if (turnId.startsWith("external-import-turn-")) {
@@ -465,6 +775,9 @@ function parseSessionFile(filePath, {
     }
 
     if (value.type === "response_item") {
+      if (typeof value.timestamp === "string") {
+        lastActivityAt = value.timestamp;
+      }
       const approval = pendingToolApprovalFromResponseItem(value);
       if (approval) {
         lastActivityKind = "waitingForInput";
@@ -479,7 +792,7 @@ function parseSessionFile(filePath, {
     }
   }
 
-  sessionId ??= path.basename(filePath, ".jsonl").split("-").at(-1);
+  sessionId ??= sessionIdFromRolloutPath(filePath);
   if (!sessionId) return null;
 
   const ageMs = lastActivityAt ? nowMs - Date.parse(lastActivityAt) : Number.POSITIVE_INFINITY;
@@ -503,6 +816,7 @@ function parseSessionFile(filePath, {
   return {
     sessionId,
     parentSessionId,
+    threadSource,
     kind,
     label,
     agentName,
@@ -547,6 +861,21 @@ function parentThreadIdFromSessionMeta(payload) {
     payload?.parent_thread_id,
     payload?.source?.subagent?.thread_spawn?.parent_thread_id,
   );
+}
+
+function isSubagentRow(row) {
+  return isSubagentThreadSource(row.threadSource) || Boolean(row.parentSessionId);
+}
+
+function isSubagentThreadSource(threadSource) {
+  return typeof threadSource === "string" && threadSource.toLowerCase() === "subagent";
+}
+
+function effectiveThreadSource(threadSource, jsonlThreadSource) {
+  if (isSubagentThreadSource(threadSource) || isSubagentThreadSource(jsonlThreadSource)) {
+    return "subagent";
+  }
+  return firstNonEmpty(threadSource, jsonlThreadSource) || undefined;
 }
 
 function toSessionRow(observation, { liveCliSessions = [], liveCliTtyForWorkspace, nowMs = Date.now() }) {
@@ -691,6 +1020,7 @@ function mergeLiveCliSessions(rows, liveCliSessions, missingRow) {
     if (matched) continue;
 
     const row = missingRow(liveSession);
+    if (!row) continue;
     if (merged.some((existing) => existing.sessionId === row.sessionId)) continue;
     merged.push(markLiveCliSessionRunning(row, liveSession.tty));
   }
@@ -731,30 +1061,6 @@ function liveCliSessionRow(liveSession, options) {
       };
     }
   }
-
-  return fallbackLiveCliSessionRow(liveSession);
-}
-
-function fallbackLiveCliSessionRow(liveSession) {
-  const projectName = path.basename(liveSession.workspacePath);
-  const sessionId = liveSession.sessionId ?? `live-cli:${liveSession.workspacePath}:${liveSession.tty}`;
-  return {
-    sessionId,
-    label: projectName ? `Codex CLI: ${projectName}` : "Codex CLI session",
-    agentName: "cli",
-    projectName,
-    workspacePath: liveSession.workspacePath,
-    lastActivityAt: undefined,
-    evidenceSummary: `Live Codex CLI process observed on ${liveSession.tty}.`,
-    state: "running",
-    confidence: "inferred",
-    statusReason: `Live Codex CLI process observed on ${liveSession.tty}.`,
-    handled: false,
-    dismissed: false,
-    dismissabilityReason: dismissabilityReason("running"),
-    jumpAvailability: "approximate",
-    jumpTarget: "cli",
-  };
 }
 
 function sortAndLimitRows(rows, limit) {
@@ -1111,6 +1417,9 @@ function liveCliSessionIdsFromOpenFiles(pid) {
 }
 
 function sessionIdFromJsonlPath(filePath) {
+  const rolloutSessionId = sessionIdFromRolloutPath(filePath);
+  if (looksLikeCodexSessionId(rolloutSessionId)) return rolloutSessionId;
+
   const fileName = path.basename(filePath);
   const stem = fileName.endsWith(".jsonl") ? fileName.slice(0, -".jsonl".length) : fileName;
   const parts = stem.split("-");
@@ -1118,6 +1427,14 @@ function sessionIdFromJsonlPath(filePath) {
     ? parts.slice(-5).join("-")
     : parts.at(-1);
   return looksLikeCodexSessionId(candidate) ? candidate : undefined;
+}
+
+function sessionIdFromRolloutPath(filePath) {
+  const fileName = path.basename(filePath);
+  const stem = fileName.endsWith(".jsonl") ? fileName.slice(0, -".jsonl".length) : fileName;
+  const parts = stem.split("-");
+  const sessionStart = parts.findIndex((part) => part.startsWith("019"));
+  return sessionStart >= 0 ? parts.slice(sessionStart).join("-") : undefined;
 }
 
 function looksLikeCodexSessionId(value) {

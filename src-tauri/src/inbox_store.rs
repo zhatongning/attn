@@ -13,9 +13,12 @@ use crate::domain::confidence::Confidence;
 use crate::domain::dismissability::evaluate_dismissability;
 use crate::codex_source::{
     discover_codex_observation_by_id_and_follow_up_window,
-    discover_codex_observations_with_state_db_and_follow_up_window, parse_utc_timestamp,
+    discover_codex_observation_snapshot_with_state_db_and_follow_up_window, parse_utc_timestamp,
+    ObservationSnapshotSource,
 };
-use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
+use crate::domain::session::{
+    JumpAvailability, JumpTarget, ObservationKind, SessionRow, SessionState,
+};
 use crate::domain::source_health::{SourceCapability, SourceHealth, SourceStatus};
 
 const SESSION_ROWS_CACHE_TTL: Duration = Duration::from_millis(5500);
@@ -80,6 +83,8 @@ pub struct InboxStore {
     pinned_session_ids: Mutex<HashSet<String>>,
     acknowledged_signals: Mutex<HashSet<AcknowledgedSignal>>,
     session_rows_cache: Mutex<Option<CachedSessionRows>>,
+    desktop_observation_history: Mutex<HashMap<String, DesktopObservationHistory>>,
+    latest_observation_snapshot_source: Mutex<Option<ObservationSnapshotSource>>,
     dismissed_sessions_path: PathBuf,
 }
 
@@ -90,6 +95,8 @@ impl Default for InboxStore {
             pinned_session_ids: Mutex::new(HashSet::new()),
             acknowledged_signals: Mutex::new(HashSet::new()),
             session_rows_cache: Mutex::new(None),
+            desktop_observation_history: Mutex::new(HashMap::new()),
+            latest_observation_snapshot_source: Mutex::new(None),
             dismissed_sessions_path: dismissed_sessions_path(),
         }
     }
@@ -103,6 +110,8 @@ impl InboxStore {
             pinned_session_ids: Mutex::new(HashSet::new()),
             acknowledged_signals: Mutex::new(HashSet::new()),
             session_rows_cache: Mutex::new(None),
+            desktop_observation_history: Mutex::new(HashMap::new()),
+            latest_observation_snapshot_source: Mutex::new(None),
             dismissed_sessions_path,
         }
     }
@@ -152,6 +161,21 @@ struct CachedSessionRows {
     rows: Vec<SessionRow>,
     loaded_at: Instant,
     follow_up_to_idle_minutes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DesktopObservationHistory {
+    latest_running_row: SessionRow,
+    state: DesktopObservationState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopObservationState {
+    Running,
+    AwaitingIdleConfirmation,
+    AwaitingMissingConfirmation,
+    RetainedAfterDegradedSnapshot,
+    SourceUnavailable,
 }
 
 impl InboxStore {
@@ -211,34 +235,41 @@ impl InboxStore {
         let live_cli_sessions = find_live_codex_cli_sessions();
         let follow_up_window = Duration::from_millis(follow_up_window_ms);
 
-        let rows = discover_codex_observations_with_state_db_and_follow_up_window(
-            &codex_state_db_path(),
+        let state_db = codex_state_db_path();
+        let snapshot = discover_codex_observation_snapshot_with_state_db_and_follow_up_window(
+            &state_db,
             &codex_sessions_root(),
             80,
             now,
             follow_up_window,
-        )
+        );
+        self.record_observation_snapshot_source(snapshot.source.clone());
+        let rows = snapshot
+            .observations
             .into_iter()
             .map(|observation| {
+                let kind = observation.kind;
                 let mut row = classify_observation(observation);
                 row = apply_live_cli_activity_signal(
                     row,
                     |row| live_cli_tty_for_row_from_sessions(row, &live_cli_sessions),
                     now,
                 );
-                row
+                (kind, row)
             })
             .collect();
+        let rows = self.stabilize_desktop_running_rows(rows, &snapshot.source);
         let rows = merge_live_cli_sessions_with_codex_rows(
             rows,
             live_cli_sessions,
-            &codex_state_db_path(),
+            &state_db,
             now,
             follow_up_window,
         );
 
         let mut rows = rows
             .into_iter()
+            .filter(|row| !is_subagent_row(row))
             .map(|row| {
                 finalize_session_row(
                     row,
@@ -254,6 +285,182 @@ impl InboxStore {
         rows.sort_by(compare_session_rows_for_store);
         rows.truncate(80);
         rows
+    }
+
+    fn stabilize_desktop_running_rows(
+        &self,
+        observed_rows: Vec<(ObservationKind, SessionRow)>,
+        snapshot_source: &ObservationSnapshotSource,
+    ) -> Vec<SessionRow> {
+        let mut history = self
+            .desktop_observation_history
+            .lock()
+            .expect("desktop observation history lock poisoned");
+        let mut observed_desktop_ids = HashSet::new();
+        let mut stabilized_rows = Vec::with_capacity(observed_rows.len());
+
+        for (kind, row) in observed_rows {
+            if !matches!(row.jump_target, JumpTarget::Desktop) {
+                stabilized_rows.push(row);
+                continue;
+            }
+
+            observed_desktop_ids.insert(row.session_id.clone());
+            let previous = history.get(&row.session_id).cloned();
+
+            if snapshot_source.is_degraded()
+                && matches!(kind, ObservationKind::Idle | ObservationKind::InsufficientEvidence)
+            {
+                if let Some(previous) = previous {
+                    match previous.state {
+                        DesktopObservationState::RetainedAfterDegradedSnapshot
+                        | DesktopObservationState::SourceUnavailable => {
+                            history.insert(
+                                row.session_id.clone(),
+                                DesktopObservationHistory {
+                                    latest_running_row: previous.latest_running_row.clone(),
+                                    state: DesktopObservationState::SourceUnavailable,
+                                },
+                            );
+                            stabilized_rows.push(unavailable_desktop_source_row(
+                                &previous.latest_running_row,
+                                snapshot_source.sqlite_error(),
+                            ));
+                        }
+                        DesktopObservationState::Running
+                        | DesktopObservationState::AwaitingIdleConfirmation
+                        | DesktopObservationState::AwaitingMissingConfirmation => {
+                            history.insert(
+                                row.session_id.clone(),
+                                DesktopObservationHistory {
+                                    latest_running_row: previous.latest_running_row.clone(),
+                                    state: DesktopObservationState::RetainedAfterDegradedSnapshot,
+                                },
+                            );
+                            stabilized_rows.push(retained_desktop_running_row(
+                                &previous.latest_running_row,
+                                snapshot_source.sqlite_error(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if matches!(kind, ObservationKind::Running) {
+                history.insert(
+                    row.session_id.clone(),
+                    DesktopObservationHistory {
+                        latest_running_row: row.clone(),
+                        state: DesktopObservationState::Running,
+                    },
+                );
+                stabilized_rows.push(annotate_degraded_snapshot_row(row, snapshot_source));
+                continue;
+            }
+
+            if !snapshot_source.is_degraded()
+                && matches!(kind, ObservationKind::Idle)
+                && previous
+                    .as_ref()
+                    .is_some_and(|entry| {
+                        matches!(
+                            entry.state,
+                            DesktopObservationState::Running
+                                | DesktopObservationState::RetainedAfterDegradedSnapshot
+                                | DesktopObservationState::SourceUnavailable
+                        )
+                    })
+            {
+                let previous = previous.expect("checked above");
+                history.insert(
+                    row.session_id.clone(),
+                    DesktopObservationHistory {
+                        latest_running_row: previous.latest_running_row.clone(),
+                        state: DesktopObservationState::AwaitingIdleConfirmation,
+                    },
+                );
+                stabilized_rows.push(awaiting_desktop_idle_confirmation_row(
+                    row,
+                    &previous.latest_running_row,
+                ));
+                continue;
+            }
+
+            history.remove(&row.session_id);
+            stabilized_rows.push(annotate_degraded_snapshot_row(row, snapshot_source));
+        }
+
+        if snapshot_source.is_degraded() {
+            let retained_entries = history
+                .iter()
+                .filter(|(session_id, _)| !observed_desktop_ids.contains(*session_id))
+                .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+                .collect::<Vec<_>>();
+            for (session_id, previous) in retained_entries {
+                match previous.state {
+                    DesktopObservationState::RetainedAfterDegradedSnapshot
+                    | DesktopObservationState::SourceUnavailable => {
+                        history.insert(
+                            session_id,
+                            DesktopObservationHistory {
+                                latest_running_row: previous.latest_running_row.clone(),
+                                state: DesktopObservationState::SourceUnavailable,
+                            },
+                        );
+                        stabilized_rows.push(unavailable_desktop_source_row(
+                            &previous.latest_running_row,
+                            snapshot_source.sqlite_error(),
+                        ));
+                    }
+                    DesktopObservationState::Running
+                    | DesktopObservationState::AwaitingIdleConfirmation
+                    | DesktopObservationState::AwaitingMissingConfirmation => {
+                        history.insert(
+                            session_id,
+                            DesktopObservationHistory {
+                                latest_running_row: previous.latest_running_row.clone(),
+                                state: DesktopObservationState::RetainedAfterDegradedSnapshot,
+                            },
+                        );
+                        stabilized_rows.push(retained_desktop_running_row(
+                            &previous.latest_running_row,
+                            snapshot_source.sqlite_error(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            let missing_entries = history
+                .iter()
+                .filter(|(session_id, _)| !observed_desktop_ids.contains(*session_id))
+                .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+                .collect::<Vec<_>>();
+            for (session_id, previous) in missing_entries {
+                match previous.state {
+                    DesktopObservationState::Running
+                    | DesktopObservationState::RetainedAfterDegradedSnapshot => {
+                        history.insert(
+                            session_id,
+                            DesktopObservationHistory {
+                                latest_running_row: previous.latest_running_row.clone(),
+                                state: DesktopObservationState::AwaitingMissingConfirmation,
+                            },
+                        );
+                        stabilized_rows.push(awaiting_desktop_missing_confirmation_row(
+                            &previous.latest_running_row,
+                        ));
+                    }
+                    DesktopObservationState::AwaitingIdleConfirmation
+                    | DesktopObservationState::AwaitingMissingConfirmation
+                    | DesktopObservationState::SourceUnavailable => {
+                        history.remove(&session_id);
+                    }
+                }
+            }
+        }
+
+        stabilized_rows
     }
 
     pub fn dismiss_session(&self, session_id: &str) -> Vec<SessionRow> {
@@ -323,40 +530,25 @@ impl InboxStore {
     }
 
     pub fn source_health(&self) -> SourceHealth {
-        SourceHealth {
-            source_name: "Codex desktop".to_string(),
-            status: if codex_sessions_root().exists() {
-                SourceStatus::Available
-            } else {
-                SourceStatus::Unknown
-            },
-            capabilities: vec![
-                SourceCapability {
-                    name: "Thread discovery".to_string(),
-                    availability: if codex_sessions_root().exists() {
-                        Confidence::Inferred
-                    } else {
-                        Confidence::Unavailable
-                    },
-                    detail: format!(
-                        "Reads local Codex thread state from {}.",
-                        codex_state_db_path().display()
-                    ),
-                },
-                SourceCapability {
-                    name: "Attention/completion status".to_string(),
-                    availability: Confidence::Inferred,
-                    detail: "Uses SQLite threads as primary state and JSONL as event evidence.".to_string(),
-                },
-                SourceCapability {
-                    name: "Window jump-back".to_string(),
-                    availability: Confidence::Inferred,
-                    detail:
-                        "Routes one Jump back action to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for that workspace."
-                            .to_string(),
-                },
-            ],
-        }
+        let sessions_root = codex_sessions_root();
+        let baseline_state_db = codex_state_db_path();
+        let latest_snapshot_source = self
+            .latest_observation_snapshot_source
+            .lock()
+            .expect("latest observation snapshot source lock poisoned")
+            .clone();
+        source_health_for_observation_snapshot(
+            latest_snapshot_source.as_ref(),
+            &sessions_root,
+            &baseline_state_db,
+        )
+    }
+
+    fn record_observation_snapshot_source(&self, snapshot_source: ObservationSnapshotSource) {
+        *self
+            .latest_observation_snapshot_source
+            .lock()
+            .expect("latest observation snapshot source lock poisoned") = Some(snapshot_source);
     }
 
     pub fn jump_to_session(
@@ -587,6 +779,77 @@ impl InboxStore {
     }
 }
 
+fn source_health_for_observation_snapshot(
+    latest_snapshot_source: Option<&ObservationSnapshotSource>,
+    sessions_root: &std::path::Path,
+    baseline_state_db: &std::path::Path,
+) -> SourceHealth {
+    let (status, thread_discovery_availability, thread_discovery_detail) =
+        match latest_snapshot_source {
+            Some(ObservationSnapshotSource::Sqlite { state_db_path }) => (
+                SourceStatus::Available,
+                Confidence::Inferred,
+                format!("Reads local Codex thread state from {}.", state_db_path.display()),
+            ),
+            Some(ObservationSnapshotSource::JsonlFallback {
+                state_db_path,
+                sqlite_error,
+            }) if sessions_root.exists() => (
+                SourceStatus::Degraded,
+                Confidence::Inferred,
+                format!(
+                    "SQLite thread discovery at {} failed; JSONL fallback used. {sqlite_error}",
+                    state_db_path.display()
+                ),
+            ),
+            Some(ObservationSnapshotSource::JsonlFallback {
+                state_db_path,
+                sqlite_error,
+            }) => (
+                SourceStatus::Unknown,
+                Confidence::Unavailable,
+                format!(
+                    "SQLite thread discovery at {} failed, and JSONL sessions are unavailable. {sqlite_error}",
+                    state_db_path.display()
+                ),
+            ),
+            None if sessions_root.exists() => (
+                SourceStatus::Available,
+                Confidence::Inferred,
+                format!("Reads local Codex thread state from {}.", baseline_state_db.display()),
+            ),
+            None => (
+                SourceStatus::Unknown,
+                Confidence::Unavailable,
+                format!("Reads local Codex thread state from {}.", baseline_state_db.display()),
+            ),
+        };
+
+    SourceHealth {
+        source_name: "Codex desktop".to_string(),
+        status,
+        capabilities: vec![
+            SourceCapability {
+                name: "Thread discovery".to_string(),
+                availability: thread_discovery_availability,
+                detail: thread_discovery_detail,
+            },
+            SourceCapability {
+                name: "Attention/completion status".to_string(),
+                availability: Confidence::Inferred,
+                detail: "Uses SQLite threads as primary state and JSONL as event evidence.".to_string(),
+            },
+            SourceCapability {
+                name: "Window jump-back".to_string(),
+                availability: Confidence::Inferred,
+                detail:
+                    "Routes one Jump back action to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for that workspace."
+                        .to_string(),
+            },
+        ],
+    }
+}
+
 fn finalize_session_row(
     row: SessionRow,
     acknowledged_signals: &HashSet<AcknowledgedSignal>,
@@ -628,6 +891,119 @@ fn compare_session_rows_for_store(left: &SessionRow, right: &SessionRow) -> std:
             timestamp_value(right.last_activity_at.as_deref())
                 .cmp(&timestamp_value(left.last_activity_at.as_deref()))
         })
+}
+
+fn is_subagent_row(row: &SessionRow) -> bool {
+    row.thread_source.as_deref() == Some("subagent") || row.parent_session_id.is_some()
+}
+
+fn awaiting_desktop_idle_confirmation_row(
+    idle_row: SessionRow,
+    previous_running_row: &SessionRow,
+) -> SessionRow {
+    SessionRow {
+        state: SessionState::Running,
+        confidence: Confidence::Inferred,
+        status_reason:
+            "Desktop source reported idle once; waiting for the next SQLite snapshot to confirm idle."
+                .to_string(),
+        evidence_summary: idle_row.evidence_summary.or_else(|| {
+            previous_running_row
+                .evidence_summary
+                .clone()
+                .or_else(|| Some("Recent Desktop running state retained until idle is confirmed.".to_string()))
+        }),
+        last_activity_at: previous_running_row
+            .last_activity_at
+            .clone()
+            .or(idle_row.last_activity_at),
+        ..idle_row
+    }
+}
+
+fn awaiting_desktop_missing_confirmation_row(previous_running_row: &SessionRow) -> SessionRow {
+    SessionRow {
+        state: SessionState::Running,
+        confidence: Confidence::Inferred,
+        status_reason:
+            "Desktop session was missing from one SQLite snapshot; waiting for the next snapshot to confirm it stopped."
+                .to_string(),
+        evidence_summary: previous_running_row.evidence_summary.clone().or_else(|| {
+            Some("Recent Desktop running state retained until the missing row is confirmed.".to_string())
+        }),
+        handled: false,
+        dismissed: false,
+        ..previous_running_row.clone()
+    }
+}
+
+fn retained_desktop_running_row(
+    previous_running_row: &SessionRow,
+    sqlite_error: Option<&str>,
+) -> SessionRow {
+    let fallback_detail = sqlite_error
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" SQLite fallback: {value}"))
+        .unwrap_or_default();
+    SessionRow {
+        state: SessionState::Running,
+        confidence: Confidence::Inferred,
+        status_reason: format!(
+            "Recent Desktop running state retained while the SQLite source is degraded.{fallback_detail}"
+        ),
+        evidence_summary: Some(match previous_running_row.evidence_summary.as_deref() {
+            Some(evidence) => format!("{evidence}{fallback_detail}"),
+            None => format!(
+                "Recent Desktop running state retained until SQLite discovery recovers.{fallback_detail}"
+            ),
+        }),
+        handled: false,
+        dismissed: false,
+        ..previous_running_row.clone()
+    }
+}
+
+fn unavailable_desktop_source_row(
+    previous_running_row: &SessionRow,
+    sqlite_error: Option<&str>,
+) -> SessionRow {
+    let fallback_detail = sqlite_error
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" SQLite fallback: {value}"))
+        .unwrap_or_default();
+    SessionRow {
+        state: SessionState::Unknown,
+        confidence: Confidence::Unknown,
+        status_reason: format!(
+            "Desktop SQLite source unavailable after consecutive degraded snapshots.{fallback_detail}"
+        ),
+        evidence_summary: Some(match previous_running_row.evidence_summary.as_deref() {
+            Some(evidence) => format!("{evidence}{fallback_detail}"),
+            None => format!(
+                "Recent Desktop running state can no longer be verified.{fallback_detail}"
+            ),
+        }),
+        handled: false,
+        dismissed: false,
+        ..previous_running_row.clone()
+    }
+}
+
+fn annotate_degraded_snapshot_row(
+    row: SessionRow,
+    snapshot_source: &ObservationSnapshotSource,
+) -> SessionRow {
+    let Some(sqlite_error) = snapshot_source.sqlite_error() else {
+        return row;
+    };
+
+    SessionRow {
+        evidence_summary: Some(match row.evidence_summary {
+            Some(evidence) => format!("{evidence} SQLite fallback: {sqlite_error}"),
+            None => format!("SQLite fallback: {sqlite_error}"),
+        }),
+        ..row
+    }
 }
 
 fn session_state_priority(state: SessionState) -> u8 {
@@ -871,13 +1247,15 @@ struct LiveCliSession {
 
 #[cfg(test)]
 fn merge_live_cli_sessions(rows: Vec<SessionRow>, live_sessions: Vec<LiveCliSession>) -> Vec<SessionRow> {
-    merge_live_cli_sessions_with_row_builder(rows, live_sessions, fallback_live_cli_session_row)
+    merge_live_cli_sessions_with_row_builder(rows, live_sessions, |session| {
+        Some(fallback_live_cli_session_row(session))
+    })
 }
 
 fn merge_live_cli_sessions_with_row_builder(
     mut rows: Vec<SessionRow>,
     live_sessions: Vec<LiveCliSession>,
-    missing_row: impl Fn(&LiveCliSession) -> SessionRow,
+    missing_row: impl Fn(&LiveCliSession) -> Option<SessionRow>,
 ) -> Vec<SessionRow> {
     for live_session in live_sessions {
         if let Some(session_id) = live_session.session_id.as_deref() {
@@ -891,7 +1269,9 @@ fn merge_live_cli_sessions_with_row_builder(
             }
         }
 
-        let row = missing_row(&live_session);
+        let Some(row) = missing_row(&live_session) else {
+            continue;
+        };
         if rows.iter().any(|existing| existing.session_id == row.session_id) {
             continue;
         }
@@ -946,7 +1326,7 @@ fn live_cli_session_row_with_state_db_and_follow_up_window(
     state_db: &std::path::Path,
     now: SystemTime,
     follow_up_window: Duration,
-) -> SessionRow {
+) -> Option<SessionRow> {
     let row = live_session
         .session_id
         .as_deref()
@@ -958,8 +1338,7 @@ fn live_cli_session_row_with_state_db_and_follow_up_window(
                 follow_up_window,
             )
         })
-        .map(classify_observation)
-        .unwrap_or_else(|| fallback_live_cli_session_row(live_session));
+        .map(classify_observation)?;
 
     let project_name = live_session
         .workspace_path
@@ -974,11 +1353,12 @@ fn live_cli_session_row_with_state_db_and_follow_up_window(
         .or_else(|| Some(live_session.workspace_path.clone()));
     let project_name = row.project_name.clone().or(project_name);
 
-    row.with_workspace(workspace_path)
+    Some(row.with_workspace(workspace_path)
         .with_project_name(project_name)
-        .with_jump_target(JumpTarget::Cli)
+        .with_jump_target(JumpTarget::Cli))
 }
 
+#[cfg(test)]
 fn fallback_live_cli_session_row(live_session: &LiveCliSession) -> SessionRow {
     let session_id = live_session
         .session_id
@@ -1008,6 +1388,7 @@ fn fallback_live_cli_session_row(live_session: &LiveCliSession) -> SessionRow {
         .with_jump_target(JumpTarget::Cli)
 }
 
+#[cfg(test)]
 fn live_cli_synthetic_session_id(live_session: &LiveCliSession) -> String {
     format!(
         "live-cli:{}:{}",
@@ -1780,7 +2161,10 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use crate::domain::confidence::Confidence;
-    use crate::domain::session::{JumpAvailability, JumpTarget, SessionRow, SessionState};
+    use crate::domain::session::{
+        JumpAvailability, JumpTarget, ObservationKind, SessionRow, SessionState,
+    };
+    use crate::domain::source_health::SourceStatus;
     use crate::inbox_store::InboxStore;
 
     #[test]
@@ -2370,6 +2754,34 @@ mod tests {
     }
 
     #[test]
+    fn unverified_live_cli_sessions_are_not_added_as_panel_rows() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing_state_db = temp.path().join("missing-state.sqlite");
+        let rows = super::merge_live_cli_sessions_with_codex_rows(
+            Vec::new(),
+            vec![super::LiveCliSession {
+                session_id: Some("019unverified-live-cli".to_string()),
+                session_ids: vec!["019unverified-live-cli".to_string()],
+                workspace_path: "/repo".to_string(),
+                tty: "ttys008".to_string(),
+            }, super::LiveCliSession {
+                session_id: None,
+                session_ids: vec![
+                    "019unverified-child-a".to_string(),
+                    "019unverified-child-b".to_string(),
+                ],
+                workspace_path: "/repo".to_string(),
+                tty: "ttys009".to_string(),
+            }],
+            &missing_state_db,
+            UNIX_EPOCH + Duration::from_secs(1_786_052_000),
+            Duration::from_secs(30 * 60),
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn live_cli_sessions_promote_matching_rows_without_adding_duplicates() {
         let rows = vec![SessionRow::new(
             "live-session",
@@ -2669,6 +3081,8 @@ mod tests {
                 loaded_at: std::time::Instant::now(),
                 follow_up_to_idle_minutes: super::DEFAULT_FOLLOW_UP_TO_IDLE_MINUTES,
             })),
+            desktop_observation_history: std::sync::Mutex::new(std::collections::HashMap::new()),
+            latest_observation_snapshot_source: std::sync::Mutex::new(None),
             dismissed_sessions_path: temp.path().join("dismissed-sessions.json"),
         };
 
@@ -2677,6 +3091,209 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, cached_row.session_id);
         assert_eq!(rows[0].label, cached_row.label);
+    }
+
+    #[test]
+    fn source_health_reports_the_latest_jsonl_fallback_as_degraded() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_root = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_root).expect("sessions root");
+        let snapshot_source = super::ObservationSnapshotSource::JsonlFallback {
+            state_db_path: "/tmp/state.sqlite".into(),
+            sqlite_error: "database is locked".to_string(),
+        };
+
+        let health = super::source_health_for_observation_snapshot(
+            Some(&snapshot_source),
+            &sessions_root,
+            &temp.path().join("state.sqlite"),
+        );
+
+        assert!(matches!(health.status, SourceStatus::Degraded));
+        let thread_discovery = health
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "Thread discovery")
+            .expect("thread discovery capability");
+        assert_eq!(thread_discovery.availability, Confidence::Inferred);
+        assert!(thread_discovery.detail.contains("database is locked"));
+    }
+
+    #[test]
+    fn waits_for_a_second_sqlite_idle_snapshot_before_hiding_a_desktop_running_row() {
+        let store = InboxStore::default();
+        let running = SessionRow::new(
+            "desktop-running",
+            "Desktop running",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_jump_target(JumpTarget::Desktop)
+        .with_last_activity("2026-06-03T02:10:00.000Z");
+        let idle = SessionRow::new(
+            "desktop-running",
+            "Desktop idle",
+            SessionState::Idle,
+            Confidence::Inferred,
+        )
+        .with_jump_target(JumpTarget::Desktop)
+        .with_last_activity("2026-06-03T00:00:00.000Z");
+        let initial = store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Running, running)],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+        let first_idle = store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Idle, idle.clone())],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+        let degraded = store.stabilize_desktop_running_rows(
+            Vec::new(),
+            &super::ObservationSnapshotSource::JsonlFallback {
+                state_db_path: "/tmp/state.sqlite".into(),
+                sqlite_error: "database is locked".to_string(),
+            },
+        );
+        let source_unavailable = store.stabilize_desktop_running_rows(
+            Vec::new(),
+            &super::ObservationSnapshotSource::JsonlFallback {
+                state_db_path: "/tmp/state.sqlite".into(),
+                sqlite_error: "database is locked".to_string(),
+            },
+        );
+        let recovered_first_idle = store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Idle, idle.clone())],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+        let confirmed_idle = store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Idle, idle)],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+
+        assert_eq!(initial[0].state, SessionState::Running);
+        assert_eq!(first_idle[0].state, SessionState::Running);
+        assert!(first_idle[0].status_reason.contains("confirm idle"));
+        assert_eq!(degraded[0].state, SessionState::Running);
+        assert_eq!(source_unavailable[0].state, SessionState::Unknown);
+        assert!(source_unavailable[0].status_reason.contains("source unavailable"));
+        assert_eq!(recovered_first_idle[0].state, SessionState::Running);
+        assert_eq!(confirmed_idle[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn keeps_a_recent_desktop_running_row_through_a_degraded_missing_snapshot() {
+        let store = InboxStore::default();
+        let running = SessionRow::new(
+            "desktop-fallback",
+            "Desktop running",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_jump_target(JumpTarget::Desktop)
+        .with_last_activity("2026-06-03T02:10:00.000Z");
+        let idle = SessionRow::new(
+            "desktop-fallback",
+            "Desktop idle",
+            SessionState::Idle,
+            Confidence::Inferred,
+        )
+        .with_jump_target(JumpTarget::Desktop);
+        store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Running, running)],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+        let fallback = store.stabilize_desktop_running_rows(
+            Vec::new(),
+            &super::ObservationSnapshotSource::JsonlFallback {
+                state_db_path: "/tmp/state.sqlite".into(),
+                sqlite_error: "database is locked".to_string(),
+            },
+        );
+        let first_sqlite_idle = store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Idle, idle.clone())],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+        let second_sqlite_idle = store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Idle, idle)],
+            &super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() },
+        );
+
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].state, SessionState::Running);
+        assert!(fallback[0].evidence_summary.as_deref().is_some_and(|value| value.contains("database is locked")));
+        assert_eq!(first_sqlite_idle[0].state, SessionState::Running);
+        assert_eq!(second_sqlite_idle[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn waits_for_a_second_healthy_missing_snapshot_before_hiding_a_desktop_running_row() {
+        let store = InboxStore::default();
+        let running = SessionRow::new(
+            "desktop-missing",
+            "Desktop running",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_jump_target(JumpTarget::Desktop)
+        .with_last_activity("2026-06-03T02:10:00.000Z");
+        let source = super::ObservationSnapshotSource::Sqlite {
+            state_db_path: "/tmp/state.sqlite".into(),
+        };
+
+        store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Running, running)],
+            &source,
+        );
+        let first_missing = store.stabilize_desktop_running_rows(Vec::new(), &source);
+        let confirmed_missing = store.stabilize_desktop_running_rows(Vec::new(), &source);
+
+        assert_eq!(first_missing.len(), 1);
+        assert_eq!(first_missing[0].state, SessionState::Running);
+        assert!(first_missing[0]
+            .status_reason
+            .contains("missing from one SQLite snapshot"));
+        assert!(confirmed_missing.is_empty());
+    }
+
+    #[test]
+    fn does_not_delay_explicit_terminal_or_cli_idle_states() {
+        let store = InboxStore::default();
+        let desktop_running = SessionRow::new(
+            "desktop-terminal",
+            "Desktop running",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_jump_target(JumpTarget::Desktop);
+        let completed_stale = SessionRow::new(
+            "desktop-terminal",
+            "Desktop completed",
+            SessionState::Idle,
+            Confidence::Inferred,
+        )
+        .with_jump_target(JumpTarget::Desktop);
+        let cli_idle = SessionRow::new(
+            "cli-idle",
+            "CLI idle",
+            SessionState::Idle,
+            Confidence::Inferred,
+        )
+        .with_jump_target(JumpTarget::Cli);
+        let source = super::ObservationSnapshotSource::Sqlite { state_db_path: "/tmp/state.sqlite".into() };
+
+        store.stabilize_desktop_running_rows(
+            vec![(ObservationKind::Running, desktop_running)],
+            &source,
+        );
+        let rows = store.stabilize_desktop_running_rows(
+            vec![
+                (ObservationKind::CompletedStale, completed_stale),
+                (ObservationKind::Idle, cli_idle),
+            ],
+            &source,
+        );
+
+        assert_eq!(rows[0].state, SessionState::Idle);
+        assert_eq!(rows[1].state, SessionState::Idle);
     }
 
     #[test]

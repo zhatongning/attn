@@ -39,6 +39,30 @@ describe("preview server", () => {
       Number.NaN,
     ]);
   });
+
+  it("uses the session source's latest snapshot health", async () => {
+    const health = {
+      sourceName: "Codex sessions",
+      status: "degraded",
+      capabilities: [{
+        name: "Thread discovery",
+        availability: "unavailable",
+        detail: "SQLite thread discovery failed; JSONL fallback used.",
+      }],
+    };
+    const source = {
+      discoverCodexSessions() {
+        return [];
+      },
+      sourceHealth() {
+        return health;
+      },
+    };
+    const server = await listen(createPreviewServer({ source }));
+
+    expect(await fetchJson(server, "/api/sessions")).toEqual([]);
+    expect(await fetchJson(server, "/api/source-health")).toEqual(health);
+  });
 });
 
 function listen(server) {

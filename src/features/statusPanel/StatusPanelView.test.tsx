@@ -98,6 +98,20 @@ describe("StatusPanelView", () => {
     expect(screen.queryByRole("article")).toBeNull();
     expect(screen.getByText("Attn")).toBeTruthy();
     expect(screen.getByText("1 alerts")).toBeTruthy();
+    expect(document.querySelector(".panel-header .panel-counters")).toBeTruthy();
+    expect(document.querySelector(".panel-footer")).toBeNull();
+  });
+
+  it("places session counters at the bottom right when expanded", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(document.querySelector(".panel-header .panel-counters")).toBeNull();
+    const footerCounters = document.querySelector(".panel-footer .panel-counters");
+    expect(footerCounters).toBeTruthy();
+    expect(within(footerCounters as HTMLElement).getByText("1 alerts")).toBeTruthy();
+    expect(within(footerCounters as HTMLElement).getByText("1 running")).toBeTruthy();
   });
 
   it("expands the compact strip when clicked", () => {
@@ -139,6 +153,94 @@ describe("StatusPanelView", () => {
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
   });
 
+  it("keeps the rendered session when the packaged refresh fails", async () => {
+    const retainedRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "retain-on-refresh-failure",
+      label: "Retained refresh task",
+      state: "needsAttention",
+      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+    };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") throw new Error("list_sessions unavailable");
+      if (command === "source_health") return fakeSourceHealth;
+      return null;
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("preview API is unavailable in the packaged app");
+    }));
+
+    render(<StatusPanelView initialRows={[retainedRow]} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.getByText("Retained refresh task")).toBeTruthy();
+    expect(await screen.findByText("list_sessions unavailable")).toBeTruthy();
+    expect(screen.getByText("Retained refresh task")).toBeTruthy();
+  });
+
+  it("keeps the newer running snapshot when an older refresh completes later", async () => {
+    const followUpRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "refresh-ordering-session",
+      label: "Refresh ordering task",
+      state: "needsAttention",
+      statusReason: "Read recently; keep it quiet during the 30-minute follow-up window.",
+    };
+    const runningRow: SessionRow = {
+      ...followUpRow,
+      state: "running",
+      statusReason: "running signal observed",
+    };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+
+    let resolveOlderRefresh: ((rows: SessionRow[]) => void) | undefined;
+    const olderRefresh = new Promise<SessionRow[]>((resolve) => {
+      resolveOlderRefresh = resolve;
+    });
+    let listRequestCount = 0;
+    tauriCoreMock.invoke.mockImplementation((command: string) => {
+      if (command === "list_sessions") {
+        listRequestCount += 1;
+        return listRequestCount === 1 ? olderRefresh : Promise.resolve([runningRow]);
+      }
+      if (command === "source_health") return Promise.resolve(fakeSourceHealth);
+      return Promise.resolve(null);
+    });
+
+    const originalSetInterval = window.setInterval.bind(window);
+    let refreshTimer: (() => void) | undefined;
+    vi.spyOn(window, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number) => {
+      if (timeout === 5000 && typeof handler === "function") {
+        refreshTimer = () => handler();
+        return 1;
+      }
+
+      return originalSetInterval(handler, timeout);
+    }) as typeof window.setInterval);
+
+    render(<StatusPanelView initialRows={[followUpRow]} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(listRequestCount).toBe(1);
+    });
+    await act(async () => {
+      refreshTimer?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("status-row-refresh-ordering-session").className).toContain("status-row--working");
+    });
+
+    await act(async () => {
+      resolveOlderRefresh?.([followUpRow]);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("status-row-refresh-ordering-session").className).toContain("status-row--working");
+  });
+
   it("shows a newly refreshed follow-up in an unused slot without treating it as an alert", async () => {
     const firstRows = initialSessions.filter((row) => row.state !== "waitingForInput");
     const nextRows = [
@@ -169,7 +271,7 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("follow-up")).toBeTruthy();
   });
 
-  it("auto-collapses inspect rows by default instead of staying open", async () => {
+  it("auto-collapses inspect rows after the 30-second default", async () => {
     const firstRows = initialSessions.filter((row) => row.state !== "waitingForInput");
     const nextRows = [
       ...firstRows,
@@ -193,9 +295,9 @@ describe("StatusPanelView", () => {
       handler: TimerHandler,
       timeout?: number,
     ) => {
-      if (timeout === 8000 && typeof handler === "function") {
+      if (timeout === 30000 && typeof handler === "function") {
         autoCollapseCallback = () => handler();
-        return 8000;
+        return 30000;
       }
 
       return originalSetTimeout(handler, timeout);
@@ -207,7 +309,7 @@ describe("StatusPanelView", () => {
       expect(screen.getByText("Sticky inspect row")).toBeTruthy();
     });
     expect(screen.getByRole("main").className).not.toContain("panel-shell--collapsed");
-    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 8000);
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 30000);
 
     await act(async () => {
       autoCollapseCallback?.();
@@ -1247,9 +1349,69 @@ describe("StatusPanelView", () => {
     }));
 
     expect(await screen.findByText("Opened Codex Desktop session.")).toBeTruthy();
-    expect(Array.from(footer.children)).toHaveLength(1);
+    expect(Array.from(footer.children)).toHaveLength(2);
     expect(footer.firstElementChild?.textContent).toBe("Opened Codex Desktop session.");
+    expect(footer.lastElementChild?.className).toContain("panel-counters");
+    expect(within(footer).queryByRole("button")).toBeNull();
     expect(document.querySelector(".panel-message")).toBeNull();
+    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+  });
+
+  it("keeps jump feedback, hidden alerts, and counters in one footer row", async () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      panelMode: "persistent",
+      visibleItemCount: 1,
+    }));
+    const visibleRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "footer-visible-alert",
+      label: "Footer visible alert",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const hiddenRow: SessionRow = {
+      ...visibleRow,
+      sessionId: "footer-hidden-alert",
+      label: "Footer hidden alert",
+      lastActivityAt: "2026-06-15T03:20:00.000Z",
+    };
+    let resolveJump: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/jump" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          resolveJump = resolve;
+        });
+      }
+      if (pathname === "/api/sessions") return Promise.resolve(jsonResponse([visibleRow, hiddenRow]));
+      if (pathname === "/api/source-health") return Promise.resolve(jsonResponse(fakeSourceHealth));
+      return Promise.resolve(jsonResponse({}, 404));
+    }));
+
+    render(<StatusPanelView initialRows={[visibleRow, hiddenRow]} sourceHealth={fakeSourceHealth} />);
+    const footer = document.querySelector(".panel-footer") as HTMLElement;
+    expect(within(footer).getByRole("button", { name: "+1 alerts" })).toBeTruthy();
+    tauriWindowMock.setSize.mockClear();
+
+    fireEvent.click(screen.getByTitle("Jump back"));
+    expect(within(footer).queryByRole("button", { name: "+1 alerts" })).toBeNull();
+
+    resolveJump?.(jsonResponse({
+      sessionId: visibleRow.sessionId,
+      availability: "exact",
+      target: "desktop",
+      succeeded: true,
+      message: "Opened Codex Desktop session.",
+    }));
+
+    expect(await within(footer).findByText("Opened Codex Desktop session.")).toBeTruthy();
+    expect(Array.from(footer.children).map((element) => element.className)).toEqual([
+      "jump-notice",
+      "hidden-toggle",
+      "panel-counters",
+    ]);
+    expect(within(footer).getByRole("button", { name: "+1 alerts" })).toBeTruthy();
+    expect(footer.lastElementChild?.getAttribute("aria-label")).toBe("Session counters");
     expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
   });
 
@@ -1565,7 +1727,7 @@ describe("StatusPanelView", () => {
     expect(statusTexts).toEqual(["● blocked", "● attention", "● inspect"]);
   });
 
-  it("shows a parent subtask summary while only promoting intervention subagents", () => {
+  it("does not render subagent rows or a parent subtask summary", () => {
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 2 }));
     const rows: SessionRow[] = [
       {
@@ -1584,6 +1746,7 @@ describe("StatusPanelView", () => {
         state: "running",
         workspacePath: "/Users/edy/project",
         threadSource: "subagent",
+        parentSessionId: "parent",
         statusReason: "running signal observed",
       },
       {
@@ -1593,6 +1756,7 @@ describe("StatusPanelView", () => {
         state: "inspect",
         workspacePath: "/Users/edy/project",
         threadSource: "subagent",
+        parentSessionId: "parent",
         statusReason: "completed task ready to inspect; open it to mark read",
       },
       {
@@ -1601,8 +1765,18 @@ describe("StatusPanelView", () => {
         label: "Input child task",
         state: "waitingForInput",
         workspacePath: "/Users/edy/project",
-        threadSource: "subagent",
+        parentSessionId: "parent",
         statusReason: "waiting for user input",
+      },
+      {
+        ...initialSessions[0],
+        sessionId: "child-stopped",
+        label: "Stopped child task",
+        state: "stopped",
+        workspacePath: "/Users/edy/project",
+        threadSource: "subagent",
+        parentSessionId: "parent",
+        statusReason: "stopped before completion",
       },
     ];
 
@@ -1610,190 +1784,14 @@ describe("StatusPanelView", () => {
     expandPanel();
 
     expect(screen.getByText("Parent task")).toBeTruthy();
-    expect(screen.getByText("2 subtasks: 1 inspect, 1 running")).toBeTruthy();
-    expect(screen.getByText("Input child task")).toBeTruthy();
-    expect(screen.getByText("subagent anomaly")).toBeTruthy();
+    expect(screen.getByText("0 alerts")).toBeTruthy();
     expect(screen.queryByText("Quiet child task")).toBeNull();
     expect(screen.queryByText("Inspect child task")).toBeNull();
-    expect(screen.getAllByRole("article")).toHaveLength(2);
-  });
-
-  it("acknowledges rolled-up inspect subagents when the parent inspect row is opened", async () => {
-    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 2 }));
-    const rows: SessionRow[] = [
-      {
-        ...initialSessions[0],
-        sessionId: "parent",
-        label: "Parent task",
-        state: "inspect",
-        workspacePath: "/Users/edy/project",
-        threadSource: "user",
-        statusReason: "completed task ready to inspect; open it to mark read",
-      },
-      {
-        ...initialSessions[0],
-        sessionId: "child-inspect",
-        label: "Inspect child task",
-        state: "inspect",
-        workspacePath: "/Users/edy/project",
-        threadSource: "subagent",
-        parentSessionId: "parent",
-        statusReason: "completed task ready to inspect; open it to mark read",
-      },
-      {
-        ...initialSessions[0],
-        sessionId: "child-input",
-        label: "Input child task",
-        state: "waitingForInput",
-        workspacePath: "/Users/edy/project",
-        threadSource: "subagent",
-        parentSessionId: "parent",
-        statusReason: "waiting for user input",
-      },
-    ];
-    Object.defineProperty(window, "__TAURI_INTERNALS__", {
-      configurable: true,
-      value: {},
-    });
-    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
-      if (command === "list_sessions") return rows;
-      if (command === "source_health") return fakeSourceHealth;
-      if (command === "jump_to_session") {
-        return {
-          sessionId: args?.sessionId,
-          availability: "exact",
-          target: "desktop",
-          succeeded: true,
-          message: "Opened parent session.",
-        };
-      }
-      return null;
-    });
-
-    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
-    expandPanel();
-
-    const parentRow = screen.getByTestId("status-row-parent");
-    fireEvent.click(within(parentRow).getByTitle("Jump back"));
-
-    await waitFor(() => {
-      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("jump_to_session", {
-        sessionId: "parent",
-        acknowledgedSessionIds: ["parent", "child-inspect"],
-        followUpToIdleMinutes: 30,
-      });
-    });
-  });
-
-  it("expands rolled-up subagents and jumps to the selected child session", async () => {
-    const rows: SessionRow[] = [
-      {
-        ...initialSessions[0],
-        sessionId: "parent",
-        label: "Parent task",
-        state: "running",
-        workspacePath: "/Users/edy/project",
-        threadSource: "user",
-        statusReason: "running signal observed",
-      },
-      {
-        ...initialSessions[0],
-        sessionId: "child-inspect",
-        label: "Inspect child task",
-        state: "inspect",
-        workspacePath: "/Users/edy/project",
-        threadSource: "subagent",
-        parentSessionId: "parent",
-        statusReason: "completed task ready to inspect; open it to mark read",
-      },
-    ];
-    Object.defineProperty(window, "__TAURI_INTERNALS__", {
-      configurable: true,
-      value: {},
-    });
-    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
-      if (command === "list_sessions") return rows;
-      if (command === "source_health") return fakeSourceHealth;
-      if (command === "jump_to_session") {
-        return {
-          sessionId: args?.sessionId,
-          availability: "exact",
-          target: "desktop",
-          succeeded: true,
-          message: "Opened child session.",
-        };
-      }
-      return null;
-    });
-
-    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
-    expandPanel();
-
-    fireEvent.click(screen.getByRole("button", { name: "1 subtask: 1 inspect" }));
-    const subtaskRow = await screen.findByTestId("subtask-row-child-inspect");
-
-    expect(within(subtaskRow).getByText("Inspect child task")).toBeTruthy();
-    fireEvent.click(within(subtaskRow).getByTitle("Jump back"));
-
-    await waitFor(() => {
-      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("jump_to_session", {
-        sessionId: "child-inspect",
-        acknowledgedSessionIds: ["child-inspect"],
-        followUpToIdleMinutes: 30,
-      });
-    });
-  });
-
-  it("dismisses a parent and its rolled-up subagent sessions as one group", async () => {
-    const rows: SessionRow[] = [
-      {
-        ...initialSessions[0],
-        sessionId: "parent",
-        label: "Parent task",
-        state: "running",
-        workspacePath: "/Users/edy/project",
-        threadSource: "user",
-        statusReason: "running signal observed",
-      },
-      {
-        ...initialSessions[0],
-        sessionId: "child-inspect",
-        label: "Inspect child task",
-        state: "inspect",
-        workspacePath: "/Users/edy/project",
-        threadSource: "subagent",
-        parentSessionId: "parent",
-        statusReason: "completed task ready to inspect; open it to mark read",
-      },
-    ];
-    Object.defineProperty(window, "__TAURI_INTERNALS__", {
-      configurable: true,
-      value: {},
-    });
-    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
-      if (command === "list_sessions") return rows;
-      if (command === "source_health") return fakeSourceHealth;
-      if (command === "dismiss_sessions") {
-        const ids = new Set(args?.sessionIds as string[]);
-        return rows.map((row) => (
-          ids.has(row.sessionId) ? { ...row, dismissed: true, handled: true } : row
-        ));
-      }
-      return null;
-    });
-
-    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
-    expandPanel();
-
-    fireEvent.click(screen.getByTitle("Dismiss"));
-
-    expect(screen.queryByText("Parent task")).toBeNull();
-    expect(screen.queryByText("Inspect child task")).toBeNull();
-    await waitFor(() => {
-      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("dismiss_sessions", {
-        sessionIds: ["parent", "child-inspect"],
-      });
-    });
+    expect(screen.queryByText("Input child task")).toBeNull();
+    expect(screen.queryByText("Stopped child task")).toBeNull();
+    expect(screen.queryByText(/subtasks?/)).toBeNull();
+    expect(screen.queryByText("subagent anomaly")).toBeNull();
+    expect(screen.getAllByRole("article")).toHaveLength(1);
   });
 
   it("keeps an opened intervention row quiet but visible during the follow-up read window", async () => {
@@ -2334,7 +2332,7 @@ function defaultZhConfig() {
     language: "zh",
     visibleItemCount: 1,
     panelMode: "auto",
-    autoCollapseDelayMs: 8000,
+    autoCollapseDelayMs: 30000,
     statusColors: {
       blocked: "#e06c75",
       input: "#c678dd",

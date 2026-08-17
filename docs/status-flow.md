@@ -11,7 +11,7 @@ The status model should answer one question:
 
 > Do I need to do anything with this agent session right now?
 
-Subagent sessions follow the same rule. They should be discovered and preserved, but the panel should not become a flat list of every internal worker session. When JSONL `session_meta.payload.parent_thread_id` links a subagent to a parent thread, normal subagent rows are summarized on that parent row. If the parent id is missing or the parent row is not currently visible, the panel may fall back to the same-workspace parent heuristic. Subagent rows are promoted back into the top-level list only when they need direct intervention, currently `attention`, `stopped`, or `blocked`.
+Subagent sessions remain available to the source layer for parent-link and process discovery, but they do not appear in the panel. Rows marked `thread_source = subagent` or linked with `parent_session_id` are excluded before panel cards, counters, and actions are derived. The panel reports parent sessions only.
 
 ## State Layers
 
@@ -115,6 +115,12 @@ Generic non-terminal activity is still considered recent for 2 hours.
 | Desktop thread has recent activity | `Running` |
 | Desktop thread is old and unarchived | `Idle` |
 | CLI thread has no recent JSONL signal | `InsufficientEvidence`, unless a live CLI process is found. |
+
+### Desktop Snapshot Stability
+
+SQLite remains the primary Desktop discovery source. If one discovery pass must fall back to JSONL, a recently observed Desktop `Running` row stays visible while the source is degraded, even when that fallback omits the row or reports weak idle evidence. A second consecutive degraded snapshot becomes actionable `blocked` source-unavailable evidence instead of continuing to report unverified work as `running`.
+
+For a healthy SQLite source, one `Running` to `Idle` observation is treated as provisional: the panel keeps the row as inferred `running` until the next healthy SQLite observation confirms `Idle`. Explicit terminal observations such as `CompletedStale`, `Stopped`, and `WaitingForInput`, plus CLI rows, are not delayed by this guard.
 
 ### Live CLI Process Rule
 

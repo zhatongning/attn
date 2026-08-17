@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createCodexSessionsDevSource,
-  sourceHealth,
+  sourceHealth as defaultSourceHealth,
 } from "./scripts/codexSessionsDevSource.mjs";
 
 const port = 1420;
@@ -24,7 +24,9 @@ export function createPreviewServer({ source = previewSource } = {}) {
     }
 
     if (url.pathname === "/api/source-health") {
-      return sendJson(res, sourceHealth());
+      return sendJson(res, typeof source.sourceHealth === "function"
+        ? source.sourceHealth()
+        : defaultSourceHealth());
     }
 
     if (url.pathname === "/api/jump" && req.method === "POST") {

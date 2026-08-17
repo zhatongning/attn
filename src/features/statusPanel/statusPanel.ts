@@ -34,12 +34,6 @@ export interface StatusPanelRow extends SessionRow {
   statusTone: "alert" | "quiet";
   interventionReason: string;
   evidenceTooltip: string;
-  subtaskSummary?: string;
-  subtaskRows?: StatusPanelRow[];
-  dismissSessionIds?: string[];
-  acknowledgeSessionIds?: string[];
-  subagentMarker?: string;
-  jumpSessionId?: string;
 }
 
 export interface StatusPanelModel {
@@ -112,9 +106,7 @@ export interface StatusPanelCopy {
   loadSourceFailedLabel: string;
   loadHookStatusFailedLabel: string;
   installHooksFailedLabel: string;
-  subagentAnomalyLabel: string;
   showEvidenceLabel: (label: string) => string;
-  subtaskSummaryLabel: (summary: SubtaskSummary) => string;
   statusPrefix: string;
   evidencePrefix: string;
   lastActivityPrefix: string;
@@ -127,20 +119,13 @@ export interface StatusPanelCopy {
   sourceNameLabels: Record<string, string>;
 }
 
-interface SubtaskSummary {
-  total: number;
-  counts: Partial<Record<InterventionStatus, number>>;
-  rows: StatusPanelRow[];
-  jumpRow?: StatusPanelRow;
-}
-
 export const defaultStatusPanelConfig: StatusPanelConfig = {
   styleFamily: "atom",
   palette: "oneDark",
   language: "en",
   visibleItemCount: 1,
   panelMode: "auto",
-  autoCollapseDelayMs: 8000,
+  autoCollapseDelayMs: 30000,
   followUpToIdleMinutes: 30,
   preventAutoCollapseStatuses: [],
   statusColors: {
@@ -285,20 +270,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     loadSourceFailedLabel: "Unable to load Codex source.",
     loadHookStatusFailedLabel: "Unable to load Codex hook status.",
     installHooksFailedLabel: "Codex hook installation failed.",
-    subagentAnomalyLabel: "subagent anomaly",
     showEvidenceLabel: (label) => `Show status evidence for ${label}`,
-    subtaskSummaryLabel: (summary) => {
-      const parts = subtaskSummaryParts(summary, {
-        blocked: "blocked",
-        input: "attention",
-        inspect: "inspect",
-        stopped: "stopped",
-        needed: "follow-up",
-        working: "running",
-        idle: "idle",
-      });
-      return `${summary.total} ${summary.total === 1 ? "subtask" : "subtasks"}${parts.length > 0 ? `: ${parts.join(", ")}` : ""}`;
-    },
     statusPrefix: "Status",
     evidencePrefix: "Evidence",
     lastActivityPrefix: "Last activity",
@@ -382,12 +354,7 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     loadSourceFailedLabel: "无法加载 Codex 数据。",
     loadHookStatusFailedLabel: "无法加载 Codex 钩子状态。",
     installHooksFailedLabel: "安装 Codex 钩子失败。",
-    subagentAnomalyLabel: "子任务异常",
     showEvidenceLabel: (label) => `查看 ${label} 的状态依据`,
-    subtaskSummaryLabel: (summary) => {
-      const parts = subtaskSummaryParts(summary, statusLabels.zh);
-      return `${summary.total} 个子任务${parts.length > 0 ? `：${parts.join("，")}` : ""}`;
-    },
     statusPrefix: "状态",
     evidencePrefix: "依据",
     lastActivityPrefix: "最后活动",
@@ -424,9 +391,10 @@ export function buildStatusPanelModel(
   const copy = panelCopy[config.language];
   const panelRows = rows
     .filter((row) => !row.dismissed)
+    .filter((row) => !isSubagentRow(row))
     .filter(shouldIncludeInWatchlist)
     .map((row) => toPanelRow(row, theme, copy))
-  const rolledUpRows = rollUpSubagentRows(panelRows, copy).sort(comparePanelRows);
+  const rolledUpRows = panelRows.sort(comparePanelRows);
   const cardRows = rolledUpRows.filter(
     (row) => row.pinned || row.statusTone === "alert" || row.displayStatus === "working",
   );
@@ -468,140 +436,8 @@ export function buildStatusPanelModel(
   };
 }
 
-function rollUpSubagentRows(rows: StatusPanelRow[], copy: StatusPanelCopy) {
-  const rowBySessionId = new Map(rows.map((row) => [row.sessionId, row]));
-  const parentByWorkspace = parentRowsByWorkspace(rows);
-  const summaries = new Map<string, SubtaskSummary>();
-  const visibleRows: StatusPanelRow[] = [];
-
-  for (const row of rows) {
-    const parentMatch = isSubagentRow(row)
-      ? parentForSubagentRow(row, rowBySessionId, parentByWorkspace)
-      : undefined;
-    const parent = parentMatch?.parent;
-    if (!parent) {
-      if (isSubagentRow(row)) {
-        if (shouldPromoteSubagentRow(row)) {
-          visibleRows.push({ ...row, subagentMarker: copy.subagentAnomalyLabel });
-        }
-        continue;
-      }
-      visibleRows.push(row);
-      continue;
-    }
-
-    if (shouldPromoteAttachedSubagentRow(row, parentMatch.exactParentChain)) {
-      visibleRows.push({ ...row, subagentMarker: copy.subagentAnomalyLabel });
-      continue;
-    }
-
-    const summary = summaries.get(parent.sessionId) ?? { total: 0, counts: {}, rows: [] };
-    summary.total += 1;
-    summary.counts[row.displayStatus] = (summary.counts[row.displayStatus] ?? 0) + 1;
-    summary.rows.push(row);
-    summaries.set(parent.sessionId, summary);
-  }
-
-  return visibleRows.map((row) => {
-    const summary = summaries.get(row.sessionId);
-    if (!summary) return row;
-    const subtaskRows = [...summary.rows].sort(compareSubtaskRows);
-    return {
-      ...row,
-      subtaskSummary: copy.subtaskSummaryLabel(summary),
-      subtaskRows,
-      dismissSessionIds: [row.sessionId, ...subtaskRows.map((item) => item.sessionId)],
-      acknowledgeSessionIds: [row.sessionId, ...subtaskRows
-        .filter((item) => item.displayStatus === "inspect")
-        .map((item) => item.sessionId)],
-    };
-  });
-}
-
-function compareSubtaskRows(left: StatusPanelRow, right: StatusPanelRow) {
-  const toneDelta = tonePriority(left.statusTone) - tonePriority(right.statusTone);
-  if (toneDelta !== 0) return toneDelta;
-
-  return comparePanelRows(left, right);
-}
-
-function tonePriority(tone: StatusPanelRow["statusTone"]) {
-  return tone === "alert" ? 0 : 1;
-}
-
-interface SubagentParentMatch {
-  parent: StatusPanelRow;
-  exactParentChain: boolean;
-}
-
-function parentForSubagentRow(
-  row: StatusPanelRow,
-  rowBySessionId: Map<string, StatusPanelRow>,
-  parentByWorkspace: Map<string, StatusPanelRow>,
-): SubagentParentMatch | undefined {
-  const exactParent = rootParentForSubagentRow(row, rowBySessionId);
-  if (exactParent) {
-    return { parent: exactParent, exactParentChain: true };
-  }
-
-  const workspaceParent = row.workspacePath ? parentByWorkspace.get(row.workspacePath) : undefined;
-  return workspaceParent ? { parent: workspaceParent, exactParentChain: false } : undefined;
-}
-
-function rootParentForSubagentRow(
-  row: StatusPanelRow,
-  rowBySessionId: Map<string, StatusPanelRow>,
-) {
-  let parentSessionId = row.parentSessionId;
-  const visitedSessionIds = new Set([row.sessionId]);
-
-  while (parentSessionId && !visitedSessionIds.has(parentSessionId)) {
-    visitedSessionIds.add(parentSessionId);
-    const parent = rowBySessionId.get(parentSessionId);
-    if (!parent) return undefined;
-    if (!isSubagentRow(parent)) return parent;
-    parentSessionId = parent.parentSessionId;
-  }
-
-  return undefined;
-}
-
-function parentRowsByWorkspace(rows: StatusPanelRow[]) {
-  const parentByWorkspace = new Map<string, StatusPanelRow>();
-  for (const row of rows) {
-    if (isSubagentRow(row) || !row.workspacePath) continue;
-    const current = parentByWorkspace.get(row.workspacePath);
-    if (!current || timestampValue(row.lastActivityAt) > timestampValue(current.lastActivityAt)) {
-      parentByWorkspace.set(row.workspacePath, row);
-    }
-  }
-  return parentByWorkspace;
-}
-
 function isSubagentRow(row: SessionRow) {
   return row.threadSource === "subagent" || Boolean(row.parentSessionId);
-}
-
-function shouldPromoteSubagentRow(row: StatusPanelRow) {
-  return row.displayStatus === "blocked" || row.displayStatus === "input" || row.displayStatus === "stopped";
-}
-
-function shouldPromoteAttachedSubagentRow(row: StatusPanelRow, hasExactParentSession: boolean) {
-  return row.displayStatus === "blocked"
-    || row.displayStatus === "input"
-    || (row.displayStatus === "stopped" && !hasExactParentSession);
-}
-
-function subtaskSummaryParts(
-  summary: SubtaskSummary,
-  labels: Record<InterventionStatus, string>,
-) {
-  const statuses: InterventionStatus[] = ["blocked", "input", "inspect", "working", "needed", "stopped", "idle"];
-  return statuses
-    .flatMap((status) => {
-      const count = summary.counts[status] ?? 0;
-      return count > 0 ? [`${count} ${labels[status]}`] : [];
-    });
 }
 
 function themeFromConfig(config: StatusPanelConfig): AtomInterventionTheme {

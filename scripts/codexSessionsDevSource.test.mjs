@@ -6,11 +6,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createCodexSessionsDevSource,
   defaultCodexStateDbPath,
+  discoverCodexThreadById,
   discoverCodexSessions,
   jumpToSession,
   normalizeFollowUpToIdleMinutes,
   parseCodexProcessLine,
   selectLiveCliPrimarySessionId,
+  sourceHealth,
 } from "./codexSessionsDevSource.mjs";
 
 const tempDirs = [];
@@ -200,7 +202,7 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
-  it("reads parent thread ids from subagent session metadata", () => {
+  it("reads parent thread ids from subagent session metadata by id without listing the child", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
     const sessionDir = path.join(temp, "sessions", "2026", "06", "11");
@@ -227,21 +229,512 @@ describe("codexSessionsDevSource", () => {
       updatedAtMs: Date.parse("2026-06-11T09:10:00.000Z"),
     });
 
+    const row = discoverCodexThreadById("019child", {
+      stateDbPath: stateDb,
+      nowMs: Date.parse("2026-06-11T09:20:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(row).toMatchObject({
+      sessionId: "019child",
+      threadSource: "subagent",
+      parentSessionId: "019parent",
+    });
+  });
+
+  it("keeps a parent discoverable when newer subagents exceed the SQLite limit", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019parent-capacity",
+      rolloutPath: path.join(temp, "missing-parent-capacity.jsonl"),
+      cwd: "/Users/edy/project-parent",
+      title: "Parent session",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Parent session",
+      updatedAtMs: Date.parse("2026-06-17T01:00:00.000Z"),
+    });
+
+    const childIds = [
+      "019child-capacity-a",
+      "019child-capacity-b",
+      "019child-capacity-c",
+    ];
+    childIds.forEach((id, index) => {
+      insertThread({
+        stateDb,
+        id,
+        rolloutPath: path.join(temp, `missing-${id}.jsonl`),
+        cwd: "/Users/edy/project-parent",
+        title: "Child session",
+        source: "vscode",
+        threadSource: "subagent",
+        preview: "Child session",
+        updatedAtMs: Date.parse("2026-06-17T01:01:00.000Z") + index,
+      });
+    });
+    execFileSync("sqlite3", [
+      stateDb,
+      `insert into thread_spawn_edges (child_thread_id, parent_thread_id) values
+        ('019child-capacity-a', '019parent-capacity'),
+        ('019child-capacity-b', '019parent-capacity'),
+        ('019child-capacity-c', '019parent-capacity');`,
+    ]);
+
     const rows = discoverCodexSessions({
       stateDbPath: stateDb,
       sessionsRoot: path.join(temp, "sessions"),
-      nowMs: Date.parse("2026-06-11T09:20:00.000Z"),
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
       unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 1,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019parent-capacity",
+      threadSource: "user",
+    });
+  });
+
+  it("uses spawn edges to keep a parent discoverable when a newer child is misclassified as user", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019parent-edge-capacity",
+      rolloutPath: path.join(temp, "missing-parent-edge-capacity.jsonl"),
+      cwd: "/Users/edy/project-parent",
+      title: "Parent session",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Parent session",
+      updatedAtMs: Date.parse("2026-06-17T01:00:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: "019child-edge-capacity",
+      rolloutPath: path.join(temp, "missing-child-edge-capacity.jsonl"),
+      cwd: "/Users/edy/project-parent",
+      title: "Misclassified child session",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Misclassified child session",
+      updatedAtMs: Date.parse("2026-06-17T01:01:00.000Z"),
+    });
+    execFileSync("sqlite3", [
+      stateDb,
+      "insert into thread_spawn_edges (child_thread_id, parent_thread_id) values ('019child-edge-capacity', '019parent-edge-capacity');",
+    ]);
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 1,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sessionId).toBe("019parent-edge-capacity");
+  });
+
+  it("keeps child session metadata when a later embedded parent session metadata record appears", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "18");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-18T09-00-00-019fallback-child.jsonl"),
+      [
+        '{"timestamp":"2026-06-18T01:00:00.000Z","type":"session_meta","payload":{"id":"019fallback-child","parent_thread_id":"019fallback-parent","cwd":"/Users/edy/project-child","originator":"codex-tui","agent_nickname":"Child Agent","thread_source":"subagent"}}',
+        '{"timestamp":"2026-06-18T01:01:00.000Z","type":"session_meta","payload":{"id":"019fallback-parent","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","agent_nickname":"Parent Agent"}}',
+        '{"timestamp":"2026-06-18T01:02:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child is working"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019fallback-child",
+      rolloutPath: path.join(sessionDir, "rollout-2026-06-18T09-00-00-019fallback-child.jsonl"),
+      cwd: "/Users/edy/project-child",
+      title: "Child session",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "Child session",
+      updatedAtMs: Date.parse("2026-06-18T01:02:00.000Z"),
+    });
+
+    const row = discoverCodexThreadById("019fallback-child", {
+      stateDbPath: stateDb,
+      nowMs: Date.parse("2026-06-18T01:05:00.000Z"),
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(row).toMatchObject({
+      sessionId: "019fallback-child",
+      parentSessionId: "019fallback-parent",
+      agentName: "Child Agent",
+      workspacePath: "/Users/edy/project-child",
+      jumpTarget: "cli",
+    });
+  });
+
+  it("collapses duplicate session IDs from JSONL fallback files to the newest observation", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "18");
+    const olderPath = path.join(sessionDir, "rollout-2026-06-18T09-00-00-019fallback-duplicate.jsonl");
+    const newerPath = path.join(sessionDir, "rollout-2026-06-18T09-05-00-019fallback-duplicate-copy.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      olderPath,
+      [
+        '{"timestamp":"2026-06-18T01:00:00.000Z","type":"session_meta","payload":{"id":"019fallback-duplicate","cwd":"/Users/edy/project-older","originator":"Codex Desktop"}}',
+        '{"timestamp":"2026-06-18T01:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Older fallback copy"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      newerPath,
+      [
+        '{"timestamp":"2026-06-18T01:04:00.000Z","type":"session_meta","payload":{"id":"019fallback-duplicate","cwd":"/Users/edy/project-newer","originator":"Codex Desktop"}}',
+        '{"timestamp":"2026-06-18T01:05:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Newer fallback copy"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.utimesSync(olderPath, new Date("2026-06-18T01:02:00.000Z"), new Date("2026-06-18T01:02:00.000Z"));
+    fs.utimesSync(newerPath, new Date("2026-06-18T01:06:00.000Z"), new Date("2026-06-18T01:06:00.000Z"));
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-18T01:10:00.000Z"),
       limit: 20,
       liveCliTtyForWorkspace: () => undefined,
     });
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
-      sessionId: "019child",
-      threadSource: "subagent",
-      parentSessionId: "019parent",
+      sessionId: "019fallback-duplicate",
+      label: "Newer fallback copy",
+      workspacePath: "/Users/edy/project-newer",
+      lastActivityAt: "2026-06-18T01:05:00.000Z",
     });
+  });
+
+  it("keeps a parent when newer orphan subagents exceed the JSONL fallback limit", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "18");
+    const parentPath = path.join(sessionDir, "rollout-2026-06-18T09-00-00-019parent-fallback.jsonl");
+    const childPath = path.join(sessionDir, "rollout-2026-06-18T10-00-00-019orphan-child-fallback.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      parentPath,
+      [
+        '{"timestamp":"2026-06-18T01:00:00.000Z","type":"session_meta","payload":{"id":"019parent-fallback","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","thread_source":"user"}}',
+        '{"timestamp":"2026-06-18T01:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent working"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      childPath,
+      [
+        '{"timestamp":"2026-06-18T02:00:00.000Z","type":"session_meta","payload":{"id":"019orphan-child-fallback","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}',
+        '{"timestamp":"2026-06-18T02:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child working"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.utimesSync(parentPath, new Date("2026-06-18T01:02:00.000Z"), new Date("2026-06-18T01:02:00.000Z"));
+    fs.utimesSync(childPath, new Date("2026-06-18T01:06:00.000Z"), new Date("2026-06-18T01:06:00.000Z"));
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-18T01:10:00.000Z"),
+      limit: 1,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sessionId).toBe("019parent-fallback");
+  });
+
+  it("returns no JSONL fallback rows when the limit is zero", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "18");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-18T09-00-00-019limit-zero.jsonl"),
+      [
+        '{"timestamp":"2026-06-18T01:00:00.000Z","type":"session_meta","payload":{"id":"019limit-zero","cwd":"/Users/edy/project","originator":"Codex Desktop"}}',
+        '{"timestamp":"2026-06-18T01:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-18T01:10:00.000Z"),
+      limit: 0,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toEqual([]);
+  });
+
+  it("uses JSONL subagent metadata to refill a SQLite list after an unmarked child", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "18");
+    const childPath = path.join(sessionDir, "rollout-2026-06-18T10-00-00-019child-jsonl-source.jsonl");
+    const parentPath = path.join(sessionDir, "rollout-2026-06-18T09-00-00-019parent-jsonl-source.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      childPath,
+      [
+        '{"timestamp":"2026-06-18T02:00:00.000Z","type":"session_meta","payload":{"id":"019child-jsonl-source","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}',
+        '{"timestamp":"2026-06-18T02:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child working"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      parentPath,
+      [
+        '{"timestamp":"2026-06-18T01:00:00.000Z","type":"session_meta","payload":{"id":"019parent-jsonl-source","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","thread_source":"user"}}',
+        '{"timestamp":"2026-06-18T01:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent working"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb, { includeSpawnEdges: false });
+    insertThread({
+      stateDb,
+      id: "019child-jsonl-source",
+      rolloutPath: childPath,
+      cwd: "/Users/edy/project-child",
+      title: "Child session",
+      source: "cli",
+      threadSource: "user",
+      preview: "Child session",
+      updatedAtMs: Date.parse("2026-06-18T02:01:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: "019parent-jsonl-source",
+      rolloutPath: parentPath,
+      cwd: "/Users/edy/project-parent",
+      title: "Parent session",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Parent session",
+      updatedAtMs: Date.parse("2026-06-18T01:01:00.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-18T01:10:00.000Z"),
+      limit: 1,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sessionId).toBe("019parent-jsonl-source");
+  });
+
+  it("does not add unverified live CLI sessions to the list", () => {
+    const temp = tempDir();
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-18T01:10:00.000Z"),
+      limit: 20,
+      liveCliSessions: [
+        { sessionId: "019unverified-live-cli", workspacePath: "/repo", tty: "ttys008" },
+        { workspacePath: "/repo", tty: "ttys009" },
+      ],
+    });
+
+    expect(rows).toEqual([]);
+  });
+
+  it.sequential("loads SQLite parent links by id while JSONL remains authoritative", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "17");
+    const sqliteBinDir = path.join(temp, "bin");
+    const sqliteCallLog = path.join(temp, "sqlite-calls.log");
+    const sqliteQueryLog = path.join(temp, "sqlite-query.log");
+    const originalEnvironment = Object.fromEntries(
+      ["PATH", "SQLITE_CALL_LOG", "SQLITE_QUERY_LOG", "REAL_SQLITE3"].map((key) => [key, process.env[key]]),
+    );
+    const realSqlite3 = execFileSync("sh", ["-lc", "command -v sqlite3"], { encoding: "utf8" }).trim();
+    const jsonlChildId = "019child-jsonl-parent";
+    const sqliteChildId = "019child-sqlite-parent";
+    const workspacePath = "/Users/edy/project";
+    fs.mkdirSync(sessionDir, { recursive: true });
+    createThreadsTable(stateDb);
+    fs.mkdirSync(sqliteBinDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sqliteBinDir, "sqlite3"),
+      [
+        "#!/bin/sh",
+        'printf "call\\n" >> "$SQLITE_CALL_LOG"',
+        'printf "%s" "$4" > "$SQLITE_QUERY_LOG"',
+        'exec "$REAL_SQLITE3" "$@"',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    const jsonlParentRolloutPath = path.join(sessionDir, `rollout-2026-06-17T12-00-00-${jsonlChildId}.jsonl`);
+    const sqliteParentRolloutPath = path.join(sessionDir, `rollout-2026-06-17T12-01-00-${sqliteChildId}.jsonl`);
+    fs.writeFileSync(
+      jsonlParentRolloutPath,
+      [
+        `{"timestamp":"2026-06-17T04:00:00.000Z","type":"session_meta","payload":{"id":"${jsonlChildId}","parent_thread_id":"019parent-jsonl","cwd":"${workspacePath}","originator":"codex-tui","source":"cli"}}`,
+        '{"timestamp":"2026-06-17T04:01:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"child"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      sqliteParentRolloutPath,
+      [
+        `{"timestamp":"2026-06-17T04:02:00.000Z","type":"session_meta","payload":{"id":"${sqliteChildId}","cwd":"${workspacePath}","originator":"codex-tui","source":"cli"}}`,
+        '{"timestamp":"2026-06-17T04:03:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"child"}}',
+        "",
+      ].join("\n"),
+    );
+    insertThread({
+      stateDb,
+      id: jsonlChildId,
+      rolloutPath: jsonlParentRolloutPath,
+      cwd: workspacePath,
+      title: "JSONL child",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "JSONL child",
+      updatedAtMs: Date.parse("2026-06-17T04:01:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: sqliteChildId,
+      rolloutPath: sqliteParentRolloutPath,
+      cwd: workspacePath,
+      title: "SQLite child",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "SQLite child",
+      updatedAtMs: Date.parse("2026-06-17T04:03:00.000Z"),
+    });
+    execFileSync("sqlite3", [
+      stateDb,
+      `insert into thread_spawn_edges (child_thread_id, parent_thread_id) values
+        (${sql(jsonlChildId)}, '019parent-sqlite'),
+        (${sql(sqliteChildId)}, '019parent-sqlite');`,
+    ]);
+
+    try {
+      process.env.PATH = `${sqliteBinDir}:${originalEnvironment.PATH ?? ""}`;
+      process.env.SQLITE_CALL_LOG = sqliteCallLog;
+      process.env.SQLITE_QUERY_LOG = sqliteQueryLog;
+      process.env.REAL_SQLITE3 = realSqlite3;
+
+      const jsonlChild = discoverCodexThreadById(jsonlChildId, {
+        stateDbPath: stateDb,
+        nowMs: Date.parse("2026-06-17T04:10:00.000Z"),
+        unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+        liveCliTtyForWorkspace: () => undefined,
+      });
+      const sqliteChild = discoverCodexThreadById(sqliteChildId, {
+        stateDbPath: stateDb,
+        nowMs: Date.parse("2026-06-17T04:10:00.000Z"),
+        unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+        liveCliTtyForWorkspace: () => undefined,
+      });
+
+      expect(jsonlChild).toMatchObject({
+        parentSessionId: "019parent-jsonl",
+      });
+      expect(sqliteChild).toMatchObject({
+        parentSessionId: "019parent-sqlite",
+      });
+      expect(fs.readFileSync(sqliteCallLog, "utf8").trim().split("\n")).toHaveLength(2);
+      expect(fs.readFileSync(sqliteQueryLog, "utf8").toLowerCase()).toContain(
+        "left join thread_spawn_edges",
+      );
+    } finally {
+      restoreEnvironmentVariables(originalEnvironment);
+    }
+  });
+
+  it("lists no subagent rows when an older state DB lacks spawn edges", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb, { includeSpawnEdges: false });
+    insertThread({
+      stateDb,
+      id: "019legacy-state-db",
+      rolloutPath: path.join(temp, "missing.jsonl"),
+      cwd: "/Users/edy/project",
+      title: "Legacy thread",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "Legacy thread",
+      updatedAtMs: Date.parse("2026-06-17T04:03:00.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "missing-sessions"),
+      nowMs: Date.parse("2026-06-17T04:10:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toEqual([]);
+  });
+
+  it("lists no subagent rows when spawn edges omit a required column", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb);
+    execFileSync("sqlite3", [
+      stateDb,
+      "drop table thread_spawn_edges; create table thread_spawn_edges (child_thread_id text primary key);",
+    ]);
+    insertThread({
+      stateDb,
+      id: "019incompatible-edge-schema",
+      rolloutPath: path.join(temp, "missing.jsonl"),
+      cwd: "/Users/edy/project",
+      title: "Incompatible edge schema",
+      source: "cli",
+      threadSource: "subagent",
+      preview: "Incompatible edge schema",
+      updatedAtMs: Date.parse("2026-06-17T04:03:00.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "missing-sessions"),
+      nowMs: Date.parse("2026-06-17T04:10:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toEqual([]);
   });
 
   it("keeps unread completed sessions in inspect even after the old inspect window", () => {
@@ -1420,6 +1913,342 @@ describe("codexSessionsDevSource", () => {
       statusReason: "no recent activity observed; idle until the next source signal",
     });
   });
+
+  it("reports a JSONL fallback snapshot as degraded source health", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionsRoot = path.join(temp, "sessions");
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+
+    const health = sourceHealth({
+      stateDbPath: stateDb,
+      sessionsRoot,
+      snapshot: {
+        isDegraded: true,
+        sqliteError: "database is locked",
+      },
+    });
+
+    expect(health.status).toBe("degraded");
+    expect(health.capabilities.find((capability) => capability.name === "Thread discovery"))
+      .toMatchObject({
+        availability: "inferred",
+        detail: expect.stringContaining("database is locked"),
+      });
+  });
+
+  it("keeps missing SQLite discovery unavailable before the first source snapshot", () => {
+    const temp = tempDir();
+    const sessionsRoot = path.join(temp, "sessions");
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+
+    const health = sourceHealth({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot,
+    });
+
+    expect(health.status).toBe("available");
+    expect(health.capabilities.find((capability) => capability.name === "Thread discovery"))
+      .toMatchObject({ availability: "unavailable" });
+  });
+
+  it("retains the source instance's latest degraded snapshot for health reporting", () => {
+    const temp = tempDir();
+    const sessionsRoot = path.join(temp, "sessions");
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    const source = createCodexSessionsDevSource({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    source.discoverCodexSessions();
+
+    expect(source.sourceHealth()).toMatchObject({ status: "degraded" });
+  });
+
+  it("waits for a second healthy SQLite idle snapshot before hiding a Desktop running row", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionsRoot = path.join(temp, "sessions");
+    const sessionDir = path.join(sessionsRoot, "2026", "06", "17");
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-17T09-00-00-019desktop-stability.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-17T00:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-stability","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019desktop-stability",
+      rolloutPath,
+      cwd: "/Users/edy/project-desktop",
+      title: "Desktop stability",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Desktop stability",
+      updatedAtMs: Date.parse("2026-06-17T01:00:00.000Z"),
+    });
+    const source = createCodexSessionsDevSource({
+      stateDbPath: stateDb,
+      sessionsRoot,
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-stability",
+      state: "running",
+    });
+
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-16T22:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-stability","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        "",
+      ].join("\n"),
+    );
+    execFileSync("sqlite3", [
+      stateDb,
+      `update threads set updated_at_ms = ${Date.parse("2026-06-16T22:00:00.000Z")} where id = '019desktop-stability';`,
+    ]);
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-stability",
+      state: "running",
+    });
+    expect(source.discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "missing-sessions"),
+    })[0]).toMatchObject({
+      sessionId: "019desktop-stability",
+      state: "running",
+    });
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-stability",
+      state: "running",
+    });
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-stability",
+      state: "idle",
+    });
+  });
+
+  it("retains a Desktop running row through a degraded missing SQLite snapshot and reconfirms idle after recovery", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionsRoot = path.join(temp, "sessions");
+    const sessionDir = path.join(sessionsRoot, "2026", "06", "17");
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-17T09-00-00-019desktop-recovery.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-17T00:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-recovery","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019desktop-recovery",
+      rolloutPath,
+      cwd: "/Users/edy/project-desktop",
+      title: "Desktop recovery",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Desktop recovery",
+      updatedAtMs: Date.parse("2026-06-17T01:00:00.000Z"),
+    });
+    const source = createCodexSessionsDevSource({
+      stateDbPath: stateDb,
+      sessionsRoot,
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-recovery",
+      state: "running",
+    });
+
+    const degradedRows = source.discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "missing-sessions"),
+    });
+    expect(degradedRows).toHaveLength(1);
+    expect(degradedRows[0]).toMatchObject({
+      sessionId: "019desktop-recovery",
+      state: "running",
+    });
+    expect(source.discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing-state.sqlite"),
+      sessionsRoot: path.join(temp, "missing-sessions"),
+    })[0]).toMatchObject({
+      sessionId: "019desktop-recovery",
+      state: "unknown",
+      statusReason: expect.stringContaining("source unavailable"),
+    });
+
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-16T22:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-recovery","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        "",
+      ].join("\n"),
+    );
+    execFileSync("sqlite3", [
+      stateDb,
+      `update threads set updated_at_ms = ${Date.parse("2026-06-16T22:00:00.000Z")} where id = '019desktop-recovery';`,
+    ]);
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-recovery",
+      state: "running",
+    });
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-recovery",
+      state: "idle",
+    });
+  });
+
+  it("waits for a second healthy missing snapshot before hiding a Desktop running row", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionsRoot = path.join(temp, "sessions");
+    const sessionDir = path.join(sessionsRoot, "2026", "06", "17");
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-17T09-00-00-019desktop-missing.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-17T00:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-missing","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019desktop-missing",
+      rolloutPath,
+      cwd: "/Users/edy/project-desktop",
+      title: "Desktop missing",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Desktop missing",
+      updatedAtMs: Date.parse("2026-06-17T01:00:00.000Z"),
+    });
+    const source = createCodexSessionsDevSource({
+      stateDbPath: stateDb,
+      sessionsRoot,
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-missing",
+      state: "running",
+    });
+
+    execFileSync("sqlite3", [stateDb, "delete from threads where id = '019desktop-missing';"]);
+
+    expect(source.discoverCodexSessions()[0]).toMatchObject({
+      sessionId: "019desktop-missing",
+      state: "running",
+      statusReason: expect.stringContaining("missing from one SQLite snapshot"),
+    });
+    expect(source.discoverCodexSessions()).toHaveLength(0);
+  });
+
+  it("does not delay terminal completed-stale or CLI idle rows after a Desktop running row", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionsRoot = path.join(temp, "sessions");
+    const sessionDir = path.join(sessionsRoot, "2026", "06", "17");
+    const desktopRolloutPath = path.join(sessionDir, "rollout-2026-06-17T09-00-00-019desktop-terminal.jsonl");
+    const cliRolloutPath = path.join(sessionDir, "rollout-2026-06-17T09-00-00-019cli-idle.jsonl");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      desktopRolloutPath,
+      [
+        '{"timestamp":"2026-06-17T00:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-terminal","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      cliRolloutPath,
+      [
+        '{"timestamp":"2026-06-17T00:00:00.000Z","type":"session_meta","payload":{"id":"019cli-idle","cwd":"/Users/edy/project-cli","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-17T00:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\"}","call_id":"call_cli_idle"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019desktop-terminal",
+      rolloutPath: desktopRolloutPath,
+      cwd: "/Users/edy/project-desktop",
+      title: "Desktop terminal",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Desktop terminal",
+      updatedAtMs: Date.parse("2026-06-17T01:00:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: "019cli-idle",
+      rolloutPath: cliRolloutPath,
+      cwd: "/Users/edy/project-cli",
+      title: "CLI idle",
+      source: "cli",
+      threadSource: "user",
+      preview: "CLI idle",
+      updatedAtMs: Date.parse("2026-06-17T00:01:00.000Z"),
+    });
+    const source = createCodexSessionsDevSource({
+      stateDbPath: stateDb,
+      sessionsRoot,
+      nowMs: Date.parse("2026-06-17T01:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(source.discoverCodexSessions().find((row) => row.sessionId === "019desktop-terminal")).toMatchObject({
+      state: "running",
+    });
+
+    fs.writeFileSync(
+      desktopRolloutPath,
+      [
+        '{"timestamp":"2026-05-31T00:00:00.000Z","type":"session_meta","payload":{"id":"019desktop-terminal","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-05-31T00:01:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        "",
+      ].join("\n"),
+    );
+    execFileSync("sqlite3", [
+      stateDb,
+      `update threads set updated_at_ms = ${Date.parse("2026-06-01T00:01:00.000Z")} where id = '019desktop-terminal';`,
+    ]);
+
+    const rows = source.discoverCodexSessions();
+    expect(rows.find((row) => row.sessionId === "019desktop-terminal")).toMatchObject({
+      state: "idle",
+      statusReason: "completed task is no longer recent; idle until the next source signal",
+    });
+    expect(rows.find((row) => row.sessionId === "019cli-idle")).toMatchObject({
+      state: "idle",
+      jumpTarget: "cli",
+      statusReason: "No live Codex CLI process for pending input; idle until the next source signal.",
+    });
+  });
 });
 
 function tempDir() {
@@ -1428,11 +2257,21 @@ function tempDir() {
   return dir;
 }
 
-function createThreadsTable(stateDb) {
+function createThreadsTable(stateDb, { includeSpawnEdges = true } = {}) {
+  const spawnEdgesTable = includeSpawnEdges
+    ? "\n     create table thread_spawn_edges (child_thread_id text primary key, parent_thread_id text not null);"
+    : "";
   execFileSync("sqlite3", [
     stateDb,
-    "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer, thread_source text, preview text not null default '');",
+    `create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, archived_at integer, git_sha text, git_branch text, git_origin_url text, cli_version text not null default '', first_user_message text not null default '', agent_nickname text, agent_role text, memory_mode text not null default 'enabled', model text, reasoning_effort text, agent_path text, created_at_ms integer, updated_at_ms integer, thread_source text, preview text not null default '');${spawnEdgesTable}`,
   ]);
+}
+
+function restoreEnvironmentVariables(values) {
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 }
 
 function insertThread({

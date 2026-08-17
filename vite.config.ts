@@ -4,7 +4,6 @@ import {
   createCodexSessionsDevSource,
   defaultCodexSessionsRoot,
   defaultCodexStateDbPath,
-  sourceHealth,
 } from "./scripts/codexSessionsDevSource.mjs";
 
 // @ts-expect-error process is a nodejs global
@@ -55,7 +54,7 @@ function codexSessionsDevApi() {
       });
 
       server.middlewares.use("/api/source-health", (_req: any, res: any) => {
-        sendJson(res, sourceHealth());
+        sendJson(res, previewSource.sourceHealth());
       });
 
       server.middlewares.use("/api/jump", (req: any, res: any) => {

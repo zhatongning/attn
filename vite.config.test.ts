@@ -18,6 +18,7 @@ vi.mock("./scripts/codexSessionsDevSource.mjs", () => ({
   createCodexSessionsDevSource: () => ({
     discoverCodexSessions: source.discoverCodexSessions,
     jumpToSession: source.jumpToSession,
+    sourceHealth: source.sourceHealth,
   }),
   defaultCodexSessionsRoot: "/tmp/codex-sessions",
   defaultCodexStateDbPath: "/tmp/state.sqlite",
@@ -58,6 +59,18 @@ describe("Vite Codex sessions API", () => {
       "session-1",
       { followUpToIdleMinutes: 45 },
     );
+  });
+
+  it("returns the source instance's latest snapshot health", async () => {
+    const handlers = await apiHandlers();
+    const health = { sourceName: "Codex sessions", status: "degraded", capabilities: [] };
+    source.sourceHealth.mockReturnValueOnce(health);
+    const reply = response();
+
+    await handlers.get("/api/source-health")?.({ url: "/" }, reply);
+
+    expect(source.sourceHealth).toHaveBeenCalledOnce();
+    expect(reply.end).toHaveBeenCalledWith(JSON.stringify(health));
   });
 });
 

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -11,8 +11,34 @@ use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 
 const UNREAD_COMPLETION_RETENTION: Duration = Duration::from_secs(12 * 60 * 60);
 const SESSION_TAIL_READ_BYTES: u64 = 128 * 1024;
+const SESSION_HEADER_READ_BYTES: usize = 32 * 1024;
 const HOOK_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_FOLLOW_UP_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationSnapshotSource {
+    Sqlite { state_db_path: PathBuf },
+    JsonlFallback { state_db_path: PathBuf, sqlite_error: String },
+}
+
+impl ObservationSnapshotSource {
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::JsonlFallback { .. })
+    }
+
+    pub fn sqlite_error(&self) -> Option<&str> {
+        match self {
+            Self::Sqlite { .. } => None,
+            Self::JsonlFallback { sqlite_error, .. } => Some(sqlite_error),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservationSnapshot {
+    pub observations: Vec<SourceObservation>,
+    pub source: ObservationSnapshotSource,
+}
 
 #[derive(Debug, Clone)]
 struct SessionFileSummary {
@@ -24,6 +50,16 @@ struct SessionFileSummary {
 struct ParsedSessionObservation {
     observation: SourceObservation,
     task_completed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionHeaderMetadata {
+    session_id: String,
+    parent_session_id: Option<String>,
+    thread_source: Option<String>,
+    workspace_path: Option<String>,
+    agent_name: Option<String>,
+    jump_target: Option<JumpTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +116,24 @@ pub fn discover_codex_observations_with_state_db_and_follow_up_window(
     now: SystemTime,
     follow_up_window: Duration,
 ) -> Vec<SourceObservation> {
-    discover_codex_observations_with_state_db_and_hooks_and_follow_up_window(
+    discover_codex_observation_snapshot_with_state_db_and_follow_up_window(
+        state_db,
+        sessions_root,
+        limit,
+        now,
+        follow_up_window,
+    )
+    .observations
+}
+
+pub fn discover_codex_observation_snapshot_with_state_db_and_follow_up_window(
+    state_db: &Path,
+    sessions_root: &Path,
+    limit: usize,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> ObservationSnapshot {
+    discover_codex_observation_snapshot_with_state_db_and_hooks_and_follow_up_window(
         state_db,
         sessions_root,
         &codex_hook_events_path(),
@@ -97,7 +150,7 @@ pub fn discover_codex_observations_with_state_db_and_hooks(
     limit: usize,
     now: SystemTime,
 ) -> Vec<SourceObservation> {
-    discover_codex_observations_with_state_db_and_hooks_and_follow_up_window(
+    discover_codex_observation_snapshot_with_state_db_and_hooks_and_follow_up_window(
         state_db,
         sessions_root,
         hook_events_path,
@@ -105,29 +158,46 @@ pub fn discover_codex_observations_with_state_db_and_hooks(
         now,
         DEFAULT_FOLLOW_UP_WINDOW,
     )
+    .observations
 }
 
-fn discover_codex_observations_with_state_db_and_hooks_and_follow_up_window(
+fn discover_codex_observation_snapshot_with_state_db_and_hooks_and_follow_up_window(
     state_db: &Path,
     sessions_root: &Path,
     hook_events_path: &Path,
     limit: usize,
     now: SystemTime,
     follow_up_window: Duration,
-) -> Vec<SourceObservation> {
-    let Some(threads) = discover_threads_from_state_db(state_db, limit) else {
-        return discover_codex_observations_with_now(sessions_root, limit, now);
+) -> ObservationSnapshot {
+    let threads = match discover_threads_from_state_db(state_db) {
+        Ok(threads) => threads,
+        Err(sqlite_error) => {
+            return ObservationSnapshot {
+                observations: discover_codex_observations_with_now(sessions_root, limit, now),
+                source: ObservationSnapshotSource::JsonlFallback {
+                    state_db_path: state_db.to_path_buf(),
+                    sqlite_error,
+                },
+            };
+        }
     };
 
     let hook_signals = load_latest_hook_signals(hook_events_path);
 
-    threads
-        .into_iter()
-        .filter_map(|thread| {
-            let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
-            observation_from_thread(thread, hook_signal, now, follow_up_window)
-        })
-        .collect()
+    ObservationSnapshot {
+        observations: threads
+            .into_iter()
+            .filter_map(|thread| {
+                let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
+                observation_from_thread(thread, hook_signal, now, follow_up_window)
+            })
+            .filter(|observation| !is_subagent_observation(observation))
+            .take(limit)
+            .collect(),
+        source: ObservationSnapshotSource::Sqlite {
+            state_db_path: state_db.to_path_buf(),
+        },
+    }
 }
 
 pub fn discover_codex_observation_by_id(
@@ -165,11 +235,37 @@ pub fn discover_codex_observations_with_now(
 
     summaries.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
 
+    let mut observed_session_ids = HashSet::new();
+
     summaries
         .into_iter()
         .filter_map(|summary| parse_session_file(&summary.path, now).ok().flatten())
+        .filter(|observation| observed_session_ids.insert(observation.session_id.clone()))
+        .filter(|observation| !is_subagent_observation(observation))
         .take(limit)
         .collect()
+}
+
+fn is_subagent_observation(observation: &SourceObservation) -> bool {
+    is_subagent_thread_source(observation.thread_source.as_deref())
+        || observation.parent_session_id.is_some()
+}
+
+fn is_subagent_thread_source(thread_source: Option<&str>) -> bool {
+    thread_source.is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+}
+
+fn effective_thread_source(
+    primary_thread_source: Option<String>,
+    secondary_thread_source: Option<String>,
+) -> Option<String> {
+    if is_subagent_thread_source(primary_thread_source.as_deref())
+        || is_subagent_thread_source(secondary_thread_source.as_deref())
+    {
+        Some("subagent".to_string())
+    } else {
+        primary_thread_source.or(secondary_thread_source)
+    }
 }
 
 fn collect_session_files(dir: &Path, summaries: &mut Vec<SessionFileSummary>) {
@@ -215,8 +311,122 @@ fn parse_session_file_tail_detailed(
     path: &Path,
     now: SystemTime,
 ) -> Result<Option<ParsedSessionObservation>, std::io::Error> {
+    let file_len = fs::metadata(path)?.len();
     let content = read_file_tail(path, SESSION_TAIL_READ_BYTES)?;
-    parse_session_content(path, &content, now)
+    let parsed = parse_session_content(path, &content, now)?;
+    if file_len <= SESSION_TAIL_READ_BYTES {
+        return Ok(parsed);
+    }
+
+    let header_metadata = parse_session_header_metadata(path)?;
+    Ok(parsed.map(|parsed| merge_session_header_metadata(parsed, header_metadata)))
+}
+
+fn parse_session_header_metadata(
+    path: &Path,
+) -> Result<Option<SessionHeaderMetadata>, std::io::Error> {
+    let content = read_file_head(path, SESSION_HEADER_READ_BYTES)?;
+    let expected_session_id =
+        session_id_from_path(path).filter(|value| looks_like_codex_session_id(value));
+
+    for line in content.lines() {
+        if !line.contains("\"type\":\"session_meta\"")
+            && !line.contains("\"type\": \"session_meta\"")
+        {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(metadata_session_id) = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if expected_session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id != metadata_session_id)
+        {
+            continue;
+        }
+
+        return Ok(Some(SessionHeaderMetadata {
+            session_id: metadata_session_id.to_string(),
+            parent_session_id: parent_thread_id_from_session_meta(payload),
+            thread_source: payload
+                .get("thread_source")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("thread_source").and_then(Value::as_str))
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            workspace_path: payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            agent_name: payload
+                .get("agent_nickname")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("originator").and_then(Value::as_str))
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            jump_target: jump_target_from_session_meta(payload),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn read_file_head(path: &Path, max_bytes: usize) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(max_bytes);
+    file.by_ref()
+        .take(max_bytes as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn merge_session_header_metadata(
+    mut parsed: ParsedSessionObservation,
+    header_metadata: Option<SessionHeaderMetadata>,
+) -> ParsedSessionObservation {
+    let Some(header_metadata) = header_metadata else {
+        return parsed;
+    };
+    if parsed.observation.session_id != header_metadata.session_id {
+        return parsed;
+    }
+
+    parsed.observation.thread_source = effective_thread_source(
+        parsed.observation.thread_source.take(),
+        header_metadata.thread_source,
+    );
+    parsed.observation.parent_session_id = parsed
+        .observation
+        .parent_session_id
+        .take()
+        .or(header_metadata.parent_session_id);
+    parsed.observation.workspace_path = parsed
+        .observation
+        .workspace_path
+        .take()
+        .or(header_metadata.workspace_path);
+    parsed.observation.agent_name = parsed
+        .observation
+        .agent_name
+        .take()
+        .or(header_metadata.agent_name);
+    if matches!(parsed.observation.jump_target, JumpTarget::Unknown) {
+        parsed.observation.jump_target = header_metadata.jump_target.unwrap_or(JumpTarget::Unknown);
+    }
+
+    parsed
 }
 
 fn read_file_tail(path: &Path, max_bytes: u64) -> Result<String, std::io::Error> {
@@ -242,8 +452,12 @@ fn parse_session_content(
     content: &str,
     now: SystemTime,
 ) -> Result<Option<ParsedSessionObservation>, std::io::Error> {
-    let mut session_id = None;
+    // Rollout files can embed metadata for a parent session. The rollout filename
+    // identifies the session whose events this file belongs to, so keep that identity
+    // and ignore foreign session metadata.
+    let mut session_id = session_id_from_path(path).filter(|value| looks_like_codex_session_id(value));
     let mut parent_session_id = None;
+    let mut thread_source = None;
     let mut cwd = None;
     let mut agent_name = None;
     let mut session_name = None;
@@ -264,20 +478,30 @@ fn parse_session_content(
             continue;
         };
 
-        if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-            latest_timestamp = Some(timestamp.to_string());
-        }
-
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
                 if let Some(payload) = value.get("payload") {
-                    session_id = payload
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                        .or(session_id);
+                    let metadata_session_id = payload.get("id").and_then(Value::as_str);
+                    let Some(metadata_session_id) = metadata_session_id.filter(|value| !value.is_empty()) else {
+                        continue;
+                    };
+                    if session_id
+                        .as_deref()
+                        .is_some_and(|session_id| session_id != metadata_session_id)
+                    {
+                        continue;
+                    }
+
+                    session_id = Some(metadata_session_id.to_string());
                     parent_session_id =
                         parent_thread_id_from_session_meta(payload).or(parent_session_id);
+                    thread_source = payload
+                        .get("thread_source")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("thread_source").and_then(Value::as_str))
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .or(thread_source);
                     cwd = payload
                         .get("cwd")
                         .and_then(Value::as_str)
@@ -290,9 +514,15 @@ fn parse_session_content(
                         .map(ToString::to_string)
                         .or(agent_name);
                     jump_target = jump_target_from_session_meta(payload).unwrap_or(jump_target);
+                    if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+                        latest_timestamp = Some(timestamp.to_string());
+                    }
                 }
             }
             Some("event_msg") => {
+                if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+                    latest_timestamp = Some(timestamp.to_string());
+                }
                 let event_type = value
                     .get("payload")
                     .and_then(|payload| payload.get("type"))
@@ -340,6 +570,9 @@ fn parse_session_content(
                 }
             }
             Some("response_item") => {
+                if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+                    latest_timestamp = Some(timestamp.to_string());
+                }
                 if let Some(approval) = pending_tool_approval_from_response_item(&value) {
                     last_activity_kind = ObservationKind::WaitingForInput;
                     pending_tool_approval = Some(approval);
@@ -434,6 +667,10 @@ fn parse_session_content(
 
     if let Some(agent_name) = agent_name {
         observation = observation.with_agent_name(agent_name);
+    }
+
+    if let Some(thread_source) = thread_source {
+        observation = observation.with_thread_source(thread_source);
     }
 
     if let Some(parent_session_id) = parent_session_id {
@@ -576,121 +813,97 @@ struct ThreadSummary {
     parent_session_id: Option<String>,
 }
 
-fn discover_threads_from_state_db(state_db: &Path, limit: usize) -> Option<Vec<ThreadSummary>> {
+fn discover_threads_from_state_db(state_db: &Path) -> Result<Vec<ThreadSummary>, String> {
     let query = format!(
-        "{} from threads where archived = 0 order by coalesce(updated_at_ms, updated_at * 1000) desc limit {};",
+        "{} {} where threads.archived = 0 and coalesce(threads.thread_source, '') <> 'subagent' and thread_spawn_edges.parent_thread_id is null order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc;",
         thread_summary_json_select(),
-        limit
+        thread_summary_from_clause()
     );
-    let Ok(output) = Command::new("sqlite3")
-        .arg("-batch")
-        .arg("-readonly")
-        .arg(state_db)
-        .arg(query)
-        .output()
-    else {
-        return None;
-    };
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let mut threads = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_thread_summary_json)
-        .collect::<Vec<_>>();
-    let session_ids = threads.iter().map(|thread| thread.id.clone()).collect::<Vec<_>>();
-    let parent_session_ids = discover_parent_session_ids_from_state_db(state_db, &session_ids);
-    for thread in &mut threads {
-        thread.parent_session_id = parent_session_ids.get(&thread.id).cloned();
-    }
-
-    Some(threads)
+    let legacy_query = format!(
+        "{} from threads where archived = 0 and coalesce(thread_source, '') <> 'subagent' order by coalesce(updated_at_ms, updated_at * 1000) desc;",
+        legacy_thread_summary_json_select()
+    );
+    discover_thread_summaries_from_state_db(state_db, query, legacy_query)
 }
 
 fn discover_thread_from_state_db_by_id(state_db: &Path, session_id: &str) -> Option<ThreadSummary> {
     let query = format!(
-        "{} from threads where id = '{}' limit 1;",
+        "{} {} where threads.id = '{}' limit 1;",
         thread_summary_json_select(),
+        thread_summary_from_clause(),
         sqlite_string_literal(session_id)
     );
-    let output = Command::new("sqlite3")
-        .arg("-batch")
-        .arg("-readonly")
-        .arg(state_db)
-        .arg(query)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let mut thread = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(parse_thread_summary_json)?;
-    let parent_session_ids = discover_parent_session_ids_from_state_db(
-        state_db,
-        std::slice::from_ref(&thread.id),
+    let legacy_query = format!(
+        "{} from threads where id = '{}' limit 1;",
+        legacy_thread_summary_json_select(),
+        sqlite_string_literal(session_id)
     );
-    thread.parent_session_id = parent_session_ids.get(&thread.id).cloned();
-    Some(thread)
+    discover_thread_summaries_from_state_db(state_db, query, legacy_query)
+        .ok()?
+        .into_iter()
+        .next()
 }
 
-fn discover_parent_session_ids_from_state_db(
+fn discover_thread_summaries_from_state_db(
     state_db: &Path,
-    child_session_ids: &[String],
-) -> HashMap<String, String> {
-    if child_session_ids.is_empty() {
-        return HashMap::new();
-    }
-
-    let child_session_ids = child_session_ids
-        .iter()
-        .map(|session_id| format!("'{}'", sqlite_string_literal(session_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "select json_object(
-        'child_thread_id', child_thread_id,
-        'parent_thread_id', parent_thread_id
-    ) from thread_spawn_edges
-    where child_thread_id in ({child_session_ids})
-      and parent_thread_id is not null;"
-    );
-    let Ok(output) = Command::new("sqlite3")
-        .arg("-batch")
-        .arg("-readonly")
-        .arg(state_db)
-        .arg(query)
-        .output()
-    else {
-        return HashMap::new();
+    query: String,
+    legacy_query: String,
+) -> Result<Vec<ThreadSummary>, String> {
+    let output = run_sqlite_readonly_query(state_db, query)?;
+    let output = if output.status.success() {
+        output
+    } else if incompatible_thread_spawn_edges_schema(&output) {
+        let output = run_sqlite_readonly_query(state_db, legacy_query)?;
+        if !output.status.success() {
+            return Err(sqlite_query_error(state_db, &output));
+        }
+        output
+    } else {
+        return Err(sqlite_query_error(state_db, &output));
     };
 
-    if !output.status.success() {
-        return HashMap::new();
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_parent_session_id_json)
-        .collect()
+    Ok(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(parse_thread_summary_json)
+            .collect(),
+    )
 }
 
-fn parse_parent_session_id_json(line: &str) -> Option<(String, String)> {
-    let value = serde_json::from_str::<Value>(line).ok()?;
-    let child_session_id = value.get("child_thread_id")?.as_str()?.trim();
-    let parent_session_id = value.get("parent_thread_id")?.as_str()?.trim();
-    if child_session_id.is_empty() || parent_session_id.is_empty() {
-        return None;
-    }
-
-    Some((child_session_id.to_string(), parent_session_id.to_string()))
+fn run_sqlite_readonly_query(state_db: &Path, query: String) -> Result<Output, String> {
+    Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-readonly")
+        .arg(state_db)
+        .arg(query)
+        .output()
+        .map_err(|error| format!("failed to run sqlite3 for {}: {error}", state_db.display()))
 }
 
-fn thread_summary_json_select() -> &'static str {
+fn sqlite_query_error(state_db: &Path, output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!(
+            "sqlite3 query for {} exited with {}",
+            state_db.display(),
+            output.status,
+        )
+    } else {
+        format!(
+            "sqlite3 query for {} exited with {}: {stderr}",
+            state_db.display(),
+            output.status,
+        )
+    }
+}
+
+fn incompatible_thread_spawn_edges_schema(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("no such table: thread_spawn_edges")
+        || stderr.contains("no such column: thread_spawn_edges.")
+}
+
+fn legacy_thread_summary_json_select() -> &'static str {
     "select json_object(
         'id', id,
         'rollout_path', rollout_path,
@@ -701,7 +914,30 @@ fn thread_summary_json_select() -> &'static str {
         'archived', archived,
         'agent_nickname', agent_nickname,
         'thread_source', thread_source,
-        'preview', preview
+        'preview', preview,
+        'parent_session_id', null
+    )"
+}
+
+fn thread_summary_from_clause() -> &'static str {
+    "from threads
+    left join thread_spawn_edges
+      on thread_spawn_edges.child_thread_id = threads.id"
+}
+
+fn thread_summary_json_select() -> &'static str {
+    "select json_object(
+        'id', threads.id,
+        'rollout_path', threads.rollout_path,
+        'updated_at_ms', threads.updated_at_ms,
+        'source', threads.source,
+        'cwd', threads.cwd,
+        'title', threads.title,
+        'archived', threads.archived,
+        'agent_nickname', threads.agent_nickname,
+        'thread_source', threads.thread_source,
+        'preview', threads.preview,
+        'parent_session_id', thread_spawn_edges.parent_thread_id
     )"
 }
 
@@ -733,6 +969,12 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
         .get("preview")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let parent_session_id = value
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
 
     Some(ThreadSummary {
         id,
@@ -745,7 +987,7 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
         agent_nickname,
         thread_source,
         preview,
-        parent_session_id: None,
+        parent_session_id,
     })
 }
 
@@ -884,7 +1126,10 @@ fn observation_from_thread(
         .with_workspace(thread.cwd)
         .with_jump_target(jump_target);
 
-    let thread_source = thread.thread_source.clone();
+    let jsonl_thread_source = jsonl_observation
+        .as_ref()
+        .and_then(|observation| observation.thread_source.clone());
+    let thread_source = effective_thread_source(thread.thread_source.clone(), jsonl_thread_source);
     if let Some(agent_name) = thread.agent_nickname.or(thread_source.clone()).or(Some(thread.source)) {
         observation = observation.with_agent_name(agent_name);
     }
@@ -1145,7 +1390,20 @@ fn parent_thread_id_from_session_meta(payload: &Value) -> Option<String> {
 
 fn session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    stem.rsplit('-').next().map(ToString::to_string)
+    let parts = stem.split('-').collect::<Vec<_>>();
+    parts
+        .iter()
+        .position(|part| part.starts_with("019"))
+        .map(|session_start| parts[session_start..].join("-"))
+        .or_else(|| stem.rsplit('-').next().map(ToString::to_string))
+}
+
+fn looks_like_codex_session_id(value: &str) -> bool {
+    value.len() >= 20
+        && value.contains('-')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
 }
 
 fn truncate_for_summary(value: &str, max_chars: usize) -> String {
@@ -1240,8 +1498,10 @@ mod tests {
     use crate::codex_source::{
         discover_codex_observation_by_id, discover_codex_observations_with_now,
         discover_codex_observations_with_state_db,
+        discover_codex_observation_snapshot_with_state_db_and_follow_up_window,
         discover_codex_observations_with_state_db_and_follow_up_window,
         discover_codex_observations_with_state_db_and_hooks,
+        ObservationSnapshotSource,
     };
     use crate::domain::session::{JumpTarget, ObservationKind};
 
@@ -1284,12 +1544,45 @@ mod tests {
     }
 
     #[test]
-    fn reads_parent_thread_id_from_subagent_session_metadata() {
+    fn records_jsonl_fallback_when_sqlite_thread_discovery_is_unavailable() {
+        let temp = tempdir().expect("temp dir");
+        let sessions_root = temp.path().join("sessions");
+        let session_dir = sessions_root.join("2026/06/03");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-03T10-00-00-019fallback.jsonl"),
+            r#"{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019fallback","cwd":"/Users/edy/project-a","originator":"Codex Desktop"}}
+{"timestamp":"2026-06-03T02:10:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}
+"#,
+        )
+        .expect("session file");
+
+        let state_db = temp.path().join("missing-state.sqlite");
+        let snapshot = discover_codex_observation_snapshot_with_state_db_and_follow_up_window(
+            &state_db,
+            &sessions_root,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_459_000),
+            Duration::from_secs(30 * 60),
+        );
+
+        assert!(matches!(
+            snapshot.source,
+            ObservationSnapshotSource::JsonlFallback { .. }
+        ));
+        assert_eq!(snapshot.observations.len(), 1);
+        assert_eq!(snapshot.observations[0].session_id, "019fallback");
+        assert_eq!(snapshot.observations[0].kind, ObservationKind::Running);
+    }
+
+    #[test]
+    fn parses_parent_thread_id_from_subagent_session_metadata() {
         let temp = tempdir().expect("temp dir");
         let session_dir = temp.path().join("2026/06/11");
         fs::create_dir_all(&session_dir).expect("session dir");
+        let child_path = session_dir.join("rollout-2026-06-11T17-00-00-019child.jsonl");
         fs::write(
-            session_dir.join("rollout-2026-06-11T17-00-00-019child.jsonl"),
+            &child_path,
             r#"{"timestamp":"2026-06-11T09:00:00.000Z","type":"session_meta","payload":{"id":"019child","parent_thread_id":"019parent","cwd":"/Users/edy/project-a","originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019parent","depth":1}}},"thread_source":"subagent"}}"#
                 .to_string()
                 + "\n"
@@ -1298,15 +1591,155 @@ mod tests {
         )
         .expect("session file");
 
+        let row = super::parse_session_file(
+            &child_path,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_168_000),
+        )
+        .expect("parse session file")
+        .expect("child observation");
+
+        assert_eq!(row.session_id, "019child");
+        assert_eq!(row.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(row.parent_session_id.as_deref(), Some("019parent"));
+    }
+
+    #[test]
+    fn parser_keeps_child_identity_when_rollout_embeds_parent_metadata() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/13");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let child_path = session_dir.join("rollout-2026-08-13T10-00-00-019child-embedded.jsonl");
+        fs::write(
+            &child_path,
+            r#"{"timestamp":"2026-08-13T02:00:00.000Z","type":"session_meta","payload":{"id":"019child-embedded","parent_thread_id":"019parent-embedded","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-13T02:01:00.000Z","type":"session_meta","payload":{"id":"019parent-embedded","cwd":"/Users/edy/project-parent","originator":"Codex Desktop"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-13T02:02:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child still working"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let row = super::parse_session_file(
+            &child_path,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_052_000),
+        )
+        .expect("parse session file")
+        .expect("child observation");
+
+        assert_eq!(row.session_id, "019child-embedded");
+        assert_eq!(
+            row.parent_session_id.as_deref(),
+            Some("019parent-embedded")
+        );
+    }
+
+    #[test]
+    fn jsonl_fallback_deduplicates_rollout_files_by_session_id_using_newest_observation() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/13");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let older_path = session_dir.join("rollout-2026-08-13T09-00-00-019duplicate.jsonl");
+        let newer_path = session_dir.join("rollout-2026-08-13T10-00-00-019duplicate.jsonl");
+
+        fs::write(
+            &older_path,
+            r#"{"timestamp":"2026-08-13T01:00:00.000Z","type":"session_meta","payload":{"id":"019duplicate","cwd":"/Users/edy/project-old","originator":"Codex Desktop"}}
+{"timestamp":"2026-08-13T01:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"older observation"}}
+"#,
+        )
+        .expect("older session file");
+        fs::write(
+            &newer_path,
+            r#"{"timestamp":"2026-08-13T02:00:00.000Z","type":"session_meta","payload":{"id":"019duplicate","cwd":"/Users/edy/project-new","originator":"Codex Desktop"}}
+{"timestamp":"2026-08-13T02:02:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"newer observation"}}
+"#,
+        )
+        .expect("newer session file");
+
+        fs::File::open(&older_path)
+            .expect("open older session file")
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_048_000),
+                ),
+            )
+            .expect("set older session file time");
+        fs::File::open(&newer_path)
+            .expect("open newer session file")
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_051_600),
+                ),
+            )
+            .expect("set newer session file time");
+
         let rows = discover_codex_observations_with_now(
             temp.path(),
             20,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_168_000),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_052_000),
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, "019child");
-        assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
+        assert_eq!(rows[0].session_id, "019duplicate");
+        assert_eq!(
+            rows[0].workspace_path.as_deref(),
+            Some("/Users/edy/project-new")
+        );
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-08-13T02:02:00.000Z")
+        );
+    }
+
+    #[test]
+    fn jsonl_fallback_keeps_a_parent_when_newer_orphan_subagents_exceed_the_limit() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/08/13");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let parent_path = session_dir.join("rollout-2026-08-13T09-00-00-019parent-fallback.jsonl");
+        let child_path = session_dir.join("rollout-2026-08-13T10-00-00-019orphan-child-fallback.jsonl");
+
+        fs::write(
+            &parent_path,
+            r#"{"timestamp":"2026-08-13T01:00:00.000Z","type":"session_meta","payload":{"id":"019parent-fallback","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","thread_source":"user"}}
+{"timestamp":"2026-08-13T01:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent working"}}
+"#,
+        )
+        .expect("parent session file");
+        fs::write(
+            &child_path,
+            r#"{"timestamp":"2026-08-13T02:00:00.000Z","type":"session_meta","payload":{"id":"019orphan-child-fallback","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}
+{"timestamp":"2026-08-13T02:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child working"}}
+"#,
+        )
+        .expect("child session file");
+        fs::File::open(&parent_path)
+            .expect("open parent session file")
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_048_000),
+                ),
+            )
+            .expect("set parent session file time");
+        fs::File::open(&child_path)
+            .expect("open child session file")
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_051_600),
+                ),
+            )
+            .expect("set child session file time");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_052_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "019parent-fallback");
     }
 
     #[test]
@@ -1864,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_subagent_thread_preserves_parent_session_id_from_jsonl() {
+    fn sqlite_subagent_thread_by_id_preserves_parent_session_id_from_jsonl() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let session_dir = temp.path().join("2026/06/17");
@@ -1890,6 +2323,203 @@ mod tests {
             .status()
             .expect("insert thread");
 
+        let row = discover_codex_observation_by_id(
+            &state_db,
+            "019child",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_692_000),
+        )
+        .expect("subagent observation");
+
+        assert_eq!(row.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(row.parent_session_id.as_deref(), Some("019parent"));
+    }
+
+    #[test]
+    fn sqlite_thread_discovery_keeps_a_parent_when_newer_subagents_exceed_the_limit() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019parent-capacity",
+            "/tmp/missing-parent-capacity.jsonl",
+            "/Users/edy/project-parent",
+            "Parent session",
+            1_781_692_000_000,
+        );
+
+        let child_ids = [
+            "019child-capacity-a",
+            "019child-capacity-b",
+            "019child-capacity-c",
+        ];
+        for (offset, child_id) in child_ids.iter().enumerate() {
+            insert_thread(
+                &state_db,
+                child_id,
+                &format!("/tmp/missing-{child_id}.jsonl"),
+                "/Users/edy/project-parent",
+                "Child session",
+                1_781_693_000_000 + offset as i64,
+            );
+        }
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(
+                "create table thread_spawn_edges (child_thread_id text primary key, parent_thread_id text not null);
+                 update threads set thread_source = 'subagent' where id like '019child-capacity-%';
+                 insert into thread_spawn_edges (child_thread_id, parent_thread_id) values
+                    ('019child-capacity-a', '019parent-capacity'),
+                    ('019child-capacity-b', '019parent-capacity'),
+                    ('019child-capacity-c', '019parent-capacity');",
+            )
+            .status()
+            .expect("create subagent edges");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_694_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "019parent-capacity");
+        assert_eq!(rows[0].thread_source.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn sqlite_thread_discovery_uses_spawn_edges_to_exclude_misclassified_children() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019parent-edge-capacity",
+            "/tmp/missing-parent-edge-capacity.jsonl",
+            "/Users/edy/project-parent",
+            "Parent session",
+            1_781_692_000_000,
+        );
+        insert_thread(
+            &state_db,
+            "019child-edge-capacity",
+            "/tmp/missing-child-edge-capacity.jsonl",
+            "/Users/edy/project-parent",
+            "Misclassified child session",
+            1_781_693_000_000,
+        );
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(
+                "create table thread_spawn_edges (child_thread_id text primary key, parent_thread_id text not null);
+                 insert into thread_spawn_edges (child_thread_id, parent_thread_id)
+                    values ('019child-edge-capacity', '019parent-edge-capacity');",
+            )
+            .status()
+            .expect("create child spawn edge");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_694_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "019parent-edge-capacity");
+    }
+
+    #[test]
+    fn sqlite_list_uses_jsonl_subagent_metadata_and_refills_the_limit() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/08/13");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let child_path = session_dir.join("rollout-2026-08-13T10-00-00-019child-jsonl-source.jsonl");
+        let parent_path = session_dir.join("rollout-2026-08-13T09-00-00-019parent-jsonl-source.jsonl");
+        fs::write(
+            &child_path,
+            r#"{"timestamp":"2026-08-13T02:00:00.000Z","type":"session_meta","payload":{"id":"019child-jsonl-source","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}
+{"timestamp":"2026-08-13T02:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child working"}}
+"#,
+        )
+        .expect("child session file");
+        fs::write(
+            &parent_path,
+            r#"{"timestamp":"2026-08-13T01:00:00.000Z","type":"session_meta","payload":{"id":"019parent-jsonl-source","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","thread_source":"user"}}
+{"timestamp":"2026-08-13T01:01:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent working"}}
+"#,
+        )
+        .expect("parent session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019child-jsonl-source",
+            child_path.to_string_lossy().as_ref(),
+            "/Users/edy/project-child",
+            "Child session",
+            1_786_051_600_000,
+        );
+        insert_thread(
+            &state_db,
+            "019parent-jsonl-source",
+            parent_path.to_string_lossy().as_ref(),
+            "/Users/edy/project-parent",
+            "Parent session",
+            1_786_048_000_000,
+        );
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_052_000),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "019parent-jsonl-source");
+    }
+
+    #[test]
+    fn state_db_thread_summary_reads_spawn_edge_in_the_same_statement() {
+        let from_clause = super::thread_summary_from_clause();
+        assert!(from_clause.contains("left join thread_spawn_edges"));
+        assert!(from_clause.contains("thread_spawn_edges.child_thread_id = threads.id"));
+
+        let select = super::thread_summary_json_select();
+        assert!(select.contains("'parent_session_id', thread_spawn_edges.parent_thread_id"));
+    }
+
+    #[test]
+    fn state_db_thread_summary_preserves_spawn_edge_parent_id() {
+        let thread = super::parse_thread_summary_json(
+            r#"{"id":"019child","rollout_path":"/tmp/019child.jsonl","updated_at_ms":1781691600000,"source":"vscode","cwd":"/Users/edy/hose/tmc/MOS","title":"Child task","archived":0,"agent_nickname":"Averroes","thread_source":"subagent","preview":"Child task","parent_session_id":"019parent"}"#,
+        )
+        .expect("parse thread summary");
+
+        assert_eq!(thread.parent_session_id.as_deref(), Some("019parent"));
+    }
+
+    #[test]
+    fn sqlite_threads_with_incompatible_spawn_edge_schema_keep_thread_summaries() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019legacy-edge-schema",
+            "/tmp/missing-legacy-edge-schema.jsonl",
+            "/Users/edy/project",
+            "Legacy edge schema",
+            1_781_691_600_000,
+        );
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg("create table thread_spawn_edges (child_thread_id text primary key);")
+            .status()
+            .expect("create incompatible spawn edge table");
+
         let rows = discover_codex_observations_with_state_db(
             &state_db,
             temp.path(),
@@ -1898,12 +2528,12 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].thread_source.as_deref(), Some("subagent"));
-        assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
+        assert_eq!(rows[0].session_id, "019legacy-edge-schema");
+        assert_eq!(rows[0].parent_session_id, None);
     }
 
     #[test]
-    fn sqlite_subagent_thread_uses_spawn_edge_when_tail_omits_session_metadata() {
+    fn sqlite_subagent_thread_by_id_uses_spawn_edge_when_tail_omits_session_metadata() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let session_dir = temp.path().join("2026/06/17");
@@ -1937,16 +2567,110 @@ mod tests {
             .status()
             .expect("create spawn edge");
 
+        let row = discover_codex_observation_by_id(
+            &state_db,
+            "019child",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_692_000),
+        )
+        .expect("subagent observation");
+
+        assert_eq!(row.kind, ObservationKind::Stopped);
+        assert_eq!(row.parent_session_id.as_deref(), Some("019parent"));
+    }
+
+    #[test]
+    fn sqlite_subagent_thread_by_id_reads_header_metadata_when_tail_omits_it() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/08/13");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-08-13T10-00-00-019child-header.jsonl");
+        let mut session_content = r#"{"timestamp":"2026-08-13T02:00:00.000Z","type":"session_meta","payload":{"id":"019child-header","parent_thread_id":"019parent-header","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}"#
+            .to_string();
+        session_content.push('\n');
+        session_content.push_str(&"x".repeat(super::SESSION_TAIL_READ_BYTES as usize + 1));
+        session_content.push('\n');
+        session_content.push_str(
+            r#"{"timestamp":"2026-08-13T02:20:00.000Z","type":"event_msg","payload":{"type":"turn_aborted"}}"#,
+        );
+        session_content.push('\n');
+        fs::write(&rollout_path, session_content).expect("session file");
+
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019child-header",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/project-child",
+            "Child task",
+            1_786_052_000_000,
+        );
+
+        let row = discover_codex_observation_by_id(
+            &state_db,
+            "019child-header",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_052_100),
+        )
+        .expect("subagent observation");
+
+        assert_eq!(row.kind, ObservationKind::Stopped);
+        assert_eq!(row.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(row.parent_session_id.as_deref(), Some("019parent-header"));
+    }
+
+    #[test]
+    fn sqlite_list_refills_after_header_only_subagent_metadata() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/08/13");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let child_path = session_dir.join("rollout-2026-08-13T10-00-00-019child-header-list.jsonl");
+        let parent_path = session_dir.join("rollout-2026-08-13T09-00-00-019parent-header-list.jsonl");
+        let mut child_content = r#"{"timestamp":"2026-08-13T02:00:00.000Z","type":"session_meta","payload":{"id":"019child-header-list","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}"#
+            .to_string();
+        child_content.push('\n');
+        child_content.push_str(&"x".repeat(super::SESSION_TAIL_READ_BYTES as usize + 1));
+        child_content.push('\n');
+        child_content.push_str(
+            r#"{"timestamp":"2026-08-13T02:20:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child working"}}"#,
+        );
+        child_content.push('\n');
+        fs::write(&child_path, child_content).expect("child session file");
+        fs::write(
+            &parent_path,
+            r#"{"timestamp":"2026-08-13T01:00:00.000Z","type":"session_meta","payload":{"id":"019parent-header-list","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","thread_source":"user"}}
+{"timestamp":"2026-08-13T01:20:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent working"}}
+"#,
+        )
+        .expect("parent session file");
+
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019child-header-list",
+            child_path.to_string_lossy().as_ref(),
+            "/Users/edy/project-child",
+            "Child task",
+            1_786_052_000_000,
+        );
+        insert_thread(
+            &state_db,
+            "019parent-header-list",
+            parent_path.to_string_lossy().as_ref(),
+            "/Users/edy/project-parent",
+            "Parent task",
+            1_786_048_000_000,
+        );
+
         let rows = discover_codex_observations_with_state_db(
             &state_db,
             temp.path(),
-            20,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_692_000),
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_052_100),
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, ObservationKind::Stopped);
-        assert_eq!(rows[0].parent_session_id.as_deref(), Some("019parent"));
+        assert_eq!(rows[0].session_id, "019parent-header-list");
     }
 
     #[test]
