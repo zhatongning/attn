@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { initialSessions } from "./fakeSessions";
-import { jumpToSession, loadSessions, loadSourceHealth } from "./inboxApi";
+import {
+  configurePanelShortcut,
+  jumpToSession,
+  loadSessions,
+  loadSourceHealth,
+} from "./inboxApi";
 
 const tauriCoreMock = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -72,5 +77,34 @@ describe("inboxApi", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/sessions");
     expect(tauriCoreMock.invoke).not.toHaveBeenCalled();
+  });
+
+  it("configures the panel shortcut through the desktop runtime", async () => {
+    enableTauriRuntime();
+    tauriCoreMock.invoke.mockResolvedValue({ activeShortcut: "shift+alt+super+space" });
+
+    await expect(configurePanelShortcut("shift+alt+super+space")).resolves.toEqual({
+      activeShortcut: "shift+alt+super+space",
+    });
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("configure_panel_shortcut", {
+      shortcut: "shift+alt+super+space",
+    });
+  });
+
+  it("returns the requested panel shortcut in preview mode without making a request", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(configurePanelShortcut(null)).resolves.toEqual({ activeShortcut: null });
+    expect(tauriCoreMock.invoke).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates a rejected desktop shortcut configuration unchanged", async () => {
+    enableTauriRuntime();
+    const error = new Error("shortcut registration failed");
+    tauriCoreMock.invoke.mockRejectedValueOnce(error);
+
+    await expect(configurePanelShortcut("control+alt+super+p")).rejects.toBe(error);
   });
 });

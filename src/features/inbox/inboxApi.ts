@@ -16,6 +16,10 @@ interface JumpResult {
   message: string;
 }
 
+export interface PanelShortcutUpdate {
+  activeShortcut: string | null;
+}
+
 function hasTauriRuntime() {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -42,6 +46,11 @@ export async function loadSourceHealth(): Promise<SourceHealth> {
   }
 
   return invoke<SourceHealth>("source_health");
+}
+
+export async function configurePanelShortcut(shortcut: string | null): Promise<PanelShortcutUpdate> {
+  if (!hasTauriRuntime()) return { activeShortcut: shortcut };
+  return invoke<PanelShortcutUpdate>("configure_panel_shortcut", { shortcut });
 }
 
 export async function loadCodexHookIntegrationStatus(): Promise<CodexHookIntegrationStatus> {
