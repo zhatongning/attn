@@ -72,6 +72,8 @@ describe("buildStatusPanelModel", () => {
     expect(english.restorePanelShortcutLabel).toBe("Restore default");
     expect(english.disabledPanelShortcutLabel).toBe("Disabled");
     expect(english.panelShortcutRegistrationErrorLabel).toBe("That shortcut could not be registered.");
+    expect(english.currentActivePanelShortcutLabel).toBe("Currently active");
+    expect(english.panelShortcutRestartRequiredLabel).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
 
     const chinese = buildStatusPanelModel([], { ...defaultStatusPanelConfig, language: "zh" }).copy;
     expect(chinese.panelToggleShortcutLabel).toBe("面板快捷键");
@@ -81,6 +83,8 @@ describe("buildStatusPanelModel", () => {
     expect(chinese.restorePanelShortcutLabel).toBe("恢复默认");
     expect(chinese.disabledPanelShortcutLabel).toBe("已禁用");
     expect(chinese.panelShortcutRegistrationErrorLabel).toBe("无法注册该快捷键。");
+    expect(chinese.currentActivePanelShortcutLabel).toBe("当前生效");
+    expect(chinese.panelShortcutRestartRequiredLabel).toBe("快捷键状态不确定。请重启 Attn 后再设置快捷键。");
   });
 
   it("uses the configured visible item count from management settings", () => {

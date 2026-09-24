@@ -19,14 +19,17 @@ expand the separate list of hidden session rows.
 - Settings provide record, clear (disable), and restore-default actions.
 - When Attn is visible, a shortcut press toggles the existing `panelOpen` state,
   cancels any pending automatic collapse, and lets the existing React resize
-  effect choose the window height.
+  effect choose the window height. If Settings is open, it stays open and keeps
+  its draft; Back reveals the newly toggled panel state.
 - When Attn is hidden, the native handler shows the window and asks React to
   expand it. It must not focus or activate Attn, so the user's current app is
   not interrupted.
 - A key press produces one toggle. The release event is ignored.
 - A registration conflict never silently substitutes another shortcut. The
-  previous working shortcut remains active when possible, and the settings
-  view reports that the requested shortcut could not be registered.
+  saved requested shortcut remains unchanged; Settings reports the known
+  currently active shortcut (including Disabled) separately from the request.
+- If native unregistration fails, the active state is uncertain for the rest
+  of the process. Settings requires a restart and does not claim an active key.
 - Setting `clear` disables the global shortcut. Missing shortcut data in an
   older local-storage record normalizes to the default.
 
@@ -46,8 +49,9 @@ local-storage record remains the source of persistence; `normalizeConfig`
 supplies the default for missing or malformed values.
 
 The settings UI owns a short recording state. While recording, it captures
-`KeyboardEvent.code` plus the active modifiers, rejects modifier-only or
-modifier-free combinations, prevents the browser default, and lets Escape
+`KeyboardEvent.code` plus the active modifiers, requires at least one of Alt,
+Control, or Command (Shift may supplement), supports only F1-F20, prevents
+the browser default, and lets Escape
 cancel without changing the saved value. The recorder converts the result to
 the canonical accelerator string and separately renders a user-facing label.
 The recorder is not active while ordinary text/select controls are being used.
@@ -56,7 +60,7 @@ The recorder is not active while ordinary text/select controls are being used.
 
 Add the Tauri global-shortcut Rust plugin at the same major/minor line as the
 existing Tauri 2.0 dependencies. The Rust side owns one registered shortcut
-and a mutex-protected record of the currently active canonical value.
+and a mutex-protected `Known(active)` or `Uncertain` registration state.
 
 At application setup, register the default on a best-effort basis so the
 shortcut is available as soon as the desktop process starts. A registration
@@ -70,13 +74,19 @@ The command accepts `Option<String>` and applies an update transactionally:
 1. Validate and parse the requested accelerator.
 2. If it is unchanged, return success without touching the registration.
 3. Register a new value before removing the old value.
-4. If removing the old value fails, unregister the new value and retain the
-   old state.
-5. For `None`, unregister the old value and leave the manager empty.
+4. If removing the old value fails, mark state `Uncertain`, attempt to
+   unregister the new value, and reject all subsequent configuration calls
+   until process restart. The pinned macOS registrar removes its internal
+   pointer before reporting an unregister failure, so the old value cannot
+   be claimed as active.
+5. For `None`, unregister the old value and leave the manager empty only on
+   success; failure likewise marks state `Uncertain`.
 
-The command returns a small success/error result that the frontend can map to
-stable localized messages; raw platform error text is not part of the UI
-contract.
+The command returns the active shortcut on success. On failure it serializes
+`{ code, activeShortcut, stateUncertain }` while holding the state lock. Codes
+are `invalid_shortcut`, `registration_failed`, `registration_uncertain`, and
+`rollback_failed`; an uncertain state has `activeShortcut: null`. Raw platform
+error text is not part of the UI contract.
 
 The plugin handler responds only to `Pressed`. It checks whether the main
 window was visible, calls `show()` when it was hidden, and emits
@@ -106,9 +116,14 @@ panel state.
 
 Applying Settings first attempts the native shortcut update. A failed update
 does not discard other valid display settings, but the saved shortcut field
-stays at the last successfully registered value and the error remains visible
-until the next successful apply or dismissal. Applying a clear operation is
-treated as a successful update only after the old registration is removed.
+stays at the prior requested value and the attempted draft remains available.
+Startup reconciliation failure also leaves the persisted requested value
+intact. Settings compares the request or draft with the known native active
+value and displays that value explicitly when different. Dismissing an alert
+does not erase this status. If native state is uncertain, Settings shows a
+localized restart-required status instead. Successful registration clears
+the mismatch and alert. Applying a clear operation succeeds only after the
+old registration is removed.
 
 ## Failure and compatibility rules
 
@@ -117,6 +132,8 @@ treated as a successful update only after the old registration is removed.
   behavior with mocks.
 - Invalid persisted values normalize to the default; an explicit `null`
   remains disabled.
+- Shift-only accelerators and F21-F24 are invalid in persisted data, the
+  recorder, and the native command; malformed persisted values use the default.
 - A shortcut already owned by macOS or another application is reported as a
   registration failure. The app does not probe or alter other applications'
   shortcuts.
@@ -143,8 +160,12 @@ Add focused coverage for:
    panel without calling `set_focus`.
 5. Event listeners and pending registration work are cleaned up on unmount.
 6. Rust helper/command tests cover parser rejection, register-before-unregister
-   ordering, rollback after an unregister failure, and the `Pressed`-only
-   handler rule.
+   ordering, poisoning and rollback attempts after an unregister failure,
+   structured error snapshots, and the `Pressed`-only handler rule.
+7. Startup and Apply conflicts show requested versus known active values;
+   dismissal preserves a mismatch or restart status, and success clears it.
+8. A visible shortcut in Settings keeps its draft and view, while Back reveals
+   the toggled underlying panel state.
 
 Run the focused frontend tests, the full frontend suite, Rust tests, the
 production build, and `git diff --check`. Do not rebuild or replace the

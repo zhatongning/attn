@@ -625,7 +625,8 @@ p {
 }
 
 .shortcut-settings__recording,
-.shortcut-settings__error {
+.shortcut-settings__error,
+.shortcut-settings__active {
   font-size: 11px;
   line-height: 1.25;
 }
@@ -636,6 +637,10 @@ p {
 
 .shortcut-settings__error {
   color: #e06c75;
+}
+
+.shortcut-settings__active {
+  color: #abb2bf;
 }
 
 .status-color-settings {

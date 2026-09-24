@@ -28,13 +28,13 @@ describe("panel shortcut contract", () => {
       status: "captured",
       value: "alt+7",
     });
-    expect(capturePanelShortcut(event("F12", { metaKey: true }))).toEqual({
+    expect(capturePanelShortcut(event("F20", { metaKey: true }))).toEqual({
       status: "captured",
-      value: "super+f12",
+      value: "super+f20",
     });
-    expect(capturePanelShortcut(event("ArrowLeft", { shiftKey: true }))).toEqual({
+    expect(capturePanelShortcut(event("ArrowLeft", { shiftKey: true, altKey: true }))).toEqual({
       status: "captured",
-      value: "shift+left",
+      value: "shift+alt+left",
     });
   });
 
@@ -42,6 +42,8 @@ describe("panel shortcut contract", () => {
     expect(capturePanelShortcut(event("Escape"))).toEqual({ status: "cancelled" });
     expect(capturePanelShortcut(event("ShiftLeft", { shiftKey: true }))).toEqual({ status: "ignored" });
     expect(capturePanelShortcut(event("KeyA"))).toEqual({ status: "ignored" });
+    expect(capturePanelShortcut(event("KeyA", { shiftKey: true }))).toEqual({ status: "ignored" });
+    expect(capturePanelShortcut(event("F21", { metaKey: true }))).toEqual({ status: "ignored" });
     expect(capturePanelShortcut(event("Unknown", { altKey: true }))).toEqual({ status: "ignored" });
     expect(capturePanelShortcut(event("KeyA", { altKey: true, repeat: true }))).toEqual({ status: "ignored" });
   });
@@ -54,6 +56,9 @@ describe("panel shortcut contract", () => {
     expect(normalizePanelToggleShortcut(null)).toBeNull();
     expect(normalizePanelToggleShortcut("ALT+CONTROL+SUPER+P")).toBe("control+alt+super+p");
     expect(normalizePanelToggleShortcut("space")).toBe(DEFAULT_PANEL_TOGGLE_SHORTCUT);
+    expect(normalizePanelToggleShortcut("shift+a")).toBe(DEFAULT_PANEL_TOGGLE_SHORTCUT);
+    expect(normalizePanelToggleShortcut("super+f20")).toBe("super+f20");
+    expect(normalizePanelToggleShortcut("super+f21")).toBe(DEFAULT_PANEL_TOGGLE_SHORTCUT);
   });
 
   it("formats canonical accelerators for display", () => {

@@ -813,6 +813,7 @@ describe("StatusPanelView", () => {
     const ignoredModifier = new KeyboardEvent("keydown", { code: "ShiftLeft", key: "Shift", shiftKey: true, cancelable: true });
     window.dispatchEvent(ignoredModifier);
     expect(ignoredModifier.defaultPrevented).toBe(true);
+    fireEvent.keyDown(window, { code: "KeyA", key: "A", shiftKey: true });
     fireEvent.keyDown(window, { code: "KeyP", key: "p", metaKey: true, repeat: true });
     const editableKey = new KeyboardEvent("keydown", { code: "KeyP", key: "p", metaKey: true, cancelable: true, bubbles: true });
     screen.getByLabelText("Language").dispatchEvent(editableKey);
@@ -843,13 +844,17 @@ describe("StatusPanelView", () => {
     let conflict = true;
     tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
       if (command === "configure_panel_shortcut") {
-        if (args?.shortcut === "alt+super+p" && conflict) throw "registration_failed";
+        if (args?.shortcut === "alt+super+p" && conflict) throw {
+          code: "registration_failed",
+          activeShortcut: "shift+alt+super+space",
+          stateUncertain: false,
+        };
         return { activeShortcut: args?.shortcut ?? null };
       }
       if (command === "list_sessions") return initialSessions;
       return null;
     });
-    await renderShortcutSettings();
+    const openSettings = await renderShortcutSettings();
 
     fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
     fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
@@ -858,6 +863,7 @@ describe("StatusPanelView", () => {
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("无法注册该快捷键。"));
     expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value).toBe("Option-Command-P");
+    expect(screen.getByRole("status").textContent).toBe("当前生效: Option-Shift-Command-Space");
     expect(readPersistedConfig()).toMatchObject({ language: "zh", panelToggleShortcut: "shift+alt+super+space" });
     expect(screen.getByRole("main").className).toContain("management-shell");
 
@@ -866,6 +872,8 @@ describe("StatusPanelView", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     expect(readPersistedConfig()).toMatchObject({ language: "zh", panelToggleShortcut: "alt+super+p" });
     expect(screen.getByRole("main").className).not.toContain("management-shell");
+    await openSettings();
+    expect(screen.queryByText(/当前生效:/)).toBeNull();
   });
 
   it.each([
@@ -890,20 +898,52 @@ describe("StatusPanelView", () => {
     expect(readPersistedConfig().panelToggleShortcut).toBe(activeShortcut);
   });
 
-  it("remembers startup registration failure until Settings is dismissed", async () => {
+  it.each([
+    ["shift+alt+super+space", "Option-Shift-Command-Space"],
+    [null, "Disabled"],
+  ])("keeps a saved custom shortcut after startup conflict with %s active", async (activeShortcut, activeLabel) => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelToggleShortcut: "alt+super+p" }));
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     tauriCoreMock.invoke.mockImplementation(async (command: string) => {
-      if (command === "configure_panel_shortcut") throw "registration_failed";
+      if (command === "configure_panel_shortcut") throw {
+        code: "registration_failed",
+        activeShortcut,
+        stateUncertain: false,
+      };
       if (command === "list_sessions") return initialSessions;
       return null;
     });
     const openSettings = await renderShortcutSettings();
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("That shortcut could not be registered."));
-    expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value).toBe("Option-Command-P");
+    expect(screen.getByRole("status").textContent).toBe(`Currently active: ${activeLabel}`);
+    expect(readPersistedConfig().panelToggleShortcut).toBe("alt+super+p");
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await openSettings();
     expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status").textContent).toBe(`Currently active: ${activeLabel}`);
+  });
+
+  it("keeps restart-required status after an uncertain native failure is dismissed", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "configure_panel_shortcut") throw {
+        code: "registration_uncertain",
+        activeShortcut: null,
+        stateUncertain: true,
+      };
+      if (command === "list_sessions") return initialSessions;
+      return null;
+    });
+    const openSettings = await renderShortcutSettings();
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByRole("status").textContent).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await openSettings();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status").textContent).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
   });
 
   it("continues shortcut settings Apply after a startup conflict without a stale alert", async () => {
@@ -1016,7 +1056,7 @@ describe("StatusPanelView", () => {
 
   it("discards a pending failed shortcut draft after document visibility dismissal", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
-    let rejectUpdate: ((reason: string) => void) | undefined;
+    let rejectUpdate: ((reason: unknown) => void) | undefined;
     const update = new Promise<never>((_resolve, reject) => { rejectUpdate = reject; });
     tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
       if (command === "configure_panel_shortcut") {
@@ -1034,7 +1074,11 @@ describe("StatusPanelView", () => {
     vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
     fireEvent(document, new Event("visibilitychange"));
     expect(screen.getByRole("main").className).not.toContain("management-shell");
-    await act(async () => rejectUpdate?.("registration_failed"));
+    await act(async () => rejectUpdate?.({
+      code: "registration_failed",
+      activeShortcut: "shift+alt+super+space",
+      stateUncertain: false,
+    }));
     await waitFor(() => expect(readPersistedConfig()).toMatchObject({
       language: "zh",
       panelToggleShortcut: "shift+alt+super+space",
@@ -1090,7 +1134,7 @@ describe("StatusPanelView", () => {
 
   it("keeps a dismissed shortcut settings failure quiet while retaining the requested draft", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
-    let rejectUpdate: ((reason: string) => void) | undefined;
+    let rejectUpdate: ((reason: unknown) => void) | undefined;
     const update = new Promise<never>((_resolve, reject) => { rejectUpdate = reject; });
     tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
       if (command === "configure_panel_shortcut") {
@@ -1116,7 +1160,11 @@ describe("StatusPanelView", () => {
 
     await act(async () => togglePanel?.({ payload: true }));
     expect(screen.getByRole("main").className).not.toContain("management-shell");
-    await act(async () => rejectUpdate?.("registration_failed"));
+    await act(async () => rejectUpdate?.({
+      code: "registration_failed",
+      activeShortcut: "shift+alt+super+space",
+      stateUncertain: false,
+    }));
     await waitFor(() => expect(readPersistedConfig()).toMatchObject({
       language: "zh",
       panelToggleShortcut: "shift+alt+super+space",
@@ -1125,6 +1173,7 @@ describe("StatusPanelView", () => {
     await act(async () => openManagement?.({ payload: "management" }));
     expect(screen.queryByRole("alert")).toBeNull();
     expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value).toBe("Option-Command-P");
+    expect(screen.getByRole("status").textContent).toBe("当前生效: Option-Shift-Command-Space");
   });
 
   it("normalizes failed shortcut settings drafts and refreshes with the committed follow-up threshold", async () => {
@@ -1338,6 +1387,29 @@ describe("StatusPanelView", () => {
       toggleHandler?.({ payload: false });
     });
     expect(document.querySelector(".panel-shell--collapsed")).not.toBeNull();
+  });
+
+  it("keeps Settings and its draft open while a visible shortcut toggles the underlying panel", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let menuHandler: ((event: { payload: string }) => void) | undefined;
+    let toggleHandler: ((event: { payload: boolean }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") menuHandler = callback as typeof menuHandler;
+      if (event === "agent-session-inbox://toggle-panel") toggleHandler = callback as typeof toggleHandler;
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await act(async () => menuHandler?.({ payload: "management" }));
+    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+
+    await act(async () => toggleHandler?.({ payload: false }));
+    expect(screen.getByRole("main").className).toContain("management-shell");
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value).toBe("Option-Command-P");
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(document.querySelector(".panel-shell--collapsed")).toBeNull();
   });
 
   it("restores the expanded panel from management when the shortcut reveals a hidden window", async () => {

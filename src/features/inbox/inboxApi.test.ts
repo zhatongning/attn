@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { initialSessions } from "./fakeSessions";
 import {
+  PanelShortcutConfigureError,
   configurePanelShortcut,
   jumpToSession,
   loadSessions,
@@ -106,5 +107,39 @@ describe("inboxApi", () => {
     tauriCoreMock.invoke.mockRejectedValueOnce(error);
 
     await expect(configurePanelShortcut("control+alt+super+p")).rejects.toBe(error);
+  });
+
+  it("normalizes a structured native shortcut rejection without losing the active snapshot", async () => {
+    enableTauriRuntime();
+    tauriCoreMock.invoke.mockRejectedValueOnce({
+      code: "registration_failed",
+      activeShortcut: "shift+alt+super+space",
+      stateUncertain: false,
+    });
+
+    await expect(configurePanelShortcut("control+alt+super+p")).rejects.toMatchObject({
+      code: "registration_failed",
+      activeShortcut: "shift+alt+super+space",
+      stateUncertain: false,
+    });
+  });
+
+  it("preserves uncertain native status and leaves malformed or legacy rejections untouched", async () => {
+    enableTauriRuntime();
+    const uncertain = { code: "rollback_failed", activeShortcut: null, stateUncertain: true };
+    tauriCoreMock.invoke.mockRejectedValueOnce(uncertain);
+    try {
+      await configurePanelShortcut(null);
+      throw new Error("expected a rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PanelShortcutConfigureError);
+      expect(error).toMatchObject(uncertain);
+    }
+
+    const malformed = { code: "registration_failed", activeShortcut: 7, stateUncertain: false };
+    tauriCoreMock.invoke.mockRejectedValueOnce(malformed);
+    await expect(configurePanelShortcut(null)).rejects.toBe(malformed);
+    tauriCoreMock.invoke.mockRejectedValueOnce("registration_failed");
+    await expect(configurePanelShortcut(null)).rejects.toBe("registration_failed");
   });
 });

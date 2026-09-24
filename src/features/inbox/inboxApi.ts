@@ -20,6 +20,41 @@ export interface PanelShortcutUpdate {
   activeShortcut: string | null;
 }
 
+export type PanelShortcutErrorCode =
+  | "invalid_shortcut"
+  | "registration_failed"
+  | "rollback_failed"
+  | "registration_uncertain";
+
+export class PanelShortcutConfigureError extends Error {
+  constructor(
+    readonly code: PanelShortcutErrorCode,
+    readonly activeShortcut: string | null,
+    readonly stateUncertain: boolean,
+  ) {
+    super(code);
+    this.name = "PanelShortcutConfigureError";
+  }
+}
+
+function normalizePanelShortcutError(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  const error = value as Record<string, unknown>;
+  if (
+    typeof error.code !== "string"
+    || !["invalid_shortcut", "registration_failed", "rollback_failed", "registration_uncertain"].includes(error.code)
+    || (error.activeShortcut !== null && typeof error.activeShortcut !== "string")
+    || typeof error.stateUncertain !== "boolean"
+    || (error.stateUncertain && error.activeShortcut !== null)
+    || (["rollback_failed", "registration_uncertain"].includes(error.code) !== error.stateUncertain)
+  ) return value;
+  return new PanelShortcutConfigureError(
+    error.code as PanelShortcutErrorCode,
+    error.activeShortcut,
+    error.stateUncertain,
+  );
+}
+
 function hasTauriRuntime() {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -50,7 +85,11 @@ export async function loadSourceHealth(): Promise<SourceHealth> {
 
 export async function configurePanelShortcut(shortcut: string | null): Promise<PanelShortcutUpdate> {
   if (!hasTauriRuntime()) return { activeShortcut: shortcut };
-  return invoke<PanelShortcutUpdate>("configure_panel_shortcut", { shortcut });
+  try {
+    return await invoke<PanelShortcutUpdate>("configure_panel_shortcut", { shortcut });
+  } catch (error) {
+    throw normalizePanelShortcutError(error);
+  }
 }
 
 export async function loadCodexHookIntegrationStatus(): Promise<CodexHookIntegrationStatus> {

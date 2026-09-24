@@ -59,6 +59,8 @@ export interface StatusPanelCopy {
   restorePanelShortcutLabel: string;
   disabledPanelShortcutLabel: string;
   panelShortcutRegistrationErrorLabel: string;
+  currentActivePanelShortcutLabel: string;
+  panelShortcutRestartRequiredLabel: string;
   alertsLabel: string;
   workingLabel: string;
   hiddenAlertsLabel: string;
@@ -231,6 +233,8 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     restorePanelShortcutLabel: "Restore default",
     disabledPanelShortcutLabel: "Disabled",
     panelShortcutRegistrationErrorLabel: "That shortcut could not be registered.",
+    currentActivePanelShortcutLabel: "Currently active",
+    panelShortcutRestartRequiredLabel: "Shortcut state is uncertain. Restart Attn to restore shortcut settings.",
     alertsLabel: "alerts",
     workingLabel: "running",
     hiddenAlertsLabel: "alerts",
@@ -322,6 +326,8 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     restorePanelShortcutLabel: "恢复默认",
     disabledPanelShortcutLabel: "已禁用",
     panelShortcutRegistrationErrorLabel: "无法注册该快捷键。",
+    currentActivePanelShortcutLabel: "当前生效",
+    panelShortcutRestartRequiredLabel: "快捷键状态不确定。请重启 Attn 后再设置快捷键。",
     alertsLabel: "需关注",
     workingLabel: "进行中",
     hiddenAlertsLabel: "需关注",

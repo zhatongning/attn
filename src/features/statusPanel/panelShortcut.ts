@@ -63,7 +63,7 @@ export function capturePanelShortcut(event: PanelShortcutKeyboardEvent): PanelSh
     if (modifier === "alt") return event.altKey;
     return event.metaKey;
   });
-  if (modifiers.length === 0) return { status: "ignored" };
+  if (!event.altKey && !event.ctrlKey && !event.metaKey) return { status: "ignored" };
 
   return { status: "captured", value: [...modifiers, key].join("+") };
 }
@@ -94,7 +94,7 @@ export function formatPanelShortcut(value: string | null): string {
 function keyNameForCode(code: string): string | null {
   if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
   if (/^Digit[0-9]$/.test(code)) return code.slice(5);
-  if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(code)) return code.toLowerCase();
+  if (/^F(?:[1-9]|1[0-9]|20)$/.test(code)) return code.toLowerCase();
   if (code === "Space") return "space";
   return navigationKeys[code] ?? null;
 }
@@ -111,6 +111,7 @@ function normalizeShortcutString(value: string): string | null {
     return null;
   }
   if (new Set(modifiers).size !== modifiers.length) return null;
+  if (!modifiers.some((modifier) => modifier === "alt" || modifier === "control" || modifier === "super")) return null;
 
   const orderedModifiers = canonicalModifiers.filter((modifier) => modifiers.includes(modifier));
   return [...orderedModifiers, key].join("+");
@@ -119,7 +120,7 @@ function normalizeShortcutString(value: string): string | null {
 function isShortcutKey(value: string): boolean {
   return /^[a-z]$/.test(value)
     || /^[0-9]$/.test(value)
-    || /^f(?:[1-9]|1[0-9]|2[0-4])$/.test(value)
+    || /^f(?:[1-9]|1[0-9]|20)$/.test(value)
     || [
       "space",
       "down",

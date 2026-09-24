@@ -16,7 +16,19 @@ pub const TOGGLE_PANEL_EVENT: &str = "agent-session-inbox://toggle-panel";
 
 #[derive(Default)]
 pub struct PanelShortcutState {
-    pub active: Mutex<Option<String>>,
+    active: Mutex<ShortcutRegistrationState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShortcutRegistrationState {
+    Known(Option<String>),
+    Uncertain,
+}
+
+impl Default for ShortcutRegistrationState {
+    fn default() -> Self {
+        Self::Known(None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,18 +39,45 @@ pub struct PanelShortcutUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PanelShortcutError {
+pub enum PanelShortcutErrorCode {
     InvalidShortcut,
     RegistrationFailed,
     RollbackFailed,
+    RegistrationUncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelShortcutError {
+    code: PanelShortcutErrorCode,
+    active_shortcut: Option<String>,
+    state_uncertain: bool,
+}
+
+impl PanelShortcutError {
+    fn from_state(code: PanelShortcutErrorCode, state: &ShortcutRegistrationState) -> Self {
+        match state {
+            ShortcutRegistrationState::Known(active_shortcut) => Self {
+                code,
+                active_shortcut: active_shortcut.clone(),
+                state_uncertain: false,
+            },
+            ShortcutRegistrationState::Uncertain => Self {
+                code,
+                active_shortcut: None,
+                state_uncertain: true,
+            },
+        }
+    }
 }
 
 impl Display for PanelShortcutError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidShortcut => "invalid_shortcut",
-            Self::RegistrationFailed => "registration_failed",
-            Self::RollbackFailed => "rollback_failed",
+        formatter.write_str(match self.code {
+            PanelShortcutErrorCode::InvalidShortcut => "invalid_shortcut",
+            PanelShortcutErrorCode::RegistrationFailed => "registration_failed",
+            PanelShortcutErrorCode::RollbackFailed => "rollback_failed",
+            PanelShortcutErrorCode::RegistrationUncertain => "registration_uncertain",
         })
     }
 }
@@ -94,15 +133,48 @@ pub fn register_default<R: Runtime>(app: &AppHandle<R>) -> Result<(), PanelShort
     update_native_shortcut(app, state.inner(), Some(DEFAULT_PANEL_SHORTCUT)).map(|_| ())
 }
 
-pub fn canonicalize_shortcut(value: &str) -> Result<String, PanelShortcutError> {
+pub fn canonicalize_shortcut(value: &str) -> Result<String, PanelShortcutErrorCode> {
     let shortcut = Shortcut::from_str(value)
         .map(|shortcut| canonicalize_native_shortcut(shortcut.into_string()))
-        .map_err(|_| PanelShortcutError::InvalidShortcut)?;
+        .map_err(|_| PanelShortcutErrorCode::InvalidShortcut)?;
 
-    shortcut
-        .contains('+')
-        .then_some(shortcut)
-        .ok_or(PanelShortcutError::InvalidShortcut)
+    let parts = shortcut.split('+').collect::<Vec<_>>();
+    let Some(key) = parts.last() else {
+        return Err(PanelShortcutErrorCode::InvalidShortcut);
+    };
+    let modifiers = &parts[..parts.len() - 1];
+    let primary_modifier = modifiers
+        .iter()
+        .any(|modifier| matches!(*modifier, "alt" | "control" | "super"));
+    let supported_key = (key.len() == 1
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()))
+        || key
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u8>().ok().map(|value| (number, value)))
+            .is_some_and(|(number, value)| (1..=20).contains(&value) && number == value.to_string())
+        || matches!(
+            *key,
+            "space"
+                | "down"
+                | "left"
+                | "right"
+                | "up"
+                | "backspace"
+                | "delete"
+                | "end"
+                | "enter"
+                | "home"
+                | "insert"
+                | "pagedown"
+                | "pageup"
+                | "tab"
+        );
+    if !primary_modifier || !supported_key {
+        return Err(PanelShortcutErrorCode::InvalidShortcut);
+    }
+    Ok(shortcut)
 }
 
 fn canonicalize_native_shortcut(value: String) -> String {
@@ -119,46 +191,65 @@ fn canonicalize_native_shortcut(value: String) -> String {
     parts.join("+")
 }
 
-pub fn apply_shortcut_update(
-    active: &mut Option<String>,
+fn apply_shortcut_update(
+    active: &mut ShortcutRegistrationState,
     requested: Option<&str>,
     registrar: &mut impl ShortcutRegistrar,
 ) -> Result<Option<String>, PanelShortcutError> {
-    let requested = requested.map(canonicalize_shortcut).transpose()?;
+    let previous = match active {
+        ShortcutRegistrationState::Known(previous) => previous.clone(),
+        ShortcutRegistrationState::Uncertain => {
+            return Err(PanelShortcutError::from_state(
+                PanelShortcutErrorCode::RegistrationUncertain,
+                active,
+            ));
+        }
+    };
+    let requested = requested
+        .map(canonicalize_shortcut)
+        .transpose()
+        .map_err(|code| PanelShortcutError::from_state(code, active))?;
 
-    if *active == requested {
-        return Ok(active.clone());
+    if previous == requested {
+        return Ok(previous);
     }
 
-    match requested {
+    match requested.as_deref() {
         Some(next) => {
-            registrar
-                .register(&next)
-                .map_err(|_| PanelShortcutError::RegistrationFailed)?;
+            if registrar.register(next).is_err() {
+                return Err(PanelShortcutError::from_state(
+                    PanelShortcutErrorCode::RegistrationFailed,
+                    active,
+                ));
+            }
 
-            if let Some(previous) = active.as_deref() {
+            if let Some(previous) = previous.as_deref() {
                 if registrar.unregister(previous).is_err() {
-                    return if registrar.unregister(&next).is_ok() {
-                        Err(PanelShortcutError::RegistrationFailed)
+                    *active = ShortcutRegistrationState::Uncertain;
+                    let code = if registrar.unregister(next).is_ok() {
+                        PanelShortcutErrorCode::RegistrationUncertain
                     } else {
-                        Err(PanelShortcutError::RollbackFailed)
+                        PanelShortcutErrorCode::RollbackFailed
                     };
+                    return Err(PanelShortcutError::from_state(code, active));
                 }
             }
-
-            *active = Some(next);
         }
         None => {
-            if let Some(previous) = active.as_deref() {
-                registrar
-                    .unregister(previous)
-                    .map_err(|_| PanelShortcutError::RegistrationFailed)?;
-                *active = None;
+            if let Some(previous) = previous.as_deref() {
+                if registrar.unregister(previous).is_err() {
+                    *active = ShortcutRegistrationState::Uncertain;
+                    return Err(PanelShortcutError::from_state(
+                        PanelShortcutErrorCode::RegistrationUncertain,
+                        active,
+                    ));
+                }
             }
         }
     }
 
-    Ok(active.clone())
+    *active = ShortcutRegistrationState::Known(requested.clone());
+    Ok(requested)
 }
 
 pub fn is_pressed(state: ShortcutState) -> bool {
@@ -263,7 +354,8 @@ mod tests {
     use super::reveal_plan;
     use super::{
         apply_shortcut_update, canonicalize_shortcut, handle_shortcut_event, is_pressed,
-        PanelShortcutError, PanelShortcutUpdate, ShortcutRegistrar,
+        PanelShortcutError, PanelShortcutErrorCode, PanelShortcutUpdate, ShortcutRegistrar,
+        ShortcutRegistrationState,
     };
     use tauri_plugin_global_shortcut::ShortcutState;
 
@@ -295,32 +387,61 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_native_shortcuts_and_rejects_modifier_only_values() {
+    fn canonicalizes_native_shortcuts_and_rejects_unsafe_values() {
         assert_eq!(
             canonicalize_shortcut("ALT+SHIFT+SUPER+SPACE").unwrap(),
             "shift+alt+super+space"
         );
         assert_eq!(
             canonicalize_shortcut("space").unwrap_err(),
-            PanelShortcutError::InvalidShortcut
+            PanelShortcutErrorCode::InvalidShortcut
+        );
+        assert_eq!(
+            canonicalize_shortcut("shift+a").unwrap_err(),
+            PanelShortcutErrorCode::InvalidShortcut
+        );
+        assert_eq!(canonicalize_shortcut("super+f20").unwrap(), "super+f20");
+        assert_eq!(
+            canonicalize_shortcut("super+f21").unwrap_err(),
+            PanelShortcutErrorCode::InvalidShortcut
         );
     }
 
     #[test]
-    fn serializes_errors_as_stable_unit_strings() {
+    fn serializes_errors_with_stable_code_and_locked_state_snapshot() {
+        let known = ShortcutRegistrationState::Known(Some("shift+alt+super+space".into()));
         assert_eq!(
-            serde_json::to_string(&PanelShortcutError::InvalidShortcut).unwrap(),
-            "\"invalid_shortcut\""
+            serde_json::to_value(PanelShortcutError::from_state(
+                PanelShortcutErrorCode::InvalidShortcut,
+                &known,
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "code": "invalid_shortcut",
+                "activeShortcut": "shift+alt+super+space",
+                "stateUncertain": false,
+            })
         );
         assert_eq!(
-            serde_json::to_string(&PanelShortcutError::RegistrationFailed).unwrap(),
-            "\"registration_failed\""
+            serde_json::to_value(PanelShortcutError::from_state(
+                PanelShortcutErrorCode::RegistrationUncertain,
+                &ShortcutRegistrationState::Uncertain,
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "code": "registration_uncertain",
+                "activeShortcut": null,
+                "stateUncertain": true,
+            })
         );
         assert_eq!(
-            serde_json::to_string(&PanelShortcutError::RollbackFailed).unwrap(),
-            "\"rollback_failed\""
+            PanelShortcutError::from_state(
+                PanelShortcutErrorCode::RollbackFailed,
+                &ShortcutRegistrationState::Uncertain,
+            )
+            .to_string(),
+            "rollback_failed"
         );
-        assert_eq!(PanelShortcutError::InvalidShortcut.to_string(), "invalid_shortcut");
     }
 
     #[test]
@@ -337,7 +458,7 @@ mod tests {
 
     #[test]
     fn registers_new_shortcut_before_unregistering_old_shortcut() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar::default();
 
         let next = apply_shortcut_update(
@@ -348,7 +469,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(next.as_deref(), Some("control+alt+super+p"));
-        assert_eq!(active, next);
+        assert_eq!(active, ShortcutRegistrationState::Known(next));
         assert_eq!(
             registrar.operations,
             vec![
@@ -360,7 +481,7 @@ mod tests {
 
     #[test]
     fn preserves_active_shortcut_when_new_registration_fails() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar {
             fail_register: true,
             ..Default::default()
@@ -373,17 +494,35 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, PanelShortcutError::RegistrationFailed);
-        assert_eq!(active.as_deref(), Some("shift+alt+super+space"));
+        assert_eq!(error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(
+            error.active_shortcut.as_deref(),
+            Some("shift+alt+super+space")
+        );
+        assert!(!error.state_uncertain);
+        assert_eq!(
+            active,
+            ShortcutRegistrationState::Known(Some("shift+alt+super+space".into()))
+        );
         assert_eq!(
             registrar.operations,
             vec!["register:control+alt+super+p".to_owned()]
         );
+
+        registrar.fail_register = false;
+        let retried = apply_shortcut_update(
+            &mut active,
+            Some("control+alt+super+p"),
+            &mut registrar,
+        )
+        .unwrap();
+        assert_eq!(retried.as_deref(), Some("control+alt+super+p"));
+        assert_eq!(active, ShortcutRegistrationState::Known(retried));
     }
 
     #[test]
-    fn rolls_back_new_shortcut_when_old_unregistration_fails() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+    fn poisons_state_and_attempts_rollback_when_old_unregistration_fails() {
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar {
             fail_unregister_for: vec!["shift+alt+super+space".to_owned()],
             ..Default::default()
@@ -396,8 +535,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, PanelShortcutError::RegistrationFailed);
-        assert_eq!(active.as_deref(), Some("shift+alt+super+space"));
+        assert_eq!(error.code, PanelShortcutErrorCode::RegistrationUncertain);
+        assert_eq!(error.active_shortcut, None);
+        assert!(error.state_uncertain);
+        assert_eq!(active, ShortcutRegistrationState::Uncertain);
         assert_eq!(
             registrar.operations,
             vec![
@@ -406,11 +547,21 @@ mod tests {
                 "unregister:control+alt+super+p".to_owned(),
             ]
         );
+        let operations = registrar.operations.clone();
+        let retry = apply_shortcut_update(
+            &mut active,
+            Some("control+alt+super+p"),
+            &mut registrar,
+        )
+        .unwrap_err();
+        assert_eq!(retry.code, PanelShortcutErrorCode::RegistrationUncertain);
+        assert!(retry.state_uncertain);
+        assert_eq!(registrar.operations, operations);
     }
 
     #[test]
-    fn reports_rollback_failure_without_committing_new_shortcut() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+    fn reports_rollback_failure_with_uncertain_state() {
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar {
             fail_unregister_for: vec![
                 "shift+alt+super+space".to_owned(),
@@ -426,19 +577,25 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, PanelShortcutError::RollbackFailed);
-        assert_eq!(active.as_deref(), Some("shift+alt+super+space"));
+        assert_eq!(error.code, PanelShortcutErrorCode::RollbackFailed);
+        assert!(error.state_uncertain);
+        assert_eq!(error.active_shortcut, None);
+        assert_eq!(active, ShortcutRegistrationState::Uncertain);
+        assert_eq!(
+            registrar.operations.last().map(String::as_str),
+            Some("unregister:control+alt+super+p")
+        );
     }
 
     #[test]
     fn clears_only_after_unregistering_the_active_shortcut() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar::default();
 
         let next = apply_shortcut_update(&mut active, None, &mut registrar).unwrap();
 
         assert_eq!(next, None);
-        assert_eq!(active, None);
+        assert_eq!(active, ShortcutRegistrationState::Known(None));
         assert_eq!(
             registrar.operations,
             vec!["unregister:shift+alt+super+space".to_owned()]
@@ -446,8 +603,8 @@ mod tests {
     }
 
     #[test]
-    fn retains_active_shortcut_when_clearing_cannot_unregister_it() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+    fn poisons_state_when_clearing_cannot_unregister_it() {
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar {
             fail_unregister_for: vec!["shift+alt+super+space".to_owned()],
             ..Default::default()
@@ -455,17 +612,22 @@ mod tests {
 
         let error = apply_shortcut_update(&mut active, None, &mut registrar).unwrap_err();
 
-        assert_eq!(error, PanelShortcutError::RegistrationFailed);
-        assert_eq!(active.as_deref(), Some("shift+alt+super+space"));
+        assert_eq!(error.code, PanelShortcutErrorCode::RegistrationUncertain);
+        assert_eq!(error.active_shortcut, None);
+        assert!(error.state_uncertain);
+        assert_eq!(active, ShortcutRegistrationState::Uncertain);
         assert_eq!(
             registrar.operations,
             vec!["unregister:shift+alt+super+space".to_owned()]
         );
+        let retry = apply_shortcut_update(&mut active, None, &mut registrar).unwrap_err();
+        assert_eq!(retry.code, PanelShortcutErrorCode::RegistrationUncertain);
+        assert_eq!(registrar.operations.len(), 1);
     }
 
     #[test]
     fn skips_registrar_operations_when_requested_shortcut_is_unchanged() {
-        let mut active = Some("shift+alt+super+space".to_owned());
+        let mut active = ShortcutRegistrationState::Known(Some("shift+alt+super+space".to_owned()));
         let mut registrar = FakeRegistrar::default();
 
         let next = apply_shortcut_update(

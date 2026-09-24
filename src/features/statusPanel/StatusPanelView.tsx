@@ -6,6 +6,7 @@ import type { CodexHookIntegrationStatus, SessionRow, SourceHealth } from "../..
 import {
   dismissSession as dismissSessionCommand,
   configurePanelShortcut,
+  PanelShortcutConfigureError,
   installCodexHooks,
   jumpToSession as jumpToSessionCommand,
   loadCodexHookIntegrationStatus,
@@ -49,6 +50,18 @@ interface StatusPanelViewProps {
   sourceHealth: SourceHealth;
 }
 
+interface NativeShortcutStatus {
+  activeShortcut: string | null;
+  stateUncertain: boolean;
+}
+
+function nativeShortcutStatusFromError(error: unknown): NativeShortcutStatus {
+  if (error instanceof PanelShortcutConfigureError) {
+    return { activeShortcut: error.activeShortcut, stateUncertain: error.stateUncertain };
+  }
+  return { activeShortcut: null, stateUncertain: true };
+}
+
 export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: StatusPanelViewProps) {
   const [rows, setRows] = useState(initialRows);
   const [config, setConfig] = useState<StatusPanelConfig>(() => loadInitialConfig());
@@ -61,6 +74,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const [jumpNotice, setJumpNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [shortcutRegistrationError, setShortcutRegistrationError] = useState(false);
+  const [nativeShortcutStatus, setNativeShortcutStatus] = useState<NativeShortcutStatus | null>(null);
   const [shortcutRecording, setShortcutRecording] = useState(false);
   const [shortcutApplyPending, setShortcutApplyPending] = useState(false);
   const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
@@ -161,11 +175,19 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       void refreshPanel();
     }, 5000);
     const shortcutErrorGeneration = shortcutErrorGenerationRef.current;
-    void configurePanelShortcutInOrder(configRef.current.panelToggleShortcut, () => !cancelled).catch(() => {
-      if (!cancelled && shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
-        setShortcutRegistrationError(true);
-      }
-    });
+    void configurePanelShortcutInOrder(configRef.current.panelToggleShortcut, () => !cancelled)
+      .then((result) => {
+        if (!cancelled) {
+          setNativeShortcutStatus({ activeShortcut: result.activeShortcut, stateUncertain: false });
+        }
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setNativeShortcutStatus(nativeShortcutStatusFromError(error));
+        if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
+          setShortcutRegistrationError(true);
+        }
+      });
     const dismissShortcutUiOnHide = () => {
       if (cancelled || (!document.hidden && document.visibilityState !== "hidden")) return;
       shortcutErrorGenerationRef.current += 1;
@@ -580,6 +602,15 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
             </div>
             {shortcutRecording ? <span className="shortcut-settings__recording" role="status" aria-live="polite" aria-label={model.copy.panelToggleShortcutLabel}>{model.copy.recordingPanelShortcutLabel}</span> : null}
             {shortcutRegistrationError ? <span className="shortcut-settings__error" role="alert">{model.copy.panelShortcutRegistrationErrorLabel}</span> : null}
+            {nativeShortcutStatus?.stateUncertain ? (
+              <span className="shortcut-settings__error" role="status">{model.copy.panelShortcutRestartRequiredLabel}</span>
+            ) : nativeShortcutStatus && nativeShortcutStatus.activeShortcut !== draftConfig.panelToggleShortcut ? (
+              <span className="shortcut-settings__active" role="status">
+                {model.copy.currentActivePanelShortcutLabel}: {nativeShortcutStatus.activeShortcut === null
+                  ? model.copy.disabledPanelShortcutLabel
+                  : formatPanelShortcut(nativeShortcutStatus.activeShortcut)}
+              </span>
+            ) : null}
           </div>
 
           <label className="setting-field">
@@ -896,6 +927,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     try {
       const result = await configurePanelShortcutInOrder(nextConfig.panelToggleShortcut, () => mountedRef.current);
       if (!mountedRef.current) return;
+      setNativeShortcutStatus({ activeShortcut: result.activeShortcut, stateUncertain: false });
       const committedConfig = {
         ...nextConfig,
         panelToggleShortcut: result?.activeShortcut === undefined
@@ -911,8 +943,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         setView("panel");
       }
       void refreshPanel(committedConfig.followUpToIdleMinutes);
-    } catch {
+    } catch (error: unknown) {
       if (!mountedRef.current) return;
+      setNativeShortcutStatus(nativeShortcutStatusFromError(error));
       const committedConfig = { ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut };
       commitConfig(committedConfig);
       updateDraftConfig(shortcutVisibilityDismissedRef.current ? committedConfig : nextConfig);
