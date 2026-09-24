@@ -75,6 +75,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const shortcutUpdateQueueRef = useRef<Promise<void>>(Promise.resolve());
   const shortcutApplyPendingRef = useRef(false);
   const shortcutFailedWhileDismissedRef = useRef(false);
+  const shortcutVisibilityDismissedRef = useRef(false);
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
@@ -164,6 +165,17 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         setShortcutRegistrationError(true);
       }
     });
+    const dismissShortcutUiOnHide = () => {
+      if (cancelled || (!document.hidden && document.visibilityState !== "hidden")) return;
+      shortcutErrorGenerationRef.current += 1;
+      shortcutFailedWhileDismissedRef.current = false;
+      shortcutVisibilityDismissedRef.current = true;
+      setShortcutRecording(false);
+      setShortcutRegistrationError(false);
+      updateDraftConfig(configRef.current);
+      setView("panel");
+    };
+    document.addEventListener("visibilitychange", dismissShortcutUiOnHide);
     let unlistenToggle: (() => void) | undefined;
     let unlistenMenu: (() => void) | undefined;
 
@@ -186,9 +198,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
       if (event.payload === "management") {
         setShortcutRecording(false);
-        if (!shortcutApplyPendingRef.current && !shortcutFailedWhileDismissedRef.current) {
+        if (shortcutVisibilityDismissedRef.current || (!shortcutApplyPendingRef.current && !shortcutFailedWhileDismissedRef.current)) {
           updateDraftConfig(configRef.current);
         }
+        if (!shortcutApplyPendingRef.current) shortcutVisibilityDismissedRef.current = false;
         void refreshHookStatus();
         setView("management");
       }
@@ -206,6 +219,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       actionFeedbackSequenceRef.current += 1;
       window.clearInterval(refreshTimer);
       clearJumpNoticeTimer();
+      document.removeEventListener("visibilitychange", dismissShortcutUiOnHide);
       unlistenToggle?.();
       unlistenMenu?.();
     };
@@ -448,6 +462,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
           if (shortcutApplyPendingRef.current) return;
           shortcutErrorGenerationRef.current += 1;
           shortcutFailedWhileDismissedRef.current = false;
+          shortcutVisibilityDismissedRef.current = false;
           setShortcutRecording(false);
           setShortcutRegistrationError(false);
           updateDraftConfig(configRef.current);
@@ -457,7 +472,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         </button>
         </header>
 
-        <section className="management-section" aria-label={model.copy.managementTitle}>
+        <fieldset className="management-section" aria-label={model.copy.managementTitle} disabled={shortcutApplyPending}>
           <label className="setting-field">
             <span>{model.copy.languageLabel}</span>
             <select
@@ -674,7 +689,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
               {model.copy.applySettingsLabel}
             </button>
           </div>
-        </section>
+        </fieldset>
       </main>
     );
   }
@@ -868,6 +883,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     if (shortcutApplyPendingRef.current) return;
     shortcutApplyPendingRef.current = true;
     shortcutFailedWhileDismissedRef.current = false;
+    shortcutVisibilityDismissedRef.current = false;
     shortcutErrorGenerationRef.current += 1;
     const shortcutErrorGeneration = shortcutErrorGenerationRef.current;
     const nextConfig = normalizeConfig(draftConfigRef.current);
@@ -885,19 +901,22 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       commitConfig(committedConfig);
       updateDraftConfig(committedConfig);
       shortcutFailedWhileDismissedRef.current = false;
+      shortcutVisibilityDismissedRef.current = false;
       setShortcutRegistrationError(false);
       setView("panel");
       void refreshPanel(committedConfig.followUpToIdleMinutes);
     } catch {
       if (!mountedRef.current) return;
-      commitConfig({ ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut });
-      updateDraftConfig(nextConfig);
+      const committedConfig = { ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut };
+      commitConfig(committedConfig);
+      updateDraftConfig(shortcutVisibilityDismissedRef.current ? committedConfig : nextConfig);
       void refreshPanel(nextConfig.followUpToIdleMinutes);
       if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
         setShortcutRegistrationError(true);
-      } else {
+      } else if (!shortcutVisibilityDismissedRef.current) {
         shortcutFailedWhileDismissedRef.current = true;
       }
+      shortcutVisibilityDismissedRef.current = false;
     } finally {
       shortcutApplyPendingRef.current = false;
       if (mountedRef.current) setShortcutApplyPending(false);

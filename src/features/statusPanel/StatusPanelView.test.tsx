@@ -980,6 +980,83 @@ describe("StatusPanelView", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("does not revive a startup shortcut conflict after the document becomes hidden", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let rejectStartup: ((reason: string) => void) | undefined;
+    const startup = new Promise<never>((_resolve, reject) => { rejectStartup = reject; });
+    tauriCoreMock.invoke.mockImplementation((command: string) => {
+      if (command === "configure_panel_shortcut") return startup;
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    const openSettings = await renderShortcutSettings();
+
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    fireEvent(document, new Event("visibilitychange"));
+    await act(async () => rejectStartup?.("registration_failed"));
+    await openSettings();
+
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("stops shortcut recording when the document becomes hidden", async () => {
+    const openSettings = await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
+    expect(screen.getByRole("status", { name: "Panel shortcut" })).toBeTruthy();
+
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    fireEvent(document, new Event("visibilitychange"));
+    await openSettings();
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+
+    expect(screen.queryByRole("status", { name: "Panel shortcut" })).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value)
+      .toBe("Option-Shift-Command-Space");
+  });
+
+  it("discards a pending failed shortcut draft after document visibility dismissal", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let rejectUpdate: ((reason: string) => void) | undefined;
+    const update = new Promise<never>((_resolve, reject) => { rejectUpdate = reject; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === "alt+super+p" ? update : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    const openSettings = await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+    fireEvent.change(screen.getByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    fireEvent(document, new Event("visibilitychange"));
+    expect(screen.getByRole("main").className).not.toContain("management-shell");
+    await act(async () => rejectUpdate?.("registration_failed"));
+    await waitFor(() => expect(readPersistedConfig()).toMatchObject({
+      language: "zh",
+      panelToggleShortcut: "shift+alt+super+space",
+    }));
+    await openSettings();
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value)
+      .toBe("Option-Shift-Command-Space");
+  });
+
+  it("removes document visibility handling on unmount", async () => {
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    const visibilityHandler = addListener.mock.calls.find(([type]) => type === "visibilitychange")?.[1];
+
+    expect(visibilityHandler).toBeTruthy();
+    rendered.unmount();
+    expect(removeListener).toHaveBeenCalledWith("visibilitychange", visibilityHandler);
+  });
+
   it("keeps a dismissed shortcut settings failure quiet while retaining the requested draft", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     let rejectUpdate: ((reason: string) => void) | undefined;
@@ -1153,6 +1230,36 @@ describe("StatusPanelView", () => {
 
     await act(async () => resolveUpdate?.({ activeShortcut: null }));
     await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBeNull());
+  });
+
+  it("freezes all management settings controls while shortcut Apply is pending", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let rejectUpdate: ((reason: string) => void) | undefined;
+    const update = new Promise<never>((_resolve, reject) => { rejectUpdate = reject; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === null ? update : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    for (const label of ["Language", "Style family", "Palette", "Visible items", "Panel display", "Alert display seconds", "Follow-up to idle minutes", "blocked", "Blocked color"]) {
+      expect(screen.getByLabelText(label).matches(":disabled")).toBe(true);
+    }
+    expect(screen.getByRole("button", { name: "Install Codex hooks" }).matches(":disabled")).toBe(true);
+    const blocked = screen.getByLabelText("blocked") as HTMLInputElement;
+    const wasBlockedChecked = blocked.checked;
+    blocked.click();
+    expect(blocked.checked).toBe(wasBlockedChecked);
+    expect((screen.getByLabelText("Language") as HTMLSelectElement).value).toBe("en");
+    expect((screen.getByLabelText("Visible items") as HTMLInputElement).value).toBe("1");
+
+    await act(async () => rejectUpdate?.("registration_failed"));
+    expect(readPersistedConfig()).toMatchObject({ language: "en", visibleItemCount: 1 });
   });
 
   it("does not commit a shortcut update after unmount", async () => {

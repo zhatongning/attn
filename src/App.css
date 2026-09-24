@@ -578,10 +578,14 @@ p {
 }
 
 .management-section {
+  border: 0;
   display: grid;
   gap: 10px;
+  margin: 0;
+  min-inline-size: 0;
   min-width: 0;
   overflow: auto;
+  padding: 0;
 }
 
 .setting-field {
