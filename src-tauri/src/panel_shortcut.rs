@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 pub use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
@@ -12,6 +13,12 @@ pub const TOGGLE_PANEL_EVENT: &str = "agent-session-inbox://toggle-panel";
 #[derive(Default)]
 pub struct PanelShortcutState {
     pub active: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelShortcutUpdate {
+    pub active_shortcut: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,6 +44,50 @@ impl Error for PanelShortcutError {}
 pub trait ShortcutRegistrar {
     fn register(&mut self, shortcut: &str) -> Result<(), ()>;
     fn unregister(&mut self, shortcut: &str) -> Result<(), ()>;
+}
+
+struct NativeShortcutRegistrar<'a, R: Runtime> {
+    app: &'a AppHandle<R>,
+}
+
+impl<R: Runtime> ShortcutRegistrar for NativeShortcutRegistrar<'_, R> {
+    fn register(&mut self, shortcut: &str) -> Result<(), ()> {
+        let shortcut = Shortcut::from_str(shortcut).map_err(|_| ())?;
+        self.app
+            .global_shortcut()
+            .on_shortcut(shortcut, handle_panel_shortcut_event::<R>)
+            .map_err(|_| ())
+    }
+
+    fn unregister(&mut self, shortcut: &str) -> Result<(), ()> {
+        let shortcut = Shortcut::from_str(shortcut).map_err(|_| ())?;
+        self.app.global_shortcut().unregister(shortcut).map_err(|_| ())
+    }
+}
+
+fn update_native_shortcut<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &PanelShortcutState,
+    requested: Option<&str>,
+) -> Result<PanelShortcutUpdate, PanelShortcutError> {
+    let mut active = state.active.lock().unwrap();
+    let mut registrar = NativeShortcutRegistrar { app };
+    let active_shortcut = apply_shortcut_update(&mut active, requested, &mut registrar)?;
+    Ok(PanelShortcutUpdate { active_shortcut })
+}
+
+#[tauri::command]
+pub fn configure_panel_shortcut(
+    app: AppHandle,
+    state: tauri::State<'_, PanelShortcutState>,
+    shortcut: Option<String>,
+) -> Result<PanelShortcutUpdate, PanelShortcutError> {
+    update_native_shortcut(&app, state.inner(), shortcut.as_deref())
+}
+
+pub fn register_default<R: Runtime>(app: &AppHandle<R>) -> Result<(), PanelShortcutError> {
+    let state = app.state::<PanelShortcutState>();
+    update_native_shortcut(app, state.inner(), Some(DEFAULT_PANEL_SHORTCUT)).map(|_| ())
 }
 
 pub fn canonicalize_shortcut(value: &str) -> Result<String, PanelShortcutError> {
@@ -110,11 +161,45 @@ pub fn is_pressed(state: ShortcutState) -> bool {
     matches!(state, ShortcutState::Pressed)
 }
 
+fn handle_shortcut_event(state: ShortcutState, on_pressed: impl FnOnce()) {
+    if is_pressed(state) {
+        on_pressed();
+    }
+}
+
+fn handle_panel_shortcut_event<R: Runtime>(
+    app: &AppHandle<R>,
+    _shortcut: &Shortcut,
+    event: ShortcutEvent,
+) {
+    handle_shortcut_event(event.state, || {
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+        let was_hidden = match window.is_visible() {
+            Ok(visible) => !visible,
+            Err(error) => {
+                eprintln!("failed to read panel visibility for global shortcut: {error}");
+                return;
+            }
+        };
+
+        if was_hidden {
+            if let Err(error) = window.show() {
+                eprintln!("failed to show panel for global shortcut: {error}");
+            }
+        }
+        if let Err(error) = window.emit(TOGGLE_PANEL_EVENT, was_hidden) {
+            eprintln!("failed to emit global panel shortcut event: {error}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_shortcut_update, canonicalize_shortcut, is_pressed, PanelShortcutError,
-        ShortcutRegistrar,
+        apply_shortcut_update, canonicalize_shortcut, handle_shortcut_event, is_pressed,
+        PanelShortcutError, PanelShortcutUpdate, ShortcutRegistrar,
     };
     use tauri_plugin_global_shortcut::ShortcutState;
 
@@ -172,6 +257,18 @@ mod tests {
             "\"rollback_failed\""
         );
         assert_eq!(PanelShortcutError::InvalidShortcut.to_string(), "invalid_shortcut");
+    }
+
+    #[test]
+    fn serializes_update_as_camel_case() {
+        let update = PanelShortcutUpdate {
+            active_shortcut: Some("shift+alt+super+space".to_owned()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            serde_json::json!({ "activeShortcut": "shift+alt+super+space" })
+        );
     }
 
     #[test]
@@ -285,6 +382,24 @@ mod tests {
     }
 
     #[test]
+    fn retains_active_shortcut_when_clearing_cannot_unregister_it() {
+        let mut active = Some("shift+alt+super+space".to_owned());
+        let mut registrar = FakeRegistrar {
+            fail_unregister_for: vec!["shift+alt+super+space".to_owned()],
+            ..Default::default()
+        };
+
+        let error = apply_shortcut_update(&mut active, None, &mut registrar).unwrap_err();
+
+        assert_eq!(error, PanelShortcutError::RegistrationFailed);
+        assert_eq!(active.as_deref(), Some("shift+alt+super+space"));
+        assert_eq!(
+            registrar.operations,
+            vec!["unregister:shift+alt+super+space".to_owned()]
+        );
+    }
+
+    #[test]
     fn skips_registrar_operations_when_requested_shortcut_is_unchanged() {
         let mut active = Some("shift+alt+super+space".to_owned());
         let mut registrar = FakeRegistrar::default();
@@ -304,5 +419,14 @@ mod tests {
     fn handles_only_pressed_shortcut_events() {
         assert!(is_pressed(ShortcutState::Pressed));
         assert!(!is_pressed(ShortcutState::Released));
+    }
+
+    #[test]
+    fn released_event_does_not_call_handler() {
+        let mut called = false;
+
+        handle_shortcut_event(ShortcutState::Released, || called = true);
+
+        assert!(!called);
     }
 }

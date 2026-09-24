@@ -218,9 +218,15 @@ fn move_main_panel_window<R: Runtime>(app: &tauri::AppHandle<R>, position: Panel
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(Arc::new(inbox_store::InboxStore::default()))
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(desktop)]
+    let builder = builder
+        .manage(panel_shortcut::PanelShortcutState::default())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    let builder = builder
         .menu(|handle| {
             let settings = MenuItem::with_id(handle, "open_management", "Settings...", true, Some(","))?;
             let position_top_left =
@@ -265,6 +271,11 @@ pub fn run() {
                 apply_panel_window_behavior(&window);
             }
 
+            #[cfg(desktop)]
+            if let Err(error) = panel_shortcut::register_default(app.handle()) {
+                eprintln!("failed to register default panel shortcut: {error}");
+            }
+
             app.handle().on_menu_event(|app, event| {
                 let menu_id = event.id().as_ref();
                 if menu_id == "open_management" {
@@ -279,19 +290,37 @@ pub fn run() {
             });
 
             Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            list_sessions,
-            dismiss_session,
-            dismiss_sessions,
-            restore_session,
-            pin_session,
-            unpin_session,
-            source_health,
-            codex_hook_integration_status,
-            install_codex_hooks,
-            jump_to_session
-        ])
+        });
+
+    #[cfg(desktop)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        list_sessions,
+        dismiss_session,
+        dismiss_sessions,
+        restore_session,
+        pin_session,
+        unpin_session,
+        source_health,
+        codex_hook_integration_status,
+        install_codex_hooks,
+        jump_to_session,
+        panel_shortcut::configure_panel_shortcut
+    ]);
+    #[cfg(not(desktop))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        list_sessions,
+        dismiss_session,
+        dismiss_sessions,
+        restore_session,
+        pin_session,
+        unpin_session,
+        source_health,
+        codex_hook_integration_status,
+        install_codex_hooks,
+        jump_to_session
+    ]);
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
