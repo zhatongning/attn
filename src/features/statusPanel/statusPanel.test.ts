@@ -61,6 +61,28 @@ describe("buildStatusPanelModel", () => {
     expect(defaultStatusPanelConfig.preventAutoCollapseStatuses).toEqual([]);
   });
 
+  it("defaults and localizes the panel shortcut settings contract", () => {
+    expect(defaultStatusPanelConfig.panelToggleShortcut).toBe("shift+alt+super+space");
+
+    const english = buildStatusPanelModel([]).copy;
+    expect(english.panelToggleShortcutLabel).toBe("Panel shortcut");
+    expect(english.recordPanelShortcutLabel).toBe("Record shortcut");
+    expect(english.recordingPanelShortcutLabel).toBe("Press a key combination");
+    expect(english.clearPanelShortcutLabel).toBe("Clear shortcut");
+    expect(english.restorePanelShortcutLabel).toBe("Restore default");
+    expect(english.disabledPanelShortcutLabel).toBe("Disabled");
+    expect(english.panelShortcutRegistrationErrorLabel).toBe("That shortcut could not be registered.");
+
+    const chinese = buildStatusPanelModel([], { ...defaultStatusPanelConfig, language: "zh" }).copy;
+    expect(chinese.panelToggleShortcutLabel).toBe("面板快捷键");
+    expect(chinese.recordPanelShortcutLabel).toBe("录制快捷键");
+    expect(chinese.recordingPanelShortcutLabel).toBe("请按下组合键");
+    expect(chinese.clearPanelShortcutLabel).toBe("清除快捷键");
+    expect(chinese.restorePanelShortcutLabel).toBe("恢复默认");
+    expect(chinese.disabledPanelShortcutLabel).toBe("已禁用");
+    expect(chinese.panelShortcutRegistrationErrorLabel).toBe("无法注册该快捷键。");
+  });
+
   it("uses the configured visible item count from management settings", () => {
     const model = buildStatusPanelModel(
       [

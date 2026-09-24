@@ -1,8 +1,10 @@
 import type { Confidence, SessionRow } from "../../shared/types/session";
+import { DEFAULT_PANEL_TOGGLE_SHORTCUT } from "./panelShortcut";
 
 export type InterventionStatus = "blocked" | "input" | "inspect" | "stopped" | "needed" | "working" | "idle";
 
 export interface StatusPanelConfig {
+  panelToggleShortcut: string | null;
   styleFamily: "atom";
   palette: "oneDark";
   language: "en" | "zh";
@@ -50,6 +52,13 @@ export interface StatusPanelModel {
 }
 
 export interface StatusPanelCopy {
+  panelToggleShortcutLabel: string;
+  recordPanelShortcutLabel: string;
+  recordingPanelShortcutLabel: string;
+  clearPanelShortcutLabel: string;
+  restorePanelShortcutLabel: string;
+  disabledPanelShortcutLabel: string;
+  panelShortcutRegistrationErrorLabel: string;
   alertsLabel: string;
   workingLabel: string;
   hiddenAlertsLabel: string;
@@ -120,6 +129,7 @@ export interface StatusPanelCopy {
 }
 
 export const defaultStatusPanelConfig: StatusPanelConfig = {
+  panelToggleShortcut: DEFAULT_PANEL_TOGGLE_SHORTCUT,
   styleFamily: "atom",
   palette: "oneDark",
   language: "en",
@@ -214,6 +224,13 @@ const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionSta
 
 const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   en: {
+    panelToggleShortcutLabel: "Panel shortcut",
+    recordPanelShortcutLabel: "Record shortcut",
+    recordingPanelShortcutLabel: "Press a key combination",
+    clearPanelShortcutLabel: "Clear shortcut",
+    restorePanelShortcutLabel: "Restore default",
+    disabledPanelShortcutLabel: "Disabled",
+    panelShortcutRegistrationErrorLabel: "That shortcut could not be registered.",
     alertsLabel: "alerts",
     workingLabel: "running",
     hiddenAlertsLabel: "alerts",
@@ -298,6 +315,13 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     },
   },
   zh: {
+    panelToggleShortcutLabel: "面板快捷键",
+    recordPanelShortcutLabel: "录制快捷键",
+    recordingPanelShortcutLabel: "请按下组合键",
+    clearPanelShortcutLabel: "清除快捷键",
+    restorePanelShortcutLabel: "恢复默认",
+    disabledPanelShortcutLabel: "已禁用",
+    panelShortcutRegistrationErrorLabel: "无法注册该快捷键。",
     alertsLabel: "需关注",
     workingLabel: "进行中",
     hiddenAlertsLabel: "需关注",
