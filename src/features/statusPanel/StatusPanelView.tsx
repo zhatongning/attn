@@ -141,6 +141,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     let unlistenMenu: (() => void) | undefined;
 
     void listen<boolean>("agent-session-inbox://toggle-panel", (event) => {
+      if (cancelled) {
+        return;
+      }
       togglePanelOpen(event.payload);
     }).then((unlisten) => {
       if (cancelled) {
@@ -151,6 +154,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     }).catch(() => undefined);
 
     void listen<string>("agent-session-inbox://open-management", (event) => {
+      if (cancelled) {
+        return;
+      }
       if (event.payload === "management") {
         updateDraftConfig(configRef.current);
         void refreshHookStatus();

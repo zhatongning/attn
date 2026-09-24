@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 // @ts-expect-error This test reads local CSS without adding Node types to the app build.
 import { readFileSync } from "node:fs";
@@ -885,25 +886,59 @@ describe("StatusPanelView", () => {
 
   it("unlistens a shortcut registration that resolves after panel cleanup", async () => {
     const { listen } = await import("@tauri-apps/api/event");
-    let resolveToggleListen: ((unlisten: () => void) => void) | undefined;
+    const registrations: Array<{
+      event: string;
+      callback: (event: { payload: boolean | string }) => void;
+      resolve: (unlisten: () => void) => void;
+    }> = [];
     const unlistenToggle = vi.fn();
-    vi.mocked(listen).mockImplementation((event) => {
-      if (event === "agent-session-inbox://toggle-panel") {
-        return new Promise((resolve) => {
-          resolveToggleListen = resolve;
+    const unlistenMenu = vi.fn();
+    vi.mocked(listen).mockImplementation((event, callback) => {
+      return new Promise((resolve) => {
+        registrations.push({
+          event,
+          callback: callback as (event: { payload: boolean | string }) => void,
+          resolve,
         });
-      }
-      return Promise.resolve(() => undefined);
+      });
     });
 
-    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    const rendered = render(
+      <StrictMode>
+        <StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />
+      </StrictMode>,
+    );
+
+    await waitFor(() => {
+      expect(registrations.filter(({ event }) => event === "agent-session-inbox://toggle-panel")).toHaveLength(2);
+      expect(registrations.filter(({ event }) => event === "agent-session-inbox://open-management")).toHaveLength(2);
+    });
+
+    const staleToggle = registrations.find(({ event }) => event === "agent-session-inbox://toggle-panel");
+    const staleMenu = registrations.find(({ event }) => event === "agent-session-inbox://open-management");
+    await act(async () => {
+      staleToggle?.callback({ payload: false });
+    });
+    expect(document.querySelector(".panel-shell--collapsed")).not.toBeNull();
+
+    await act(async () => {
+      staleMenu?.callback({ payload: "management" });
+    });
+    expect(screen.queryByText("management")).toBeNull();
+
     rendered.unmount();
 
     await act(async () => {
-      resolveToggleListen?.(unlistenToggle);
+      registrations.forEach(({ callback, event }) => {
+        callback({ payload: event === "agent-session-inbox://toggle-panel" ? false : "management" });
+      });
+      registrations.forEach(({ event, resolve }) => {
+        resolve(event === "agent-session-inbox://toggle-panel" ? unlistenToggle : unlistenMenu);
+      });
       await Promise.resolve();
     });
-    expect(unlistenToggle).toHaveBeenCalledTimes(1);
+    expect(unlistenToggle).toHaveBeenCalledTimes(2);
+    expect(unlistenMenu).toHaveBeenCalledTimes(2);
   });
 
   it("applies management settings only after confirmation", async () => {
