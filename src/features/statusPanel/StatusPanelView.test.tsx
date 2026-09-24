@@ -782,6 +782,130 @@ describe("StatusPanelView", () => {
     expect(screen.getByLabelText("Follow-up color")).toBeTruthy();
   });
 
+  it("toggles the panel when the visible-window shortcut fires", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let toggleHandler: ((event: { payload: boolean }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://toggle-panel") {
+        toggleHandler = callback as (event: { payload: boolean }) => void;
+      }
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await act(async () => {
+      toggleHandler?.({ payload: false });
+    });
+    expect(document.querySelector(".panel-shell--collapsed")).toBeNull();
+
+    await act(async () => {
+      toggleHandler?.({ payload: false });
+    });
+    expect(document.querySelector(".panel-shell--collapsed")).not.toBeNull();
+  });
+
+  it("restores the expanded panel from management when the shortcut reveals a hidden window", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let menuHandler: ((event: { payload: string }) => void) | undefined;
+    let toggleHandler: ((event: { payload: boolean }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") {
+        menuHandler = callback as (event: { payload: string }) => void;
+      }
+      if (event === "agent-session-inbox://toggle-panel") {
+        toggleHandler = callback as (event: { payload: boolean }) => void;
+      }
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await act(async () => {
+      menuHandler?.({ payload: "management" });
+    });
+    expect(await screen.findByText("management")).toBeTruthy();
+
+    await act(async () => {
+      toggleHandler?.({ payload: true });
+    });
+    expect(screen.queryByText("management")).toBeNull();
+    expect(document.querySelector(".panel-shell--collapsed")).toBeNull();
+    expect(screen.getByRole("article")).toBeTruthy();
+  });
+
+  it("keeps the visible shortcut selection after the old auto-collapse delay", async () => {
+    vi.useFakeTimers();
+    const firstRows = initialSessions.filter((row) => row.state !== "waitingForInput");
+    const nextRows = [
+      ...firstRows,
+      {
+        ...initialSessions[0],
+        sessionId: "shortcut-auto-collapse-row",
+        label: "Shortcut auto-collapse row",
+        state: "inspect" as const,
+        statusReason: "completed task ready to inspect; open it to mark read",
+      },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/sessions") return jsonResponse(nextRows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    }));
+    const { listen } = await import("@tauri-apps/api/event");
+    let toggleHandler: ((event: { payload: boolean }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://toggle-panel") {
+        toggleHandler = callback as (event: { payload: boolean }) => void;
+      }
+      return () => undefined;
+    });
+
+    render(<StatusPanelView initialRows={firstRows} sourceHealth={fakeSourceHealth} />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Shortcut auto-collapse row")).toBeTruthy();
+    expect(document.querySelector(".panel-shell--collapsed")).toBeNull();
+
+    await act(async () => {
+      toggleHandler?.({ payload: false });
+      toggleHandler?.({ payload: false });
+    });
+    expect(document.querySelector(".panel-shell--collapsed")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30001);
+    });
+    expect(document.querySelector(".panel-shell--collapsed")).toBeNull();
+  });
+
+  it("unlistens a shortcut registration that resolves after panel cleanup", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let resolveToggleListen: ((unlisten: () => void) => void) | undefined;
+    const unlistenToggle = vi.fn();
+    vi.mocked(listen).mockImplementation((event) => {
+      if (event === "agent-session-inbox://toggle-panel") {
+        return new Promise((resolve) => {
+          resolveToggleListen = resolve;
+        });
+      }
+      return Promise.resolve(() => undefined);
+    });
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    rendered.unmount();
+
+    await act(async () => {
+      resolveToggleListen?.(unlistenToggle);
+      await Promise.resolve();
+    });
+    expect(unlistenToggle).toHaveBeenCalledTimes(1);
+  });
+
   it("applies management settings only after confirmation", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;

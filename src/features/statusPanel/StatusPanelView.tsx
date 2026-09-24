@@ -132,11 +132,23 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
 
   useEffect(() => {
     mountedRef.current = true;
+    let cancelled = false;
     void refreshPanel();
     const refreshTimer = window.setInterval(() => {
       void refreshPanel();
     }, 5000);
+    let unlistenToggle: (() => void) | undefined;
     let unlistenMenu: (() => void) | undefined;
+
+    void listen<boolean>("agent-session-inbox://toggle-panel", (event) => {
+      togglePanelOpen(event.payload);
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenToggle = unlisten;
+    }).catch(() => undefined);
 
     void listen<string>("agent-session-inbox://open-management", (event) => {
       if (event.payload === "management") {
@@ -145,14 +157,20 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         setView("management");
       }
     }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
       unlistenMenu = unlisten;
     }).catch(() => undefined);
 
     return () => {
+      cancelled = true;
       mountedRef.current = false;
       actionFeedbackSequenceRef.current += 1;
       window.clearInterval(refreshTimer);
       clearJumpNoticeTimer();
+      unlistenToggle?.();
       unlistenMenu?.();
     };
   }, []);
@@ -588,7 +606,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
           className="strip-toggle"
           data-no-window-drag
           aria-label={panelOpen ? model.copy.collapsePanelLabel : model.copy.expandPanelLabel}
-          onClick={() => setManualPanelOpen(!panelOpen)}
+          onClick={() => togglePanelOpen()}
         >
           {panelOpen ? "-" : "+"}
         </button>
@@ -806,9 +824,14 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     return `+${hiddenAlertCount} ${model.copy.hiddenAlertsLabel}`;
   }
 
-  function setManualPanelOpen(nextOpen: boolean) {
+  function togglePanelOpen(wasHidden = false) {
     clearAutoCollapseTimer();
-    setPanelOpen(nextOpen);
+    if (wasHidden) {
+      setView("panel");
+      setPanelOpen(true);
+      return;
+    }
+    setPanelOpen((current) => !current);
   }
 
   function openPanelTemporarily(keepOpenForStatus: boolean) {
