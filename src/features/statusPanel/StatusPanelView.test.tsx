@@ -1046,6 +1046,37 @@ describe("StatusPanelView", () => {
       .toBe("Option-Shift-Command-Space");
   });
 
+  it("keeps reopened shortcut settings visible after a hidden document's pending Apply succeeds", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let resolveUpdate: ((value: { activeShortcut: string | null }) => void) | undefined;
+    const update = new Promise<{ activeShortcut: string | null }>((resolve) => { resolveUpdate = resolve; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === null ? update : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    const openSettings = await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
+    fireEvent.change(screen.getByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("configure_panel_shortcut", { shortcut: null }));
+
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    fireEvent(document, new Event("visibilitychange"));
+    hidden.mockReturnValue(false);
+    await openSettings();
+    expect((screen.getByRole("button", { name: "Apply settings" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => resolveUpdate?.({ activeShortcut: null }));
+    await waitFor(() => expect(readPersistedConfig()).toMatchObject({ language: "zh", panelToggleShortcut: null }));
+    expect(screen.getByRole("main").className).toContain("management-shell");
+    expect((screen.getByRole("button", { name: "应用设置" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value).toBe("已禁用");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("removes document visibility handling on unmount", async () => {
     const addListener = vi.spyOn(document, "addEventListener");
     const removeListener = vi.spyOn(document, "removeEventListener");
@@ -1178,7 +1209,7 @@ describe("StatusPanelView", () => {
     expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
   });
 
-  it("commits a successful shortcut settings Apply after hidden-window dismissal", async () => {
+  it("keeps reopened shortcut settings visible after hidden-window dismissal and successful Apply", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     let resolveUpdate: ((value: { activeShortcut: string | null }) => void) | undefined;
     const update = new Promise<{ activeShortcut: string | null }>((resolve) => { resolveUpdate = resolve; });
@@ -1203,9 +1234,13 @@ describe("StatusPanelView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
 
     await act(async () => togglePanel?.({ payload: true }));
+    await act(async () => openManagement?.({ payload: "management" }));
+    expect((screen.getByRole("button", { name: "Apply settings" }) as HTMLButtonElement).disabled).toBe(true);
     await act(async () => resolveUpdate?.({ activeShortcut: null }));
     await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBeNull());
-    expect(screen.getByRole("main").className).not.toContain("management-shell");
+    expect(screen.getByRole("main").className).toContain("management-shell");
+    expect((screen.getByRole("button", { name: "Apply settings" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value).toBe("Disabled");
   });
 
   it("disables shortcut actions while a native update is pending", async () => {

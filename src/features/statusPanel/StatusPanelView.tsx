@@ -72,6 +72,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const autoCollapseTimerRef = useRef<number | undefined>(undefined);
   const latestRefreshIdRef = useRef(0);
   const shortcutErrorGenerationRef = useRef(0);
+  const managementPresentationGenerationRef = useRef(0);
   const shortcutUpdateQueueRef = useRef<Promise<void>>(Promise.resolve());
   const shortcutApplyPendingRef = useRef(false);
   const shortcutFailedWhileDismissedRef = useRef(false);
@@ -168,6 +169,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     const dismissShortcutUiOnHide = () => {
       if (cancelled || (!document.hidden && document.visibilityState !== "hidden")) return;
       shortcutErrorGenerationRef.current += 1;
+      managementPresentationGenerationRef.current += 1;
       shortcutFailedWhileDismissedRef.current = false;
       shortcutVisibilityDismissedRef.current = true;
       setShortcutRecording(false);
@@ -461,6 +463,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         <button type="button" className="icon-button icon-button--back" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
           if (shortcutApplyPendingRef.current) return;
           shortcutErrorGenerationRef.current += 1;
+          managementPresentationGenerationRef.current += 1;
           shortcutFailedWhileDismissedRef.current = false;
           shortcutVisibilityDismissedRef.current = false;
           setShortcutRecording(false);
@@ -886,6 +889,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     shortcutVisibilityDismissedRef.current = false;
     shortcutErrorGenerationRef.current += 1;
     const shortcutErrorGeneration = shortcutErrorGenerationRef.current;
+    const managementPresentationGeneration = managementPresentationGenerationRef.current;
     const nextConfig = normalizeConfig(draftConfigRef.current);
     setShortcutRecording(false);
     setShortcutApplyPending(true);
@@ -903,7 +907,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       shortcutFailedWhileDismissedRef.current = false;
       shortcutVisibilityDismissedRef.current = false;
       setShortcutRegistrationError(false);
-      setView("panel");
+      if (managementPresentationGeneration === managementPresentationGenerationRef.current) {
+        setView("panel");
+      }
       void refreshPanel(committedConfig.followUpToIdleMinutes);
     } catch {
       if (!mountedRef.current) return;
@@ -980,6 +986,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     clearAutoCollapseTimer();
     if (wasHidden) {
       shortcutErrorGenerationRef.current += 1;
+      managementPresentationGenerationRef.current += 1;
       setShortcutRecording(false);
       setShortcutRegistrationError(false);
       setView("panel");
