@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, EventTarget, Manager, Runtime};
 
 pub use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
@@ -189,7 +189,11 @@ fn handle_panel_shortcut_event<R: Runtime>(
                 eprintln!("failed to show panel for global shortcut: {error}");
             }
         }
-        if let Err(error) = window.emit(TOGGLE_PANEL_EVENT, was_hidden) {
+        if let Err(error) = window.emit_to(
+            EventTarget::webview_window("main"),
+            TOGGLE_PANEL_EVENT,
+            was_hidden,
+        ) {
             eprintln!("failed to emit global panel shortcut event: {error}");
         }
     });
