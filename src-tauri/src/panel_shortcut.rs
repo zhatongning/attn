@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+use objc2::MainThreadMarker;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSApplication, NSWindow};
 use serde::Serialize;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -167,6 +171,34 @@ fn handle_shortcut_event(state: ShortcutState, on_pressed: impl FnOnce()) {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+struct RevealPlan {
+    was_hidden: bool,
+    unhide_app: bool,
+    order_front: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_plan(app_hidden: bool, window_visible: bool) -> RevealPlan {
+    let was_hidden = app_hidden || !window_visible;
+    RevealPlan {
+        was_hidden,
+        unhide_app: app_hidden,
+        order_front: was_hidden,
+    }
+}
+
+fn emit_panel_toggle<R: Runtime>(app: &AppHandle<R>, was_hidden: bool) {
+    if let Err(error) = app.emit_to(
+        EventTarget::webview_window("main"),
+        TOGGLE_PANEL_EVENT,
+        was_hidden,
+    ) {
+        eprintln!("failed to emit global panel shortcut event: {error}");
+    }
+}
+
 fn handle_panel_shortcut_event<R: Runtime>(
     app: &AppHandle<R>,
     _shortcut: &Shortcut,
@@ -176,31 +208,59 @@ fn handle_panel_shortcut_event<R: Runtime>(
         let Some(window) = app.get_webview_window("main") else {
             return;
         };
-        let was_hidden = match window.is_visible() {
-            Ok(visible) => !visible,
-            Err(error) => {
-                eprintln!("failed to read panel visibility for global shortcut: {error}");
-                return;
-            }
-        };
 
-        if was_hidden {
-            if let Err(error) = window.show() {
-                eprintln!("failed to show panel for global shortcut: {error}");
+        #[cfg(target_os = "macos")]
+        {
+            let app = app.clone();
+            if let Err(error) = window.with_webview(move |webview| {
+                let main_thread = MainThreadMarker::new()
+                    .expect("Tauri with_webview callbacks run on the main thread");
+                let application = NSApplication::sharedApplication(main_thread);
+                let native_window = webview.ns_window();
+                if native_window.is_null() {
+                    eprintln!("main panel has no native NSWindow for global shortcut");
+                    return;
+                }
+                // Tauri owns the NSWindow; its pointer is valid for this main-thread callback.
+                let native_window: &NSWindow = unsafe { &*native_window.cast() };
+                let plan = reveal_plan(application.isHidden(), native_window.isVisible());
+
+                if plan.unhide_app {
+                    application.unhideWithoutActivation();
+                }
+                if plan.order_front {
+                    native_window.orderFrontRegardless();
+                }
+                emit_panel_toggle(&app, plan.was_hidden);
+            }) {
+                eprintln!("failed to access main panel for global shortcut: {error}");
             }
         }
-        if let Err(error) = window.emit_to(
-            EventTarget::webview_window("main"),
-            TOGGLE_PANEL_EVENT,
-            was_hidden,
-        ) {
-            eprintln!("failed to emit global panel shortcut event: {error}");
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let was_hidden = match window.is_visible() {
+                Ok(visible) => !visible,
+                Err(error) => {
+                    eprintln!("failed to read panel visibility for global shortcut: {error}");
+                    return;
+                }
+            };
+
+            if was_hidden {
+                if let Err(error) = window.show() {
+                    eprintln!("failed to show panel for global shortcut: {error}");
+                }
+            }
+            emit_panel_toggle(app, was_hidden);
         }
     });
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::reveal_plan;
     use super::{
         apply_shortcut_update, canonicalize_shortcut, handle_shortcut_event, is_pressed,
         PanelShortcutError, PanelShortcutUpdate, ShortcutRegistrar,
@@ -432,5 +492,32 @@ mod tests {
         handle_shortcut_event(ShortcutState::Released, || called = true);
 
         assert!(!called);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn visible_app_and_window_need_no_reveal() {
+        let plan = reveal_plan(false, true);
+        assert!(!plan.was_hidden);
+        assert!(!plan.unhide_app);
+        assert!(!plan.order_front);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hidden_app_needs_nonactivating_unhide_and_nonkey_reveal() {
+        let plan = reveal_plan(true, true);
+        assert!(plan.was_hidden);
+        assert!(plan.unhide_app);
+        assert!(plan.order_front);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn individually_hidden_window_needs_only_nonkey_reveal() {
+        let plan = reveal_plan(false, false);
+        assert!(plan.was_hidden);
+        assert!(!plan.unhide_app);
+        assert!(plan.order_front);
     }
 }
