@@ -598,6 +598,42 @@ p {
   white-space: nowrap;
 }
 
+.shortcut-settings {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.shortcut-settings__value {
+  width: 100%;
+}
+
+.shortcut-settings__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.shortcut-settings__actions button {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.shortcut-settings__recording,
+.shortcut-settings__error {
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.shortcut-settings__recording {
+  color: #98c379;
+}
+
+.shortcut-settings__error {
+  color: #e06c75;
+}
+
 .status-color-settings {
   border: 1px solid #3b4048;
   border-radius: 6px;

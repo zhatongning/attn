@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { CodexHookIntegrationStatus, SessionRow, SourceHealth } from "../../shared/types/session";
 import {
   dismissSession as dismissSessionCommand,
+  configurePanelShortcut,
   installCodexHooks,
   jumpToSession as jumpToSessionCommand,
   loadCodexHookIntegrationStatus,
@@ -20,7 +21,12 @@ import {
   type StatusPanelCopy,
   type StatusPanelRow,
 } from "./statusPanel";
-import { normalizePanelToggleShortcut } from "./panelShortcut";
+import {
+  capturePanelShortcut,
+  DEFAULT_PANEL_TOGGLE_SHORTCUT,
+  formatPanelShortcut,
+  normalizePanelToggleShortcut,
+} from "./panelShortcut";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
@@ -54,6 +60,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const [commandMessage, setCommandMessage] = useState<string | null>(null);
   const [jumpNotice, setJumpNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [shortcutRegistrationError, setShortcutRegistrationError] = useState(false);
+  const [shortcutRecording, setShortcutRecording] = useState(false);
+  const [shortcutApplyPending, setShortcutApplyPending] = useState(false);
   const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
   const [hookInstallPending, setHookInstallPending] = useState(false);
   const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss" | "pin" | "unpin">>({});
@@ -62,6 +71,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const alertSignatureRef = useRef<string | null>(null);
   const autoCollapseTimerRef = useRef<number | undefined>(undefined);
   const latestRefreshIdRef = useRef(0);
+  const shortcutUpdateSequenceRef = useRef(0);
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
@@ -137,6 +147,12 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     const refreshTimer = window.setInterval(() => {
       void refreshPanel();
     }, 5000);
+    const shortcutUpdateSequence = shortcutUpdateSequenceRef.current;
+    void configurePanelShortcut(configRef.current.panelToggleShortcut).catch(() => {
+      if (!cancelled && shortcutUpdateSequence === shortcutUpdateSequenceRef.current) {
+        setShortcutRegistrationError(true);
+      }
+    });
     let unlistenToggle: (() => void) | undefined;
     let unlistenMenu: (() => void) | undefined;
 
@@ -158,6 +174,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       if (event.payload === "management") {
+        setShortcutRecording(false);
         updateDraftConfig(configRef.current);
         void refreshHookStatus();
         setView("management");
@@ -180,6 +197,27 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       unlistenMenu?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (!shortcutRecording || view !== "management") return;
+
+    const recordKeydown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, select, textarea, [contenteditable]:not([contenteditable="false"])')) {
+        return;
+      }
+      event.preventDefault();
+      const captured = capturePanelShortcut(event);
+      if (captured.status === "captured") {
+        updateDraftConfig((current) => ({ ...current, panelToggleShortcut: captured.value }));
+      }
+      if (captured.status !== "ignored") {
+        setShortcutRecording(false);
+      }
+    };
+    window.addEventListener("keydown", recordKeydown, true);
+    return () => window.removeEventListener("keydown", recordKeydown, true);
+  }, [shortcutRecording, view]);
 
   useEffect(() => {
     configRef.current = config;
@@ -394,6 +432,8 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
             <h1>{model.copy.managementTitle}</h1>
         </div>
         <button type="button" className="icon-button icon-button--back" data-no-window-drag onClick={() => {
+          setShortcutRecording(false);
+          setShortcutRegistrationError(false);
           updateDraftConfig(configRef.current);
           setView("panel");
         }}>
@@ -472,6 +512,41 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
               <option value="persistent">{model.copy.persistentLabel}</option>
             </select>
           </label>
+
+          <div className="shortcut-settings" data-no-window-drag>
+            <label className="setting-field" htmlFor="panel-toggle-shortcut">
+              <span>{model.copy.panelToggleShortcutLabel}</span>
+            </label>
+            <input
+              id="panel-toggle-shortcut"
+              className="shortcut-settings__value"
+              type="text"
+              aria-label={model.copy.panelToggleShortcutLabel}
+              readOnly
+              value={draftConfig.panelToggleShortcut === null
+                ? model.copy.disabledPanelShortcutLabel
+                : formatPanelShortcut(draftConfig.panelToggleShortcut)}
+            />
+            <div className="shortcut-settings__actions">
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => setShortcutRecording(true)}>
+                {model.copy.recordPanelShortcutLabel}
+              </button>
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+                setShortcutRecording(false);
+                updateDraftConfig((current) => ({ ...current, panelToggleShortcut: null }));
+              }}>
+                {model.copy.clearPanelShortcutLabel}
+              </button>
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+                setShortcutRecording(false);
+                updateDraftConfig((current) => ({ ...current, panelToggleShortcut: DEFAULT_PANEL_TOGGLE_SHORTCUT }));
+              }}>
+                {model.copy.restorePanelShortcutLabel}
+              </button>
+            </div>
+            {shortcutRecording ? <span className="shortcut-settings__recording" role="status" aria-live="polite" aria-label={model.copy.panelToggleShortcutLabel}>{model.copy.recordingPanelShortcutLabel}</span> : null}
+            {shortcutRegistrationError ? <span className="shortcut-settings__error" role="alert">{model.copy.panelShortcutRegistrationErrorLabel}</span> : null}
+          </div>
 
           <label className="setting-field">
             <span>{model.copy.alertDisplaySecondsLabel}</span>
@@ -579,7 +654,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
           </section>
 
           <div className="management-actions">
-            <button type="button" onClick={applyDraftConfig}>
+            <button type="button" disabled={shortcutApplyPending} onClick={applyDraftConfig}>
               {model.copy.applySettingsLabel}
             </button>
           </div>
@@ -773,16 +848,41 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     setDraftConfig(resolvedConfig);
   }
 
-  function applyDraftConfig() {
+  async function applyDraftConfig() {
+    if (shortcutApplyPending) return;
+    shortcutUpdateSequenceRef.current += 1;
     const nextConfig = normalizeConfig(draftConfigRef.current);
+    setShortcutRecording(false);
+    setShortcutApplyPending(true);
+    try {
+      const result = await configurePanelShortcut(nextConfig.panelToggleShortcut);
+      if (!mountedRef.current) return;
+      const committedConfig = {
+        ...nextConfig,
+        panelToggleShortcut: result?.activeShortcut === undefined
+          ? nextConfig.panelToggleShortcut
+          : result.activeShortcut,
+      };
+      commitConfig(committedConfig);
+      updateDraftConfig(committedConfig);
+      setShortcutRegistrationError(false);
+      setView("panel");
+      void refreshPanel(committedConfig.followUpToIdleMinutes);
+    } catch {
+      if (!mountedRef.current) return;
+      commitConfig({ ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut });
+      setShortcutRegistrationError(true);
+    } finally {
+      if (mountedRef.current) setShortcutApplyPending(false);
+    }
+  }
+
+  function commitConfig(nextConfig: StatusPanelConfig) {
     const nextModel = buildStatusPanelModel(rows, nextConfig);
     clearAutoCollapseTimer();
     configRef.current = nextConfig;
     setConfig(nextConfig);
     setPanelOpen(nextConfig.panelMode === "persistent" || hasPreventAutoCollapseStatus(nextModel, nextConfig));
-    updateDraftConfig(nextConfig);
-    setView("panel");
-    void refreshPanel(nextConfig.followUpToIdleMinutes);
   }
 
   async function installHooks() {
@@ -833,6 +933,8 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   function togglePanelOpen(wasHidden = false) {
     clearAutoCollapseTimer();
     if (wasHidden) {
+      setShortcutRecording(false);
+      setShortcutRegistrationError(false);
       setView("panel");
       setPanelOpen(true);
       return;
