@@ -1118,6 +1118,21 @@ describe("StatusPanelView", () => {
     expect(window.localStorage.getItem("agent-session-inbox.statusPanelConfig")).toBeNull();
   });
 
+  it.each([
+    ["legacy storage without a shortcut", "agent-session-inbox.statusPanelConfig", {}, "shift+alt+super+space"],
+    ["malformed shortcut", "attn.statusPanelConfig", { panelToggleShortcut: "not-a-shortcut" }, "shift+alt+super+space"],
+    ["valid shortcut", "attn.statusPanelConfig", { panelToggleShortcut: "control+alt+super+p" }, "control+alt+super+p"],
+    ["explicitly disabled shortcut", "attn.statusPanelConfig", { panelToggleShortcut: null }, null],
+  ])("normalizes %s storage", async (_label, storageKey, config, expectedShortcut) => {
+    window.localStorage.setItem(storageKey, JSON.stringify(config));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(readPersistedConfig().panelToggleShortcut).toBe(expectedShortcut);
+    });
+  });
+
   it("shows five rows only after visible-item settings are confirmed", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;

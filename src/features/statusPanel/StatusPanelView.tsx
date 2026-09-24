@@ -20,6 +20,7 @@ import {
   type StatusPanelCopy,
   type StatusPanelRow,
 } from "./statusPanel";
+import { normalizePanelToggleShortcut } from "./panelShortcut";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
@@ -1160,6 +1161,7 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
   const followUpToIdleMinutes = normalizeFollowUpToIdleMinutes(value.followUpToIdleMinutes);
 
   return {
+    panelToggleShortcut: normalizePanelToggleShortcut(value.panelToggleShortcut),
     styleFamily: value.styleFamily === "atom" ? value.styleFamily : defaultStatusPanelConfig.styleFamily,
     palette: value.palette === "oneDark" ? value.palette : defaultStatusPanelConfig.palette,
     language: value.language === "zh" ? "zh" : "en",
