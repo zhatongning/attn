@@ -906,7 +906,7 @@ describe("StatusPanelView", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("ignores a stale startup conflict after a successful shortcut update", async () => {
+  it("continues shortcut settings Apply after a startup conflict without a stale alert", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     let rejectStartup: ((reason: string) => void) | undefined;
     const startup = new Promise<never>((_resolve, reject) => { rejectStartup = reject; });
@@ -922,11 +922,213 @@ describe("StatusPanelView", () => {
     const openSettings = await renderShortcutSettings();
     fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
     fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
-    await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBeNull());
+    expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
 
+    await act(async () => rejectStartup?.("registration_failed"));
+    await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBeNull());
+    await openSettings();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("serializes startup reconciliation before shortcut settings Apply", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let resolveStartup: ((value: { activeShortcut: string | null }) => void) | undefined;
+    const startup = new Promise<{ activeShortcut: string | null }>((resolve) => { resolveStartup = resolve; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === "shift+alt+super+space"
+          ? startup
+          : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "configure_panel_shortcut"))
+      .toEqual([["configure_panel_shortcut", { shortcut: "shift+alt+super+space" }]]);
+    expect((screen.getByRole("button", { name: "Back" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
+
+    await act(async () => resolveStartup?.({ activeShortcut: "shift+alt+super+space" }));
+    await waitFor(() => {
+      expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "configure_panel_shortcut"))
+        .toEqual([
+          ["configure_panel_shortcut", { shortcut: "shift+alt+super+space" }],
+          ["configure_panel_shortcut", { shortcut: null }],
+        ]);
+      expect(readPersistedConfig().panelToggleShortcut).toBeNull();
+    });
+  });
+
+  it("does not revive a startup conflict after Back dismisses shortcut settings", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let rejectStartup: ((reason: string) => void) | undefined;
+    const startup = new Promise<never>((_resolve, reject) => { rejectStartup = reject; });
+    tauriCoreMock.invoke.mockImplementation((command: string) => {
+      if (command === "configure_panel_shortcut") return startup;
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    const openSettings = await renderShortcutSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await act(async () => rejectStartup?.("registration_failed"));
     await openSettings();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps a dismissed shortcut settings failure quiet while retaining the requested draft", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let rejectUpdate: ((reason: string) => void) | undefined;
+    const update = new Promise<never>((_resolve, reject) => { rejectUpdate = reject; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === "alt+super+p" ? update : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    const { listen } = await import("@tauri-apps/api/event");
+    let openManagement: ((event: { payload: string }) => void) | undefined;
+    let togglePanel: ((event: { payload: boolean }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") openManagement = callback as typeof openManagement;
+      if (event === "agent-session-inbox://toggle-panel") togglePanel = callback as typeof togglePanel;
+      return () => undefined;
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await act(async () => openManagement?.({ payload: "management" }));
+    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+    fireEvent.change(screen.getByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    await act(async () => togglePanel?.({ payload: true }));
+    expect(screen.getByRole("main").className).not.toContain("management-shell");
+    await act(async () => rejectUpdate?.("registration_failed"));
+    await waitFor(() => expect(readPersistedConfig()).toMatchObject({
+      language: "zh",
+      panelToggleShortcut: "shift+alt+super+space",
+    }));
+
+    await act(async () => openManagement?.({ payload: "management" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value).toBe("Option-Command-P");
+  });
+
+  it("normalizes failed shortcut settings drafts and refreshes with the committed follow-up threshold", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        if (args?.shortcut === "alt+super+p") throw "invalid_shortcut";
+        return { activeShortcut: args?.shortcut ?? null };
+      }
+      if (command === "list_sessions") return initialSessions;
+      return null;
+    });
+    await renderShortcutSettings();
+    fireEvent.change(screen.getByLabelText("Visible items"), { target: { value: "9" } });
+    fireEvent.change(screen.getByLabelText("Follow-up to idle minutes"), { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("That shortcut could not be registered."));
+    expect(readPersistedConfig()).toMatchObject({
+      visibleItemCount: 8,
+      followUpToIdleMinutes: 20,
+      panelToggleShortcut: "shift+alt+super+space",
+    });
+    expect((screen.getByLabelText("Visible items") as HTMLInputElement).value).toBe("8");
+    expect((screen.getByLabelText("Follow-up to idle minutes") as HTMLInputElement).value).toBe("20");
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value).toBe("Option-Command-P");
+    await waitFor(() => expect(lastInvokeCall("list_sessions")).toEqual([
+      "list_sessions", { followUpToIdleMinutes: 20 },
+    ]));
+  });
+
+  it("does not enqueue two shortcut settings updates from rapid Apply clicks", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let resolveUpdate: ((value: { activeShortcut: string | null }) => void) | undefined;
+    const update = new Promise<{ activeShortcut: string | null }>((resolve) => { resolveUpdate = resolve; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === null ? update : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
+    const applyButton = screen.getByRole("button", { name: "Apply settings" });
+
+    act(() => {
+      applyButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      applyButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await waitFor(() => expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "configure_panel_shortcut"))
+      .toHaveLength(2));
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => resolveUpdate?.({ activeShortcut: null }));
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "configure_panel_shortcut"))
+      .toHaveLength(2);
+  });
+
+  it("drops a queued shortcut settings Apply after unmount", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let resolveStartup: ((value: { activeShortcut: string | null }) => void) | undefined;
+    const startup = new Promise<{ activeShortcut: string | null }>((resolve) => { resolveStartup = resolve; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === "shift+alt+super+space"
+          ? startup
+          : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    await renderShortcutSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+    cleanup();
+
+    await act(async () => resolveStartup?.({ activeShortcut: "shift+alt+super+space" }));
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "configure_panel_shortcut"))
+      .toHaveLength(1);
+    expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
+  });
+
+  it("commits a successful shortcut settings Apply after hidden-window dismissal", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let resolveUpdate: ((value: { activeShortcut: string | null }) => void) | undefined;
+    const update = new Promise<{ activeShortcut: string | null }>((resolve) => { resolveUpdate = resolve; });
+    tauriCoreMock.invoke.mockImplementation((command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        return args?.shortcut === null ? update : Promise.resolve({ activeShortcut: args?.shortcut ?? null });
+      }
+      if (command === "list_sessions") return Promise.resolve(initialSessions);
+      return Promise.resolve(null);
+    });
+    const { listen } = await import("@tauri-apps/api/event");
+    let openManagement: ((event: { payload: string }) => void) | undefined;
+    let togglePanel: ((event: { payload: boolean }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") openManagement = callback as typeof openManagement;
+      if (event === "agent-session-inbox://toggle-panel") togglePanel = callback as typeof togglePanel;
+      return () => undefined;
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await act(async () => openManagement?.({ payload: "management" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear shortcut" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    await act(async () => togglePanel?.({ payload: true }));
+    await act(async () => resolveUpdate?.({ activeShortcut: null }));
+    await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBeNull());
+    expect(screen.getByRole("main").className).not.toContain("management-shell");
   });
 
   it("disables shortcut actions while a native update is pending", async () => {

@@ -71,7 +71,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const alertSignatureRef = useRef<string | null>(null);
   const autoCollapseTimerRef = useRef<number | undefined>(undefined);
   const latestRefreshIdRef = useRef(0);
-  const shortcutUpdateSequenceRef = useRef(0);
+  const shortcutErrorGenerationRef = useRef(0);
+  const shortcutUpdateQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const shortcutApplyPendingRef = useRef(false);
+  const shortcutFailedWhileDismissedRef = useRef(false);
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
@@ -140,6 +143,14 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     }
   }
 
+  function configurePanelShortcutInOrder(shortcut: string | null, isCurrent: () => boolean) {
+    const update = shortcutUpdateQueueRef.current.then(() => isCurrent()
+      ? configurePanelShortcut(shortcut)
+      : { activeShortcut: shortcut });
+    shortcutUpdateQueueRef.current = update.then(() => undefined, () => undefined);
+    return update;
+  }
+
   useEffect(() => {
     mountedRef.current = true;
     let cancelled = false;
@@ -147,9 +158,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     const refreshTimer = window.setInterval(() => {
       void refreshPanel();
     }, 5000);
-    const shortcutUpdateSequence = shortcutUpdateSequenceRef.current;
-    void configurePanelShortcut(configRef.current.panelToggleShortcut).catch(() => {
-      if (!cancelled && shortcutUpdateSequence === shortcutUpdateSequenceRef.current) {
+    const shortcutErrorGeneration = shortcutErrorGenerationRef.current;
+    void configurePanelShortcutInOrder(configRef.current.panelToggleShortcut, () => !cancelled).catch(() => {
+      if (!cancelled && shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
         setShortcutRegistrationError(true);
       }
     });
@@ -175,7 +186,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
       if (event.payload === "management") {
         setShortcutRecording(false);
-        updateDraftConfig(configRef.current);
+        if (!shortcutApplyPendingRef.current && !shortcutFailedWhileDismissedRef.current) {
+          updateDraftConfig(configRef.current);
+        }
         void refreshHookStatus();
         setView("management");
       }
@@ -431,7 +444,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
           <div className="panel-title">
             <h1>{model.copy.managementTitle}</h1>
         </div>
-        <button type="button" className="icon-button icon-button--back" data-no-window-drag onClick={() => {
+        <button type="button" className="icon-button icon-button--back" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+          if (shortcutApplyPendingRef.current) return;
+          shortcutErrorGenerationRef.current += 1;
+          shortcutFailedWhileDismissedRef.current = false;
           setShortcutRecording(false);
           setShortcutRegistrationError(false);
           updateDraftConfig(configRef.current);
@@ -849,13 +865,16 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   }
 
   async function applyDraftConfig() {
-    if (shortcutApplyPending) return;
-    shortcutUpdateSequenceRef.current += 1;
+    if (shortcutApplyPendingRef.current) return;
+    shortcutApplyPendingRef.current = true;
+    shortcutFailedWhileDismissedRef.current = false;
+    shortcutErrorGenerationRef.current += 1;
+    const shortcutErrorGeneration = shortcutErrorGenerationRef.current;
     const nextConfig = normalizeConfig(draftConfigRef.current);
     setShortcutRecording(false);
     setShortcutApplyPending(true);
     try {
-      const result = await configurePanelShortcut(nextConfig.panelToggleShortcut);
+      const result = await configurePanelShortcutInOrder(nextConfig.panelToggleShortcut, () => mountedRef.current);
       if (!mountedRef.current) return;
       const committedConfig = {
         ...nextConfig,
@@ -865,14 +884,22 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       };
       commitConfig(committedConfig);
       updateDraftConfig(committedConfig);
+      shortcutFailedWhileDismissedRef.current = false;
       setShortcutRegistrationError(false);
       setView("panel");
       void refreshPanel(committedConfig.followUpToIdleMinutes);
     } catch {
       if (!mountedRef.current) return;
       commitConfig({ ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut });
-      setShortcutRegistrationError(true);
+      updateDraftConfig(nextConfig);
+      void refreshPanel(nextConfig.followUpToIdleMinutes);
+      if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
+        setShortcutRegistrationError(true);
+      } else {
+        shortcutFailedWhileDismissedRef.current = true;
+      }
     } finally {
+      shortcutApplyPendingRef.current = false;
       if (mountedRef.current) setShortcutApplyPending(false);
     }
   }
@@ -933,6 +960,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   function togglePanelOpen(wasHidden = false) {
     clearAutoCollapseTimer();
     if (wasHidden) {
+      shortcutErrorGenerationRef.current += 1;
       setShortcutRecording(false);
       setShortcutRegistrationError(false);
       setView("panel");
