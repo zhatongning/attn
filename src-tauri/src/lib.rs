@@ -2,6 +2,8 @@ pub mod codex_source;
 pub mod codex_hooks;
 pub mod domain;
 pub mod inbox_store;
+#[cfg(desktop)]
+pub mod panel_shortcut;
 
 use std::sync::Arc;
 

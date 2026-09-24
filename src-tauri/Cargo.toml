@@ -37,3 +37,6 @@ tauri-plugin = "=2.0.0"
 tauri-runtime = "=2.0.0"
 tauri-runtime-wry = "=2.0.0"
 tauri-utils = "=2.0.0"
+
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-global-shortcut = "=2.0.0"
