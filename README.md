@@ -1,108 +1,148 @@
 # Attn
 
-Mac local attention panel for agent sessions that need intervention.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## Current MVP
+> A local macOS attention panel for Codex sessions that need a human decision, review, or recovery.
 
-- Lists observed Codex sessions in a compact floating status panel.
-- Supports manual dismiss and restore.
-- Preserves low-confidence and unknown rows instead of auto-clearing them.
-- Exposes Tauri commands for list, dismiss, restore, source health, and jump-back result reporting.
-- Routes jump-back to Codex Desktop, a live iTerm Codex session, or a previous iTerm tab for the same workspace.
-- Reads local Codex threads from `~/.codex/state_5.sqlite`, uses JSONL files under `~/.codex/sessions` as durable event evidence, can consume compact Codex hook events from `~/.codex/agent-session-inbox/hook-events.jsonl`, and refreshes the inbox every 5 seconds.
-- Shows settings from the macOS app menu. The panel itself does not render a settings button.
-- Floats above other windows as a single panel window and joins all macOS Spaces. Attn does not create duplicate panels for secondary displays.
-- Supports moving the panel by dragging the header, persists the dragged position, and keeps app-menu `Position` commands for quick corner placement.
+Attn is a small, always-available status panel for people who work across several Codex sessions. It turns local session evidence into a short answer to one question: **do I need to do anything with this session now?**
 
-See [Window Placement](docs/window-placement.md) for the current macOS Spaces and display behavior.
+It is an MVP for local use. Its primary focus is Codex Desktop, with limited Codex CLI jump-back support through iTerm.
 
-## Status Tokens
+## The Problem
 
-The compact panel maps internal session evidence to intervention statuses:
+When several agent sessions run in parallel, important moments are easy to miss:
 
-| Token | Status | Meaning |
+- An agent needs structured input, confirmation, or another intervention.
+- A task completed and its result should be checked while the context is still fresh.
+- A run stopped before completing.
+- A session looks active, but the available evidence is incomplete or degraded.
+
+Codex has useful session history, but it does not provide a single local, actionable watchlist for these situations. Attn brings the relevant local signals into one compact panel without becoming a full session dashboard.
+
+## What Attn Does
+
+- Observes local Codex sessions and presents only parent sessions in a compact floating panel.
+- Classifies sessions as `blocked`, `attention`, `inspect`, `running`, `follow-up`, `stopped`, or `idle`.
+- Keeps actionable rows ahead of quiet context and lets users expand the panel when they need more detail.
+- Supports Jump back, pin, dismiss, and restore actions.
+- Routes Jump back to a matching live iTerm Codex session when possible, then a matching iTerm workspace tab, and finally the exact Codex Desktop thread deep link.
+- Refreshes the panel every five seconds and keeps the panel visible across macOS Spaces.
+- Lets the user position the single panel by dragging it or through the macOS app menu.
+
+## How It Works
+
+Attn combines several local evidence sources instead of treating one timestamp as definitive:
+
+| Source | What Attn uses it for |
+| --- | --- |
+| Codex hooks | Strong live evidence that a session is active when the optional hooks are installed. |
+| Codex session JSONL | Durable task events, including completion, stop, and structured input evidence. |
+| Codex SQLite thread database | Session discovery, titles, workspaces, archival state, and metadata. |
+| Live CLI process scan | A fallback signal that a matching Codex CLI session is still running. |
+
+The Rust source layer collects observations, normalizes them into session rows, and passes them to the React status-panel model. The panel ranks rows, renders actions, and persists only its local configuration and user choices.
+
+For the detailed state machine, evidence rules, and transition rationale, see [Status Flow](docs/status-flow.md). For macOS display behavior, see [Window Placement](docs/window-placement.md).
+
+## Statuses
+
+| Status | Meaning | Expected action |
 | --- | --- | --- |
-| `● blocked` | `blocked` | The agent appears stuck, hit a repeated failure, or needs a decision before it can continue. |
-| `● attention` | `attention` | The agent is waiting for user intervention, such as approval, confirmation, or additional information. |
-| `● inspect` | `inspect` | The agent produced a result that should be checked while context is fresh. |
-| `○ running` | `running` | The agent is actively executing work right now and does not need intervention. It stays visible with quiet styling. |
-| `○ follow-up` | `follow-up` | The session was opened recently and remains a quiet follow-up state outside Alerts before it settles. |
-| `● stopped` | `stopped` | The run was manually stopped or aborted before a completion signal. Decide whether to continue, inspect, or dismiss it. |
-| `○ idle` | `idle` | The previous intervention or inspection was confirmed, or an old Desktop thread has no recent activity. It is quiet baseline state and contributes to the quiet count instead of occupying a card by default. |
+| `blocked` | The evidence indicates an actionable source problem or unresolved failure. | Investigate the source or decide how to continue. |
+| `attention` | The agent is waiting for structured user input. | Provide the required input or resolve the request. |
+| `inspect` | A recent, unread task completion or reviewable failure needs checking. | Open the session and inspect the result. |
+| `running` | The session has current activity evidence. | No action required; it remains visible as context. |
+| `follow-up` | Attn recorded a successful acknowledgement of a completed result. | No immediate action required. |
+| `stopped` | The run ended before a completion signal. | Continue, inspect, or dismiss it. |
+| `idle` | The session is old or no action is currently required. | No action required. |
 
-Each row also carries a confidence value:
+Selecting **Jump back** from an `inspect` row is Attn's reliable acknowledgement action. It changes that exact completion signal to the quiet `follow-up` state for the configured window, then to `idle`. Opening the same Codex Desktop thread outside Attn does not currently acknowledge it because Codex does not expose a reliable per-thread read/open signal to this app.
 
-- `exact`: direct source evidence was found.
-- `inferred`: the app inferred the state from local metadata or process evidence.
-- `unknown` / `unavailable`: source evidence is missing or unavailable.
+## Data And Privacy
 
-Dismissed rows stay hidden while they remain quiet. If the same session becomes `inspect`, `follow-up`, `blocked`, or actively `running` again, it returns to the panel. Clicking Jump back confirms the current inspect signal and starts the short follow-up window before the row settles back to `idle`.
+Attn operates on local Codex data. It reads:
 
-## Codex Hook Events
+- Codex thread metadata from the local SQLite state database.
+- Session JSONL files under `~/.codex/sessions` for status evidence.
+- Optional hook events from `~/.codex/agent-session-inbox/hook-events.jsonl`.
 
-Attn includes a lightweight Codex hook writer at `scripts/attn-codex-hook.cjs`.
-When installed into Codex hooks, it appends compact lifecycle events to:
+The hook writer records only the metadata needed for state transitions: event type, timestamp, session ID when supplied, workspace path, and tool name. It does not write raw prompts or model output. The panel displays status metadata and evidence confidence rather than conversation content.
 
-```text
-~/.codex/agent-session-inbox/hook-events.jsonl
-```
+Hook installation is explicit. From **Attn -> Settings**, choose **Install Codex hooks** to merge Attn commands into the existing user-level Codex hook configuration. Existing hook commands are preserved and duplicate Attn commands are avoided.
 
-The writer stores only metadata required for status transitions: hook event type, timestamp, session id when Codex provides it, workspace path, and tool name. It does not store raw prompt or model output.
+## Requirements
 
-Hook activity is used as strong live evidence for `running`:
+- macOS. The native app uses macOS-specific Tauri APIs and exposes a macOS app-menu workflow.
+- Node.js and npm.
+- A Rust toolchain and the platform dependencies required by Tauri.
+- Local Codex Desktop or Codex CLI session data.
 
-- `SessionStart`
-- `UserPromptSubmit`
-- `PreToolUse`
-- `PostToolUse`
+The repository does not yet publish a tested Node.js, Rust, or macOS version matrix. Treat source builds as the supported installation path for this MVP.
 
-`Stop` is recorded but does not by itself mean the session completed. After `Stop`, Attn falls back to JSONL and SQLite evidence to decide whether the row should become `inspect`, `follow-up`, `blocked`, `stopped`, or `idle`.
-
-The app does not edit `~/.codex/hooks.json` automatically at startup. Open the management page from the macOS app menu and choose `Install Codex hooks` to merge Attn hook commands into the existing user-level Codex hooks.
-Existing hooks are preserved and Attn commands are de-duplicated.
-
-The installed command shape is:
+## Run Locally
 
 ```bash
-node /Users/edy/sofdev/agent-session-inbox/scripts/attn-codex-hook.cjs PreToolUse
-```
-
-## Run
-
-```bash
-npm install
-npm run dev
-```
-
-Open `http://127.0.0.1:1420/` for browser preview.
-
-For desktop:
-
-```bash
+git clone <repository-url> attn
+cd attn
+npm ci
 npm run tauri dev
 ```
 
-## Verify
+Use the browser preview for UI work only:
+
+```bash
+npm run dev
+```
+
+It is served at `http://127.0.0.1:1420/`. Native window management, hook installation, and Jump back need the Tauri desktop runtime.
+
+## Verify And Build
 
 ```bash
 npm test
-npm run build
 npm run test:rust
+npm run build
 ```
 
-`npm run tauri build -- --debug` builds the debug binary and `.app`. On this machine the `.app` is produced at:
+To build a debug macOS app bundle:
 
-```text
-src-tauri/target/debug/bundle/macos/Attn.app
+```bash
+npm run tauri build -- --debug
 ```
 
-The final `.dmg` packaging step may wait on macOS AppleScript window decoration; the `.app` build is sufficient for MVP validation.
+## Project Map
 
-## Scope Notes
+| Area | Main location |
+| --- | --- |
+| Codex data discovery and JSONL parsing | `src-tauri/src/codex_source.rs` |
+| Observation-to-session classification | `src-tauri/src/domain/classification.rs` |
+| Acknowledgement, pin, dismiss, and Jump back behavior | `src-tauri/src/inbox_store.rs` |
+| Tauri commands and macOS window setup | `src-tauri/src/lib.rs` |
+| Status ranking and display model | `src/features/statusPanel/statusPanel.ts` |
+| Panel UI and local settings | `src/features/statusPanel/StatusPanelView.tsx` |
 
-- Codex desktop only for v1.
-- Claude, phone workflows, scheduled cleanup, and real activity summarization are post-MVP.
-- No raw prompt/output content is stored in this MVP; rows carry metadata and confidence only.
-- Activity state prefers recent Codex hook events when installed, then falls back to SQLite thread metadata and JSONL task events. Unread `task_complete` becomes `inspect`; opening it starts the short `follow-up` window before it moves to `idle`. Live Desktop or CLI activity becomes `running`.
-- CLI jump-back targets iTerm first by matching live Codex process cwd to tty. If no live Codex process is found, it tries an iTerm tab whose shell cwd is the same workspace before falling back to the exact Codex Desktop thread deeplink.
-- TODO: Add Warp live terminal targeting once its scriptability/API is defined.
+## Known Limitations
+
+These are current product and technical boundaries, not guarantees that the panel can infer every session state correctly.
+
+1. **No reliable external read signal for Codex Desktop.** Attn can acknowledge an `inspect` row after its own successful Jump back action, but it cannot prove that a user opened or read the same historical thread directly in Codex Desktop.
+2. **Live status is stronger with hooks installed.** Without optional Codex hooks, Attn falls back to JSONL, SQLite, and process evidence; some `running` states are therefore inferred rather than directly observed.
+3. **Some lifecycle windows are technical defaults.** Recent activity is currently two hours, unread completed work remains `inspect` for up to 12 hours, and the post-acknowledgement `follow-up` window defaults to 30 minutes with a 20-minute minimum. These values need continued product validation.
+4. **Some quiet and review states are intentionally broad.** `inspect` can represent either a successful completion or a reviewable failure, while `idle` can mean either old inactivity or a result that has already been acknowledged.
+5. **The product scope is narrow.** v1 does not support other agent providers, mobile workflows, scheduled cleanup, real activity summaries, or Warp terminal targeting.
+6. **The repository is not yet ready for public open-source distribution.** It has no declared license and `package.json` is marked `private`. A license, contribution policy, compatibility matrix, and release process are needed before treating it as a reusable public project.
+
+## Contributing
+
+Contributions should preserve the distinction between evidence and inference. When changing session behavior:
+
+1. Describe the source event or metadata that supports the new state.
+2. Add or update the focused JavaScript and Rust tests.
+3. Update [Status Flow](docs/status-flow.md) when transition or acknowledgement semantics change.
+4. Do not add raw prompts, model output, or private session data to tests, issues, or examples.
+
+Before accepting external contributions, maintainers should add a `LICENSE` file and a dedicated contribution policy.
+
+## License
+
+No license is currently declared. Until a license is added, the repository does not grant rights to use, modify, or redistribute its code, and contribution terms are unspecified. Choose and add an appropriate license before publishing Attn as an open-source project.

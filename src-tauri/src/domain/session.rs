@@ -58,6 +58,8 @@ pub struct SourceObservation {
     pub workspace_path: Option<String>,
     pub last_activity_at: Option<String>,
     pub evidence_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_subagent_count: Option<u32>,
     pub jump_target: JumpTarget,
 }
 
@@ -74,6 +76,7 @@ impl SourceObservation {
             workspace_path: None,
             last_activity_at: None,
             evidence_summary: None,
+            active_subagent_count: None,
             jump_target: JumpTarget::Unknown,
         }
     }
@@ -117,6 +120,11 @@ impl SourceObservation {
         self.jump_target = jump_target;
         self
     }
+
+    pub fn with_active_subagent_count(mut self, count: Option<u32>) -> Self {
+        self.active_subagent_count = count.filter(|count| *count > 0);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,11 +136,15 @@ pub struct SessionRow {
     pub thread_source: Option<String>,
     pub parent_session_id: Option<String>,
     pub project_name: Option<String>,
+    #[serde(skip)]
+    pub observation_kind: Option<ObservationKind>,
     pub state: SessionState,
     pub confidence: Confidence,
     pub workspace_path: Option<String>,
     pub last_activity_at: Option<String>,
     pub evidence_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_subagent_count: Option<u32>,
     pub status_reason: String,
     pub dismissability_reason: Option<String>,
     pub handled: bool,
@@ -156,11 +168,13 @@ impl SessionRow {
             thread_source: None,
             parent_session_id: None,
             project_name: None,
+            observation_kind: None,
             state,
             confidence,
             workspace_path: None,
             last_activity_at: None,
             evidence_summary: None,
+            active_subagent_count: None,
             status_reason: String::new(),
             dismissability_reason: None,
             handled: false,
@@ -191,6 +205,11 @@ impl SessionRow {
         self
     }
 
+    pub fn with_observation_kind(mut self, observation_kind: ObservationKind) -> Self {
+        self.observation_kind = Some(observation_kind);
+        self
+    }
+
     pub fn with_workspace(mut self, workspace_path: Option<String>) -> Self {
         self.workspace_path = workspace_path;
         self
@@ -213,6 +232,11 @@ impl SessionRow {
 
     pub fn with_evidence_summary(mut self, evidence_summary: Option<String>) -> Self {
         self.evidence_summary = evidence_summary.filter(|value| !value.is_empty());
+        self
+    }
+
+    pub fn with_active_subagent_count(mut self, count: Option<u32>) -> Self {
+        self.active_subagent_count = count.filter(|count| *count > 0);
         self
     }
 

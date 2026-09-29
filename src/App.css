@@ -332,6 +332,10 @@ p {
   content: none;
 }
 
+.status-row--subagent-active {
+  --subagent-accent: #e5c07b;
+}
+
 .status-row--idle {
   --status-color: #5c6370;
   --row-border-color: #2f353f;
@@ -392,6 +396,22 @@ p {
 .status-workspace {
   min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-subagent-badge {
+  background: rgba(229, 192, 123, 0.12);
+  border: 1px solid rgba(229, 192, 123, 0.42);
+  border-radius: 3px;
+  color: var(--subagent-accent, #e5c07b);
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+  max-width: 135px;
+  overflow: hidden;
+  padding: 1px 4px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

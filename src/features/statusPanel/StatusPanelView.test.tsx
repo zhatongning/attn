@@ -103,6 +103,65 @@ describe("StatusPanelView", () => {
     expect(document.querySelector(".panel-footer")).toBeNull();
   });
 
+  it("identifies parent work driven by active subagents", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      language: "zh",
+      panelMode: "persistent",
+    }));
+    const row: SessionRow = {
+      ...initialSessions[1],
+      sessionId: "parent-with-subagent",
+      label: "Parent with active child",
+      activeSubagentCount: 3,
+    };
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    const marker = screen.getByTestId("status-subagent-parent-with-subagent");
+    expect(marker.textContent).toBe("子代理活动 · 3");
+    expect(marker.getAttribute("aria-label")).toBe("子代理活动 · 3");
+    expect(screen.getByTestId("status-row-parent-with-subagent").className)
+      .toContain("status-row--subagent-active");
+  });
+
+  it("keeps the marker visible when a quiet parent has active subagents", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      language: "zh",
+      panelMode: "persistent",
+    }));
+    const row: SessionRow = {
+      ...initialSessions[1],
+      sessionId: "quiet-parent-with-subagent",
+      label: "Quiet parent with active child",
+      state: "idle",
+      activeSubagentCount: 1,
+    };
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.getByTestId("status-subagent-quiet-parent-with-subagent").textContent)
+      .toBe("子代理活动 · 1");
+    expect(screen.getByTestId("status-row-quiet-parent-with-subagent").className)
+      .toContain("status-row--working");
+  });
+
+  it("does not render a subagent marker for ordinary parent rows", () => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      language: "zh",
+      panelMode: "persistent",
+    }));
+    const row: SessionRow = {
+      ...initialSessions[1],
+      sessionId: "ordinary-parent",
+    };
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    expect(screen.queryByTestId("status-subagent-ordinary-parent")).toBeNull();
+    expect(screen.getByTestId("status-row-ordinary-parent").className)
+      .not.toContain("status-row--subagent-active");
+  });
+
   it("places session counters at the bottom right when expanded", () => {
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
 
@@ -178,9 +237,10 @@ describe("StatusPanelView", () => {
     expect(screen.getByText("Retained refresh task")).toBeTruthy();
     expect(await screen.findByText("list_sessions unavailable")).toBeTruthy();
     expect(screen.getByText("Retained refresh task")).toBeTruthy();
+    expect(screen.getByText("Unable to load Codex source.")).toBeTruthy();
   });
 
-  it("keeps the newer running snapshot when an older refresh completes later", async () => {
+  it("schedules the next poll only after a slow source request settles", async () => {
     const followUpRow: SessionRow = {
       ...initialSessions[0],
       sessionId: "refresh-ordering-session",
@@ -200,46 +260,160 @@ describe("StatusPanelView", () => {
     const olderRefresh = new Promise<SessionRow[]>((resolve) => {
       resolveOlderRefresh = resolve;
     });
+    let resolveNewerRefresh: ((rows: SessionRow[]) => void) | undefined;
+    const newerRefresh = new Promise<SessionRow[]>((resolve) => {
+      resolveNewerRefresh = resolve;
+    });
     let listRequestCount = 0;
     tauriCoreMock.invoke.mockImplementation((command: string) => {
       if (command === "list_sessions") {
         listRequestCount += 1;
-        return listRequestCount === 1 ? olderRefresh : Promise.resolve([runningRow]);
+        return listRequestCount === 1 ? olderRefresh : newerRefresh;
       }
       if (command === "source_health") return Promise.resolve(fakeSourceHealth);
       return Promise.resolve(null);
     });
 
-    const originalSetInterval = window.setInterval.bind(window);
+    const originalSetTimeout = window.setTimeout.bind(window);
     let refreshTimer: (() => void) | undefined;
-    vi.spyOn(window, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number) => {
+    vi.spyOn(window, "setTimeout").mockImplementation(((handler: TimerHandler, timeout?: number) => {
       if (timeout === 5000 && typeof handler === "function") {
         refreshTimer = () => handler();
         return 1;
       }
 
-      return originalSetInterval(handler, timeout);
-    }) as typeof window.setInterval);
+      return originalSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
 
     render(<StatusPanelView initialRows={[followUpRow]} sourceHealth={fakeSourceHealth} />);
 
     await waitFor(() => {
       expect(listRequestCount).toBe(1);
     });
-    await act(async () => {
-      refreshTimer?.();
-      await Promise.resolve();
-    });
-    await waitFor(() => {
-      expect(screen.getByTestId("status-row-refresh-ordering-session").className).toContain("status-row--working");
-    });
+    expect(refreshTimer).toBeUndefined();
 
     await act(async () => {
       resolveOlderRefresh?.([followUpRow]);
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId("status-row-refresh-ordering-session").className).toContain("status-row--working");
+    await waitFor(() => {
+      expect(screen.getByTestId("status-row-refresh-ordering-session").className).toContain("status-row--needed");
+      expect(refreshTimer).toBeTruthy();
+    });
+
+    await act(async () => {
+      refreshTimer?.();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(listRequestCount).toBe(2);
+    });
+
+    await act(async () => {
+      resolveNewerRefresh?.([runningRow]);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("status-row-refresh-ordering-session").className).toContain("status-row--working");
+    });
+  });
+
+  it("does not revive a completed polling loop after unmounting a pending refresh", async () => {
+    let resolveInitialRefresh: ((rows: SessionRow[]) => void) | undefined;
+    const initialRefresh = new Promise<SessionRow[]>((resolve) => {
+      resolveInitialRefresh = resolve;
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation((command: string) => {
+      if (command === "list_sessions") return initialRefresh;
+      return Promise.resolve(null);
+    });
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(tauriCoreMock.invoke).toHaveBeenCalledWith("list_sessions", { followUpToIdleMinutes: 30 });
+    });
+    rendered.unmount();
+
+    await act(async () => {
+      resolveInitialRefresh?.(initialSessions);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), 5000);
+  });
+
+  it("drops a queued direct refresh when the panel unmounts", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "unmount-queued-direct-refresh",
+      label: "Queued direct refresh task",
+      state: "inspect",
+      pinned: false,
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const pinnedRow: SessionRow = { ...row, pinned: true };
+    let resolveInitialRefresh: ((rows: SessionRow[]) => void) | undefined;
+    const initialRefresh = new Promise<SessionRow[]>((resolve) => {
+      resolveInitialRefresh = resolve;
+    });
+    let listRequestCount = 0;
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation((command: string) => {
+      if (command === "list_sessions") {
+        listRequestCount += 1;
+        return initialRefresh;
+      }
+      if (command === "pin_session") return Promise.resolve([pinnedRow]);
+      return Promise.resolve(null);
+    });
+
+    const rendered = render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => {
+      expect(listRequestCount).toBe(1);
+    });
+    expandPanel();
+    fireEvent.click(await screen.findByTitle("Pin session"));
+    expect(await screen.findByTitle("Unpin session")).toBeTruthy();
+
+    rendered.unmount();
+    await act(async () => {
+      resolveInitialRefresh?.([row]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(listRequestCount).toBe(1);
+  });
+
+  it("marks the source unavailable without clearing a stale running snapshot", async () => {
+    const staleRunningRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "clear-stale-running-on-failure",
+      label: "Stale running task",
+      state: "running",
+      statusReason: "running signal observed",
+    };
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") throw new Error("list_sessions unavailable");
+      return null;
+    });
+
+    render(<StatusPanelView initialRows={[staleRunningRow]} sourceHealth={fakeSourceHealth} />);
+
+    expect(await screen.findByText("list_sessions unavailable")).toBeTruthy();
+    expect(screen.getByText("Unable to load Codex source.")).toBeTruthy();
+    expect(screen.queryByText("0 alerts")).toBeNull();
+    expect(screen.queryByText("1 running")).toBeNull();
+    expect(screen.getByTestId("status-row-clear-stale-running-on-failure")).toBeTruthy();
   });
 
   it("shows a newly refreshed follow-up in an unused slot without treating it as an alert", async () => {
@@ -2197,7 +2371,7 @@ describe("StatusPanelView", () => {
     expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
   });
 
-  it("clears completed jump feedback after three seconds", async () => {
+  it("shows and clears jump feedback without waiting for a slow reconciliation", async () => {
     vi.useFakeTimers();
     const row: SessionRow = {
       ...initialSessions[0],
@@ -2236,6 +2410,9 @@ describe("StatusPanelView", () => {
     tauriWindowMock.setSize.mockClear();
     fireEvent.click(jumpButton);
 
+    expect(resolveJump).toBeTruthy();
+    expect(screen.getByText("Opening session")).toBeTruthy();
+
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
@@ -2262,21 +2439,8 @@ describe("StatusPanelView", () => {
     expect(sessionRequestCount).toBe(2);
     expect(resolveRefresh).toBeTruthy();
     const resolveJumpRefresh = resolveRefresh;
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3000);
-    });
-    expect(screen.getByText("Opening session")).toBeTruthy();
-    expect((jumpButton as HTMLButtonElement).disabled).toBe(true);
-
-    await act(async () => {
-      resolveJumpRefresh?.(jsonResponse([row]));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
     expect(screen.getByText("Opened Codex Desktop session.")).toBeTruthy();
-
+    expect(screen.getByTitle("Jump back")).toBeTruthy();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2999);
     });
@@ -2284,8 +2448,16 @@ describe("StatusPanelView", () => {
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await Promise.resolve();
     });
     expect(screen.queryByText("Opened Codex Desktop session.")).toBeNull();
+
+    await act(async () => {
+      resolveJumpRefresh?.(jsonResponse([row]));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     const footer = document.querySelector(".panel-footer") as HTMLElement;
     expect(footer).toBeTruthy();
     expect(within(footer).queryByText("Opened Codex Desktop session.")).toBeNull();
@@ -2783,7 +2955,7 @@ describe("StatusPanelView", () => {
     });
   });
 
-  it("does not let a pre-mutation refresh overwrite the post-mutation snapshot", async () => {
+  it("does not let a pre-mutation refresh overwrite the post-mutation snapshot or block its controls", async () => {
     const initialRow: SessionRow = {
       ...initialSessions[0],
       sessionId: "mutation-refresh-row",
@@ -2830,16 +3002,20 @@ describe("StatusPanelView", () => {
 
     fireEvent.click(await screen.findByTitle("Pin session"));
 
-    await waitFor(() => {
-      expect(listCallCount).toBe(2);
-    });
     expect(await screen.findByText("Post-mutation row")).toBeTruthy();
     expect(screen.getByTitle("Unpin session")).toBeTruthy();
+    expect(screen.getByText("Pinned session")).toBeTruthy();
+    expect(listCallCount).toBe(1);
 
     await act(async () => {
       resolveStaleRefresh?.([staleRow]);
       await Promise.resolve();
       await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(listCallCount).toBe(2);
+      expect(screen.getByTitle("Unpin session")).toBeTruthy();
     });
 
     expect(screen.getByText("Post-mutation row")).toBeTruthy();

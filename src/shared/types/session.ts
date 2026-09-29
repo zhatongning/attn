@@ -9,6 +9,8 @@ export interface SessionRow {
   agentName?: string;
   threadSource?: string;
   parentSessionId?: string;
+  /** Number of currently running child agents attributed to this parent session. */
+  activeSubagentCount?: number;
   projectName?: string;
   workspacePath?: string;
   lastActivityAt?: string;

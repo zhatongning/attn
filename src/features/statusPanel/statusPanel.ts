@@ -63,6 +63,8 @@ export interface StatusPanelCopy {
   panelShortcutRestartRequiredLabel: string;
   alertsLabel: string;
   workingLabel: string;
+  subagentActivityLabel: (count: number) => string;
+  activeSubagentsPrefix: string;
   hiddenAlertsLabel: string;
   hiddenPinnedLabel: string;
   collapseLabel: string;
@@ -237,6 +239,8 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     panelShortcutRestartRequiredLabel: "Shortcut state is uncertain. Restart Attn to restore shortcut settings.",
     alertsLabel: "alerts",
     workingLabel: "running",
+    subagentActivityLabel: (count) => `subagent active · ${count}`,
+    activeSubagentsPrefix: "Active subagents",
     hiddenAlertsLabel: "alerts",
     hiddenPinnedLabel: "pinned",
     collapseLabel: "collapse",
@@ -330,6 +334,8 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
     panelShortcutRestartRequiredLabel: "快捷键状态不确定。请重启 Attn 后再设置快捷键。",
     alertsLabel: "需关注",
     workingLabel: "进行中",
+    subagentActivityLabel: (count) => `子代理活动 · ${count}`,
+    activeSubagentsPrefix: "活跃子代理",
     hiddenAlertsLabel: "需关注",
     hiddenPinnedLabel: "已固定",
     collapseLabel: "收起",
@@ -536,6 +542,7 @@ function toPanelRow(row: SessionRow, theme: AtomInterventionTheme, copy: StatusP
 
   return {
     ...row,
+    activeSubagentCount: normalizedActiveSubagentCount(row.activeSubagentCount),
     pinned: row.pinned === true,
     displayStatus,
     statusLabel: status.label,
@@ -550,6 +557,15 @@ function toPanelRow(row: SessionRow, theme: AtomInterventionTheme, copy: StatusP
 }
 
 function displayStatusForRow(row: SessionRow): InterventionStatus {
+  const hasActiveSubagents = normalizedActiveSubagentCount(row.activeSubagentCount) > 0;
+  if (
+    hasActiveSubagents
+    && (row.state === "idle"
+      || row.state === "dismissable"
+      || (row.state === "unknown" && !isAttentionWorthyUnknown(row.confidence, row.statusReason)))
+  ) {
+    return "working";
+  }
   if (row.state === "inspect" || row.state === "dismissable") return "inspect";
   if (row.state === "waitingForInput") return "input";
   if (row.state === "stopped") return "stopped";
@@ -564,6 +580,7 @@ function displayStatusForRow(row: SessionRow): InterventionStatus {
 }
 
 function shouldIncludeInWatchlist(row: SessionRow) {
+  if (normalizedActiveSubagentCount(row.activeSubagentCount) > 0) return true;
   if (row.state !== "unknown") return true;
   return hasActionableUnknownEvidence(row.statusReason);
 }
@@ -601,8 +618,16 @@ function evidenceTooltipForRow(row: SessionRow, copy: StatusPanelCopy) {
   return [
     `${copy.statusPrefix}${copy.labelSeparator}${row.statusReason}`,
     row.evidenceSummary ? `${copy.evidencePrefix}${copy.labelSeparator}${row.evidenceSummary}` : undefined,
+    normalizedActiveSubagentCount(row.activeSubagentCount) > 0
+      ? `${copy.activeSubagentsPrefix}${copy.labelSeparator}${normalizedActiveSubagentCount(row.activeSubagentCount)}`
+      : undefined,
     row.lastActivityAt ? `${copy.lastActivityPrefix}${copy.labelSeparator}${row.lastActivityAt}` : undefined,
     `${copy.jumpTargetPrefix}${copy.labelSeparator}${copy.jumpTargetLabels[row.jumpTarget]}`,
     `${copy.confidencePrefix}${copy.labelSeparator}${copy.confidenceLabels[row.confidence]}`,
   ].filter(Boolean).join("\n");
+}
+
+function normalizedActiveSubagentCount(value: number | undefined) {
+  if (!Number.isFinite(value) || value === undefined) return 0;
+  return Math.max(0, Math.trunc(value));
 }

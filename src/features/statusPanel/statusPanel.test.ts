@@ -320,6 +320,51 @@ describe("buildStatusPanelModel", () => {
     ].join("\n"));
   });
 
+  it("marks a parent row when active subagents are driving its work", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("parent", "running", "running signal observed"),
+        activeSubagentCount: 2,
+      },
+    ], { ...defaultStatusPanelConfig, language: "zh" });
+
+    expect(model.visibleRows[0].activeSubagentCount).toBe(2);
+    expect(model.copy.subagentActivityLabel(2)).toBe("子代理活动 · 2");
+    expect(model.visibleRows[0].evidenceTooltip).toContain("活跃子代理：2");
+  });
+
+  it("keeps idle or non-actionable unknown parents visible while subagents run", () => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("idle-parent", "idle", "completed task is no longer recent"),
+        activeSubagentCount: 1,
+      },
+      {
+        ...row("unknown-parent", "unknown", "source status not available yet"),
+        confidence: "unknown",
+        activeSubagentCount: 1,
+      },
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 2 });
+
+    expect(model.visibleRows.map((item) => [item.sessionId, item.displayStatus])).toEqual([
+      ["idle-parent", "working"],
+      ["unknown-parent", "working"],
+    ]);
+  });
+
+  it("does not mark rows when the active subagent count is absent or invalid", () => {
+    const model = buildStatusPanelModel([
+      row("missing", "running", "running signal observed"),
+      {
+        ...row("negative", "running", "running signal observed"),
+        activeSubagentCount: -1,
+      },
+    ], { ...defaultStatusPanelConfig, visibleItemCount: 2 });
+
+    expect(model.visibleRows.map((item) => item.activeSubagentCount)).toEqual([0, 0]);
+    expect(model.visibleRows.every((item) => !item.evidenceTooltip.includes("Active subagents"))).toBe(true);
+  });
+
   it("excludes subagent rows from panel cards, counters, and parent summaries", () => {
     const model = buildStatusPanelModel(
       [

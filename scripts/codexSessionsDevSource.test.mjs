@@ -83,7 +83,7 @@ describe("codexSessionsDevSource", () => {
     expect(selectLiveCliPrimarySessionId(`${cliArgs} resume ${parentId}`, [childId])).toBe(parentId);
   });
 
-  it("sorts running ahead of follow-up and stopped rows", () => {
+  it("keeps a completion inspectable when SQLite updates one millisecond later", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
     createThreadsTable(stateDb);
@@ -99,9 +99,9 @@ describe("codexSessionsDevSource", () => {
         event: '{"timestamp":"2026-06-17T01:02:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"continue"}}',
       },
       {
-        id: "019needed",
+        id: "019inspect-after-sqlite-update",
         event: '{"timestamp":"2026-06-17T01:01:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
-        updatedAtMs: Date.parse("2026-06-17T01:01:30.000Z"),
+        updatedAtMs: Date.parse("2026-06-17T01:01:00.001Z"),
       },
       {
         id: "019inspect",
@@ -143,8 +143,8 @@ describe("codexSessionsDevSource", () => {
 
     expect(sessions.map((row) => row.state)).toEqual([
       "inspect",
+      "inspect",
       "running",
-      "needsAttention",
       "stopped",
     ]);
   });
@@ -199,6 +199,120 @@ describe("codexSessionsDevSource", () => {
       statusReason: "completed task ready to inspect; open it to mark read",
       jumpAvailability: "exact",
       jumpTarget: "desktop",
+    });
+  });
+
+  it("prefers a persisted thread name over the initial title for listing and lookup", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb);
+    execFileSync("sqlite3", [
+      stateDb,
+      "alter table threads add column name text;",
+    ]);
+    insertThread({
+      stateDb,
+      id: "019renamed",
+      rolloutPath: path.join(temp, "missing-renamed.jsonl"),
+      cwd: "/Users/edy/project",
+      title: "Initial prompt title",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Preview title",
+      updatedAtMs: Date.parse("2026-06-03T02:00:00.000Z"),
+    });
+    execFileSync("sqlite3", [
+      stateDb,
+      "update threads set name = 'Renamed session' where id = '019renamed';",
+    ]);
+
+    const options = {
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:00:01.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      liveCliTtyForWorkspace: () => undefined,
+    };
+    const [listed] = discoverCodexSessions(options);
+    const lookedUp = discoverCodexThreadById("019renamed", options);
+
+    expect(listed.label).toBe("Renamed session");
+    expect(lookedUp?.label).toBe("Renamed session");
+  });
+
+  it("falls back to the title when a legacy database lacks names and spawn edges", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    createThreadsTable(stateDb, { includeSpawnEdges: false });
+    insertThread({
+      stateDb,
+      id: "019legacy-title",
+      rolloutPath: path.join(temp, "missing-legacy.jsonl"),
+      cwd: "/Users/edy/project",
+      title: "Legacy title",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Legacy preview",
+      updatedAtMs: Date.parse("2026-06-03T02:00:00.000Z"),
+    });
+
+    const options = {
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:00:01.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      liveCliTtyForWorkspace: () => undefined,
+    };
+    const [listed] = discoverCodexSessions(options);
+    const lookedUp = discoverCodexThreadById("019legacy-title", options);
+
+    expect(listed.label).toBe("Legacy title");
+    expect(lookedUp?.label).toBe("Legacy title");
+  });
+
+  it("reopens a completed session when a new tool turn starts", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019continued-tool.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019continued-tool","cwd":"/Users/edy/project","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        '{"timestamp":"2026-06-03T02:30:00.000Z","type":"event_msg","payload":{"type":"task_started"}}',
+        '{"timestamp":"2026-06-03T02:30:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_tool"}}',
+        '{"timestamp":"2026-06-03T02:30:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_tool"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019continued-tool",
+      rolloutPath,
+      cwd: "/Users/edy/project",
+      title: "Continued tool turn",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Continued tool turn",
+      updatedAtMs: Date.parse("2026-06-03T02:30:02.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:31:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows[0]).toMatchObject({
+      sessionId: "019continued-tool",
+      state: "running",
+      lastActivityAt: "2026-06-03T02:30:02.000Z",
     });
   });
 
@@ -298,6 +412,96 @@ describe("codexSessionsDevSource", () => {
     expect(rows[0]).toMatchObject({
       sessionId: "019parent-capacity",
       threadSource: "user",
+    });
+  });
+
+  it("marks a parent with active subagent count while hiding child rows", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "05");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const parentPath = path.join(sessionDir, "rollout-2026-06-05T08-00-00-019parent.jsonl");
+    const runningChildPath = path.join(sessionDir, "rollout-2026-06-05T08-01-00-019running-child.jsonl");
+    const completedChildPath = path.join(sessionDir, "rollout-2026-06-05T08-02-00-019completed-child.jsonl");
+    fs.writeFileSync(parentPath, [
+      '{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019parent","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","source":"vscode","thread_source":"user"}}',
+      '{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent waiting on agents"}}',
+      "",
+    ].join("\n"));
+    fs.writeFileSync(runningChildPath, [
+      '{"timestamp":"2026-06-05T08:01:00.000Z","type":"session_meta","payload":{"id":"019running-child","parent_thread_id":"019parent","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}',
+      '{"timestamp":"2026-06-05T08:25:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child still working"}}',
+      "",
+    ].join("\n"));
+    fs.writeFileSync(completedChildPath, [
+      '{"timestamp":"2026-06-05T08:02:00.000Z","type":"session_meta","payload":{"id":"019completed-child","parent_thread_id":"019parent","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}',
+      '{"timestamp":"2026-06-05T08:25:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+      "",
+    ].join("\n"));
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019parent",
+      rolloutPath: parentPath,
+      cwd: "/Users/edy/project-parent",
+      title: "Parent session",
+      source: "vscode",
+      threadSource: "user",
+      preview: "Parent session",
+      updatedAtMs: Date.parse("2026-06-05T08:20:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: "019running-child",
+      rolloutPath: runningChildPath,
+      cwd: "/Users/edy/project-child",
+      title: "Running child",
+      source: "vscode",
+      threadSource: "subagent",
+      preview: "Running child",
+      updatedAtMs: Date.parse("2026-06-05T08:25:00.000Z"),
+    });
+    insertThread({
+      stateDb,
+      id: "019completed-child",
+      rolloutPath: completedChildPath,
+      cwd: "/Users/edy/project-child",
+      title: "Completed child",
+      source: "vscode",
+      threadSource: "subagent",
+      preview: "Completed child",
+      updatedAtMs: Date.parse("2026-06-05T08:25:00.000Z"),
+    });
+    execFileSync("sqlite3", [
+      stateDb,
+      "insert into thread_spawn_edges (child_thread_id, parent_thread_id) values ('019running-child', '019parent'), ('019completed-child', '019parent');",
+    ]);
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-05T08:30:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019parent",
+      activeSubagentCount: 1,
+    });
+    expect(rows.some((row) => row.sessionId.endsWith("child"))).toBe(false);
+
+    const lookedUp = discoverCodexThreadById("019parent", {
+      stateDbPath: stateDb,
+      nowMs: Date.parse("2026-06-05T08:30:00.000Z"),
+      unreadCompletionTrackingStartMs: earlyTrackingStartMs,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+    expect(lookedUp).toMatchObject({
+      sessionId: "019parent",
+      activeSubagentCount: 1,
     });
   });
 
@@ -583,6 +787,7 @@ describe("codexSessionsDevSource", () => {
     const workspacePath = "/Users/edy/project";
     fs.mkdirSync(sessionDir, { recursive: true });
     createThreadsTable(stateDb);
+    execFileSync("sqlite3", [stateDb, "alter table threads add column name text;"]);
     fs.mkdirSync(sqliteBinDir, { recursive: true });
     fs.writeFileSync(
       path.join(sqliteBinDir, "sqlite3"),
@@ -804,7 +1009,7 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
-  it("uses the configured follow-up boundary for SQLite read signals", () => {
+  it("does not treat SQLite updates as read signals at the follow-up boundary", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
     const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
@@ -844,9 +1049,9 @@ describe("codexSessionsDevSource", () => {
     expect(atBoundaryRows).toHaveLength(1);
     expect(atBoundaryRows[0]).toMatchObject({
       sessionId: "019read-signal",
-      state: "needsAttention",
-      statusReason: "completed task was opened; keep it quiet during the follow-up window",
-      lastActivityAt: "2026-06-06T04:10:00.000Z",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+      lastActivityAt: "2026-06-06T04:05:00.000Z",
     });
 
     const afterBoundaryRows = discoverCodexSessions({
@@ -861,8 +1066,8 @@ describe("codexSessionsDevSource", () => {
 
     expect(afterBoundaryRows[0]).toMatchObject({
       sessionId: "019read-signal",
-      state: "idle",
-      statusReason: "completed task is no longer recent; idle until the next source signal",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
     });
   });
 
@@ -1587,6 +1792,54 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
+  it("keeps a stale completed matching live CLI row idle instead of marking it running", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "09");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-09T15-55-11-019eab60-da30-7ea3-8b66-b53dd94db261.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-09T07:55:00.000Z","type":"session_meta","payload":{"id":"019eab60-da30-7ea3-8b66-b53dd94db261","cwd":"/Users/edy/hose/tmc_symposium/tmc_surprise","originator":"Codex CLI","source":"cli"}}',
+        '{"timestamp":"2026-06-09T08:07:25.205Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"external-import-turn-1"}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019eab60-da30-7ea3-8b66-b53dd94db261",
+      rolloutPath,
+      cwd: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+      title: "外部终端完成的任务",
+      source: "cli",
+      threadSource: "user",
+      preview: "外部终端完成的任务",
+      updatedAtMs: Date.parse("2026-06-09T08:07:25.205Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-10T07:00:00.000Z"),
+      limit: 20,
+      liveCliSessions: [{
+        sessionId: "019eab60-da30-7ea3-8b66-b53dd94db261",
+        workspacePath: "/Users/edy/hose/tmc_symposium/tmc_surprise",
+        tty: "ttys012",
+      }],
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019eab60-da30-7ea3-8b66-b53dd94db261",
+      state: "idle",
+      confidence: "inferred",
+      statusReason: "completed task is no longer recent; idle until the next source signal",
+    });
+  });
+
   it("treats a newer user message after task_complete as active work", () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
@@ -1617,6 +1870,46 @@ describe("codexSessionsDevSource", () => {
       state: "running",
       statusReason: "running signal observed",
       lastActivityAt: "2026-06-03T02:30:00.000Z",
+    });
+  });
+
+  it("keeps a completed session terminal when a response item follows task_complete", () => {
+    const temp = tempDir();
+    const stateDb = path.join(temp, "state_5.sqlite");
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "03");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = path.join(sessionDir, "rollout-2026-06-03T10-00-00-019done-response.jsonl");
+    fs.writeFileSync(
+      rolloutPath,
+      [
+        '{"timestamp":"2026-06-03T02:00:00.000Z","type":"session_meta","payload":{"id":"019done-response","cwd":"/Users/edy/wmhcar","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-03T02:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+        '{"timestamp":"2026-06-03T02:21:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}',
+        "",
+      ].join("\n"),
+    );
+    createThreadsTable(stateDb);
+    insertThread({
+      stateDb,
+      id: "019done-response",
+      rolloutPath,
+      cwd: "/Users/edy/wmhcar",
+      title: "Completed response item",
+      updatedAtMs: Date.parse("2026-06-03T02:21:00.000Z"),
+    });
+
+    const rows = discoverCodexSessions({
+      stateDbPath: stateDb,
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-03T02:25:00.000Z"),
+      liveCliSessions: [],
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019done-response",
+      state: "idle",
+      lastActivityAt: "2026-06-03T02:20:00.000Z",
     });
   });
 

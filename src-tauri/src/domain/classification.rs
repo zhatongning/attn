@@ -2,12 +2,13 @@ use super::confidence::Confidence;
 use super::session::{ObservationKind, SessionRow, SessionState, SourceObservation};
 
 pub fn classify_observation(observation: SourceObservation) -> SessionRow {
+    let observation_kind = observation.kind;
     let label = observation
         .label
         .clone()
         .unwrap_or_else(|| format!("Codex session {}", observation.session_id));
 
-    let (state, confidence, reason) = match observation.kind {
+    let (state, confidence, reason) = match observation_kind {
         ObservationKind::Running => (
             SessionState::Running,
             Confidence::Exact,
@@ -60,9 +61,11 @@ pub fn classify_observation(observation: SourceObservation) -> SessionRow {
         .with_thread_source(observation.thread_source)
         .with_parent_session_id(observation.parent_session_id)
         .with_project_name(observation.project_name)
+        .with_observation_kind(observation_kind)
         .with_workspace(observation.workspace_path)
         .with_reason(reason)
         .with_evidence_summary(observation.evidence_summary)
+        .with_active_subagent_count(observation.active_subagent_count)
         .with_last_activity_option(observation.last_activity_at)
         .with_jump_target(observation.jump_target)
 }
@@ -84,6 +87,16 @@ mod tests {
         assert_eq!(row.state, SessionState::WaitingForInput);
         assert_eq!(row.confidence, Confidence::Exact);
         assert_eq!(row.workspace_path.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn carries_active_subagent_count_to_session_row() {
+        let mut observation = SourceObservation::new("parent", ObservationKind::Running);
+        observation.active_subagent_count = Some(2);
+
+        let row = classify_observation(observation);
+
+        assert_eq!(row.active_subagent_count, Some(2));
     }
 
     #[test]

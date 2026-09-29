@@ -12,6 +12,8 @@ use crate::domain::session::{JumpTarget, ObservationKind, SourceObservation};
 const UNREAD_COMPLETION_RETENTION: Duration = Duration::from_secs(12 * 60 * 60);
 const SESSION_TAIL_READ_BYTES: u64 = 128 * 1024;
 const SESSION_HEADER_READ_BYTES: usize = 32 * 1024;
+const SESSION_TAIL_LINE_BACKTRACK_BYTES: u64 = 8 * 1024 * 1024;
+const SESSION_TAIL_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const HOOK_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_FOLLOW_UP_WINDOW: Duration = Duration::from_secs(30 * 60);
 
@@ -49,7 +51,6 @@ struct SessionFileSummary {
 #[derive(Debug, Clone)]
 struct ParsedSessionObservation {
     observation: SourceObservation,
-    task_completed_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +69,6 @@ struct CodexHookSignal {
     timestamp: String,
     timestamp_time: SystemTime,
     session_id: Option<String>,
-    workspace_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,14 +183,38 @@ fn discover_codex_observation_snapshot_with_state_db_and_hooks_and_follow_up_win
     };
 
     let hook_signals = load_latest_hook_signals(hook_events_path);
-
-    ObservationSnapshot {
-        observations: threads
+    let mut observations = threads
+        .into_iter()
+        .filter_map(|thread| {
+            let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
+            observation_from_thread(thread, hook_signal, now, follow_up_window)
+        })
+        .collect::<Vec<_>>();
+    let subagent_threads = match discover_subagent_threads_from_state_db(state_db) {
+        Ok(threads) => threads,
+        Err(sqlite_error) => {
+            return ObservationSnapshot {
+                observations: discover_codex_observations_with_now(sessions_root, limit, now),
+                source: ObservationSnapshotSource::JsonlFallback {
+                    state_db_path: state_db.to_path_buf(),
+                    sqlite_error: format!("SQLite subagent discovery failed: {sqlite_error}"),
+                },
+            };
+        }
+    };
+    observations.extend(
+        subagent_threads
             .into_iter()
+            .filter(|thread| recent_subagent_thread_candidate(thread, &hook_signals, now))
             .filter_map(|thread| {
                 let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
                 observation_from_thread(thread, hook_signal, now, follow_up_window)
-            })
+            }),
+    );
+
+    ObservationSnapshot {
+        observations: annotate_active_subagent_counts(observations)
+            .into_iter()
             .filter(|observation| !is_subagent_observation(observation))
             .take(limit)
             .collect(),
@@ -222,7 +246,15 @@ pub fn discover_codex_observation_by_id_and_follow_up_window(
     let thread = discover_thread_from_state_db_by_id(state_db, session_id)?;
     let hook_signals = load_latest_hook_signals(&codex_hook_events_path());
     let hook_signal = hook_signal_for_thread(&hook_signals, &thread);
-    observation_from_thread(thread, hook_signal, now, follow_up_window)
+    let mut observation = observation_from_thread(thread, hook_signal, now, follow_up_window)?;
+    observation.active_subagent_count = active_subagent_count_for_parent(
+        state_db,
+        &observation,
+        &hook_signals,
+        now,
+        follow_up_window,
+    );
+    Some(observation)
 }
 
 pub fn discover_codex_observations_with_now(
@@ -230,17 +262,41 @@ pub fn discover_codex_observations_with_now(
     limit: usize,
     now: SystemTime,
 ) -> Vec<SourceObservation> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
     let mut summaries = Vec::new();
     collect_session_files(sessions_root, &mut summaries);
 
     summaries.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
 
     let mut observed_session_ids = HashSet::new();
+    let mut parent_count = 0;
+    let mut observations = Vec::new();
+    for summary in summaries {
+        let file_is_old = summary
+            .modified_at
+            .and_then(|modified_at| now.duration_since(modified_at).ok())
+            .is_some_and(|age| age > Duration::from_secs(2 * 60 * 60));
+        if parent_count >= limit && file_is_old {
+            break;
+        }
 
-    summaries
+        let Some(observation) = parse_session_file(&summary.path, now).ok().flatten() else {
+            continue;
+        };
+        if !observed_session_ids.insert(observation.session_id.clone()) {
+            continue;
+        }
+        if !is_subagent_observation(&observation) {
+            parent_count += 1;
+        }
+        observations.push(observation);
+    }
+
+    annotate_active_subagent_counts(observations)
         .into_iter()
-        .filter_map(|summary| parse_session_file(&summary.path, now).ok().flatten())
-        .filter(|observation| observed_session_ids.insert(observation.session_id.clone()))
         .filter(|observation| !is_subagent_observation(observation))
         .take(limit)
         .collect()
@@ -249,6 +305,35 @@ pub fn discover_codex_observations_with_now(
 fn is_subagent_observation(observation: &SourceObservation) -> bool {
     is_subagent_thread_source(observation.thread_source.as_deref())
         || observation.parent_session_id.is_some()
+}
+
+fn annotate_active_subagent_counts(
+    observations: Vec<SourceObservation>,
+) -> Vec<SourceObservation> {
+    let mut active_counts = HashMap::<String, u32>::new();
+    for observation in &observations {
+        if observation.kind != ObservationKind::Running || !is_subagent_observation(observation) {
+            continue;
+        }
+        let Some(parent_session_id) = observation.parent_session_id.as_deref() else {
+            continue;
+        };
+        active_counts
+            .entry(parent_session_id.to_string())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+
+    observations
+        .into_iter()
+        .map(|mut observation| {
+            observation.active_subagent_count = active_counts
+                .get(&observation.session_id)
+                .copied()
+                .filter(|count| *count > 0);
+            observation
+        })
+        .collect()
 }
 
 fn is_subagent_thread_source(thread_source: Option<&str>) -> bool {
@@ -433,18 +518,92 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Result<String, std::io::Error>
     let mut file = fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let start = file_len.saturating_sub(max_bytes);
-    file.seek(SeekFrom::Start(start))?;
-
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-
-    if start > 0 {
-        if let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\n') {
-            bytes.drain(..=first_line_end);
-        }
+    let mut tail = read_file_range(&mut file, start, file_len)?;
+    if start == 0 {
+        return Ok(String::from_utf8_lossy(&tail).into_owned());
     }
 
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let first_line_end = tail.iter().position(|byte| *byte == b'\n');
+    let line_end = first_line_end
+        .map(|index| start + index as u64 + 1)
+        .unwrap_or(file_len);
+    let Some(line_start) = find_line_start(
+        &mut file,
+        start,
+        SESSION_TAIL_LINE_BACKTRACK_BYTES,
+    )? else {
+        trim_leading_partial_line(&mut tail);
+        return Ok(String::from_utf8_lossy(&tail).into_owned());
+    };
+
+    if line_start == start {
+        return Ok(String::from_utf8_lossy(&tail).into_owned());
+    }
+
+    if line_end.saturating_sub(line_start) <= max_bytes {
+        let mut complete_tail = read_file_range(&mut file, line_start, start)?;
+        complete_tail.extend_from_slice(&tail);
+        return Ok(String::from_utf8_lossy(&complete_tail).into_owned());
+    }
+
+    // A single tool result can exceed the tail budget. Skip that oversized line,
+    // but retain the state events immediately before and after it.
+    let context_start = line_start.saturating_sub(max_bytes);
+    let mut complete_tail = read_file_range(&mut file, context_start, line_start)?;
+    if context_start > 0 {
+        trim_leading_partial_line(&mut complete_tail);
+    }
+    if let Some(first_line_end) = first_line_end {
+        complete_tail.extend_from_slice(&tail[first_line_end + 1..]);
+    }
+
+    Ok(String::from_utf8_lossy(&complete_tail).into_owned())
+}
+
+fn read_file_range(
+    file: &mut fs::File,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, std::io::Error> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(end.saturating_sub(start) as usize);
+    file.by_ref()
+        .take(end.saturating_sub(start))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn find_line_start(
+    file: &mut fs::File,
+    position: u64,
+    max_backtrack: u64,
+) -> Result<Option<u64>, std::io::Error> {
+    if position == 0 {
+        return Ok(Some(0));
+    }
+
+    let lower_bound = position.saturating_sub(max_backtrack);
+    let mut cursor = position;
+    while cursor > lower_bound {
+        let chunk_start = cursor
+            .saturating_sub(SESSION_TAIL_SCAN_CHUNK_BYTES as u64)
+            .max(lower_bound);
+        let chunk = read_file_range(file, chunk_start, cursor)?;
+        if let Some(index) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(chunk_start + index as u64 + 1));
+        }
+        cursor = chunk_start;
+    }
+
+    Ok((lower_bound == 0).then_some(0))
+}
+
+fn trim_leading_partial_line(bytes: &mut Vec<u8>) {
+    if let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\n') {
+        bytes.drain(..=first_line_end);
+    } else {
+        bytes.clear();
+    }
 }
 
 fn parse_session_content(
@@ -463,8 +622,8 @@ fn parse_session_content(
     let mut session_name = None;
     let mut jump_target = JumpTarget::Unknown;
     let mut latest_timestamp = None;
-    let mut task_completed_at = None;
     let mut last_activity_kind = ObservationKind::InsufficientEvidence;
+    let mut terminal_turn_closed = false;
     let mut last_agent_message = None;
     let mut pending_tool_approval = None;
     let mut pending_structured_user_input = None;
@@ -520,9 +679,7 @@ fn parse_session_content(
                 }
             }
             Some("event_msg") => {
-                if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-                    latest_timestamp = Some(timestamp.to_string());
-                }
+                let timestamp = value.get("timestamp").and_then(Value::as_str);
                 let event_type = value
                     .get("payload")
                     .and_then(|payload| payload.get("type"))
@@ -537,18 +694,26 @@ fn parse_session_content(
                 }
 
                 if event_type == Some("task_complete") {
+                    latest_timestamp = timestamp.map(ToString::to_string);
                     last_activity_kind = ObservationKind::Completed;
-                    task_completed_at = value
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .and_then(parse_utc_timestamp)
-                        .or(task_completed_at);
+                    terminal_turn_closed = true;
+                    pending_tool_approval = None;
+                    pending_structured_user_input = None;
                 } else if event_type == Some("turn_aborted") {
+                    latest_timestamp = timestamp.map(ToString::to_string);
                     pending_tool_approval = None;
                     pending_structured_user_input = None;
                     last_activity_kind = ObservationKind::Stopped;
-                } else if matches!(event_type, Some("user_message" | "agent_message")) {
+                    terminal_turn_closed = true;
+                } else if matches!(event_type, Some("user_message" | "task_started" | "turn_started")) {
+                    latest_timestamp = timestamp.map(ToString::to_string);
+                    terminal_turn_closed = false;
                     last_activity_kind = ObservationKind::Running;
+                } else if !terminal_turn_closed {
+                    latest_timestamp = timestamp.map(ToString::to_string);
+                    if matches!(event_type, Some("agent_message" | "item_started")) {
+                        last_activity_kind = ObservationKind::Running;
+                    }
                 }
 
                 if let Some(message) = value
@@ -558,6 +723,9 @@ fn parse_session_content(
                 {
                     if message == "<EXTERNAL SESSION IMPORTED>" {
                         external_import_session = true;
+                    }
+                    if terminal_turn_closed {
+                        continue;
                     }
                     if event_type == Some("user_message") && session_name.is_none() {
                         let trimmed = message.trim();
@@ -570,6 +738,9 @@ fn parse_session_content(
                 }
             }
             Some("response_item") => {
+                if terminal_turn_closed {
+                    continue;
+                }
                 if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
                     latest_timestamp = Some(timestamp.to_string());
                 }
@@ -595,10 +766,10 @@ fn parse_session_content(
                         if resolves_pending_structured_user_input {
                             pending_structured_user_input = None;
                         }
-                        if resolves_pending_approval || resolves_pending_structured_user_input {
-                            last_activity_kind = ObservationKind::Running;
-                        }
                     }
+                    last_activity_kind = ObservationKind::Running;
+                } else {
+                    last_activity_kind = ObservationKind::Running;
                 }
             }
             _ => {}
@@ -695,10 +866,7 @@ fn parse_session_content(
 
     observation.evidence_summary = evidence_summary;
 
-    Ok(Some(ParsedSessionObservation {
-        observation,
-        task_completed_at,
-    }))
+    Ok(Some(ParsedSessionObservation { observation }))
 }
 
 fn should_parse_session_status_line(line: &str) -> bool {
@@ -713,7 +881,17 @@ fn should_parse_session_status_line(line: &str) -> bool {
                 && (line.contains("\"type\":\"function_call\"")
                     || line.contains("\"type\": \"function_call\"")
                     || line.contains("\"type\":\"function_call_output\"")
-                    || line.contains("\"type\": \"function_call_output\""))))
+                    || line.contains("\"type\": \"function_call_output\"")
+                    || line.contains("\"type\":\"custom_tool_call\"")
+                    || line.contains("\"type\": \"custom_tool_call\"")
+                    || line.contains("\"type\":\"custom_tool_call_output\"")
+                    || line.contains("\"type\": \"custom_tool_call_output\"")
+                    || line.contains("\"type\":\"agent_message\"")
+                    || line.contains("\"type\": \"agent_message\"")
+                    || line.contains("\"type\":\"reasoning\"")
+                    || line.contains("\"type\": \"reasoning\"")
+                    || line.contains("\"type\":\"message\"")
+                    || line.contains("\"type\": \"message\""))))
 }
 
 fn pending_tool_approval_from_response_item(value: &Value) -> Option<PendingToolApproval> {
@@ -805,6 +983,7 @@ struct ThreadSummary {
     updated_at_ms: Option<i64>,
     source: String,
     cwd: String,
+    name: Option<String>,
     title: String,
     archived: bool,
     agent_nickname: Option<String>,
@@ -816,29 +995,182 @@ struct ThreadSummary {
 fn discover_threads_from_state_db(state_db: &Path) -> Result<Vec<ThreadSummary>, String> {
     let query = format!(
         "{} {} where threads.archived = 0 and coalesce(threads.thread_source, '') <> 'subagent' and thread_spawn_edges.parent_thread_id is null order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc;",
-        thread_summary_json_select(),
+        thread_summary_json_select(true),
         thread_summary_from_clause()
     );
     let legacy_query = format!(
         "{} from threads where archived = 0 and coalesce(thread_source, '') <> 'subagent' order by coalesce(updated_at_ms, updated_at * 1000) desc;",
-        legacy_thread_summary_json_select()
+        legacy_thread_summary_json_select(true)
     );
-    discover_thread_summaries_from_state_db(state_db, query, legacy_query)
+    let no_name_query = format!(
+        "{} {} where threads.archived = 0 and coalesce(threads.thread_source, '') <> 'subagent' and thread_spawn_edges.parent_thread_id is null order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc;",
+        thread_summary_json_select(false),
+        thread_summary_from_clause()
+    );
+    let no_name_legacy_query = format!(
+        "{} from threads where archived = 0 and coalesce(thread_source, '') <> 'subagent' order by coalesce(updated_at_ms, updated_at * 1000) desc;",
+        legacy_thread_summary_json_select(false)
+    );
+    discover_thread_summaries_from_state_db(
+        state_db,
+        query,
+        legacy_query,
+        no_name_query,
+        no_name_legacy_query,
+    )
+}
+
+fn discover_subagent_threads_from_state_db(
+    state_db: &Path,
+) -> Result<Vec<ThreadSummary>, String> {
+    discover_subagent_threads_from_state_db_for_parent(state_db, None)
+}
+
+fn discover_subagent_threads_from_state_db_for_parent(
+    state_db: &Path,
+    parent_session_id: Option<&str>,
+) -> Result<Vec<ThreadSummary>, String> {
+    let edge_filter = parent_session_id
+        .map(|parent| {
+            format!(
+                "and (coalesce(threads.thread_source, '') = 'subagent' or thread_spawn_edges.parent_thread_id = '{}')",
+                sqlite_string_literal(parent)
+            )
+        })
+        .unwrap_or_else(|| {
+            "and (coalesce(threads.thread_source, '') = 'subagent' or thread_spawn_edges.parent_thread_id is not null)"
+                .to_string()
+        });
+    let query = format!(
+        "{} {} where threads.archived = 0 {} order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc;",
+        thread_summary_json_select(true),
+        thread_summary_from_clause(),
+        edge_filter
+    );
+    let legacy_query = format!(
+        "{} from threads where archived = 0 and coalesce(thread_source, '') = 'subagent' order by coalesce(updated_at_ms, updated_at * 1000) desc;",
+        legacy_thread_summary_json_select(true)
+    );
+    let no_name_query = format!(
+        "{} {} where threads.archived = 0 {} order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc;",
+        thread_summary_json_select(false),
+        thread_summary_from_clause(),
+        edge_filter
+    );
+    let no_name_legacy_query = format!(
+        "{} from threads where archived = 0 and coalesce(thread_source, '') = 'subagent' order by coalesce(updated_at_ms, updated_at * 1000) desc;",
+        legacy_thread_summary_json_select(false)
+    );
+    discover_thread_summaries_from_state_db(
+        state_db,
+        query,
+        legacy_query,
+        no_name_query,
+        no_name_legacy_query,
+    )
+}
+
+fn active_subagent_count_for_parent(
+    state_db: &Path,
+    parent: &SourceObservation,
+    hook_signals: &HashMap<String, CodexHookSignal>,
+    now: SystemTime,
+    follow_up_window: Duration,
+) -> Option<u32> {
+    if is_subagent_observation(parent) {
+        return None;
+    }
+
+    let child_threads = discover_subagent_threads_from_state_db_for_parent(
+        state_db,
+        Some(&parent.session_id),
+    )
+    .ok()?;
+    let count = child_threads
+        .into_iter()
+        .filter(|thread| recent_subagent_thread_candidate(thread, hook_signals, now))
+        .filter_map(|thread| {
+            let hook_signal = hook_signal_for_thread(hook_signals, &thread);
+            observation_from_thread(thread, hook_signal, now, follow_up_window)
+        })
+        .filter(|observation| {
+            observation.kind == ObservationKind::Running
+                && observation.parent_session_id.as_deref() == Some(parent.session_id.as_str())
+        })
+        .count();
+
+    u32::try_from(count).ok().filter(|count| *count > 0)
+}
+
+fn recent_subagent_thread_candidate(
+    thread: &ThreadSummary,
+    hook_signals: &HashMap<String, CodexHookSignal>,
+    now: SystemTime,
+) -> bool {
+    let hook_is_recent = hook_signal_for_thread(hook_signals, thread)
+        .and_then(|signal| now.duration_since(signal.timestamp_time).ok())
+        .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60));
+    if hook_is_recent {
+        return true;
+    }
+
+    let Some(updated_at_ms) = thread.updated_at_ms else {
+        return true;
+    };
+    let Some(updated_at) = updated_at_system_time(updated_at_ms) else {
+        return false;
+    };
+    if now
+        .duration_since(updated_at)
+        .is_ok_and(|age| age <= Duration::from_secs(2 * 60 * 60))
+    {
+        return true;
+    }
+
+    fs::metadata(&thread.rollout_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified_at| now.duration_since(modified_at).ok())
+        .is_some_and(|age| age <= Duration::from_secs(2 * 60 * 60))
+}
+
+fn updated_at_system_time(value: i64) -> Option<SystemTime> {
+    if value < 0 {
+        return None;
+    }
+    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(value as u64))
 }
 
 fn discover_thread_from_state_db_by_id(state_db: &Path, session_id: &str) -> Option<ThreadSummary> {
     let query = format!(
         "{} {} where threads.id = '{}' limit 1;",
-        thread_summary_json_select(),
+        thread_summary_json_select(true),
         thread_summary_from_clause(),
         sqlite_string_literal(session_id)
     );
     let legacy_query = format!(
         "{} from threads where id = '{}' limit 1;",
-        legacy_thread_summary_json_select(),
+        legacy_thread_summary_json_select(true),
         sqlite_string_literal(session_id)
     );
-    discover_thread_summaries_from_state_db(state_db, query, legacy_query)
+    let no_name_query = format!(
+        "{} {} where threads.id = '{}' limit 1;",
+        thread_summary_json_select(false),
+        thread_summary_from_clause(),
+        sqlite_string_literal(session_id)
+    );
+    let no_name_legacy_query = format!(
+        "{} from threads where id = '{}' limit 1;",
+        legacy_thread_summary_json_select(false),
+        sqlite_string_literal(session_id)
+    );
+    discover_thread_summaries_from_state_db(
+        state_db,
+        query,
+        legacy_query,
+        no_name_query,
+        no_name_legacy_query,
+    )
         .ok()?
         .into_iter()
         .next()
@@ -848,18 +1180,15 @@ fn discover_thread_summaries_from_state_db(
     state_db: &Path,
     query: String,
     legacy_query: String,
+    no_name_query: String,
+    no_name_legacy_query: String,
 ) -> Result<Vec<ThreadSummary>, String> {
-    let output = run_sqlite_readonly_query(state_db, query)?;
-    let output = if output.status.success() {
-        output
-    } else if incompatible_thread_spawn_edges_schema(&output) {
-        let output = run_sqlite_readonly_query(state_db, legacy_query)?;
-        if !output.status.success() {
-            return Err(sqlite_query_error(state_db, &output));
+    let output = match run_thread_summary_query(state_db, query, legacy_query) {
+        Ok(output) => output,
+        Err(error) if missing_thread_name_column(&error) => {
+            run_thread_summary_query(state_db, no_name_query, no_name_legacy_query)?
         }
-        output
-    } else {
-        return Err(sqlite_query_error(state_db, &output));
+        Err(error) => return Err(error),
     };
 
     Ok(
@@ -868,6 +1197,27 @@ fn discover_thread_summaries_from_state_db(
             .filter_map(parse_thread_summary_json)
             .collect(),
     )
+}
+
+fn run_thread_summary_query(
+    state_db: &Path,
+    query: String,
+    legacy_query: String,
+) -> Result<Output, String> {
+    let output = run_sqlite_readonly_query(state_db, query)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    if !incompatible_thread_spawn_edges_schema(&output) {
+        return Err(sqlite_query_error(state_db, &output));
+    }
+
+    let output = run_sqlite_readonly_query(state_db, legacy_query)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(sqlite_query_error(state_db, &output))
+    }
 }
 
 fn run_sqlite_readonly_query(state_db: &Path, query: String) -> Result<Output, String> {
@@ -903,13 +1253,20 @@ fn incompatible_thread_spawn_edges_schema(output: &Output) -> bool {
         || stderr.contains("no such column: thread_spawn_edges.")
 }
 
-fn legacy_thread_summary_json_select() -> &'static str {
-    "select json_object(
+fn missing_thread_name_column(error: &str) -> bool {
+    error.contains("no such column: threads.name") || error.contains("no such column: name")
+}
+
+fn legacy_thread_summary_json_select(include_name: bool) -> String {
+    let name = if include_name { "name" } else { "null" };
+    format!(
+        "select json_object(
         'id', id,
         'rollout_path', rollout_path,
         'updated_at_ms', updated_at_ms,
         'source', source,
         'cwd', cwd,
+        'name', {name},
         'title', title,
         'archived', archived,
         'agent_nickname', agent_nickname,
@@ -917,6 +1274,7 @@ fn legacy_thread_summary_json_select() -> &'static str {
         'preview', preview,
         'parent_session_id', null
     )"
+    )
 }
 
 fn thread_summary_from_clause() -> &'static str {
@@ -925,13 +1283,16 @@ fn thread_summary_from_clause() -> &'static str {
       on thread_spawn_edges.child_thread_id = threads.id"
 }
 
-fn thread_summary_json_select() -> &'static str {
-    "select json_object(
+fn thread_summary_json_select(include_name: bool) -> String {
+    let name = if include_name { "threads.name" } else { "null" };
+    format!(
+        "select json_object(
         'id', threads.id,
         'rollout_path', threads.rollout_path,
         'updated_at_ms', threads.updated_at_ms,
         'source', threads.source,
         'cwd', threads.cwd,
+        'name', {name},
         'title', threads.title,
         'archived', threads.archived,
         'agent_nickname', threads.agent_nickname,
@@ -939,6 +1300,7 @@ fn thread_summary_json_select() -> &'static str {
         'preview', threads.preview,
         'parent_session_id', thread_spawn_edges.parent_thread_id
     )"
+    )
 }
 
 fn sqlite_string_literal(value: &str) -> String {
@@ -951,6 +1313,10 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
     let rollout_path = PathBuf::from(value.get("rollout_path")?.as_str()?);
     let source = value.get("source")?.as_str()?.to_string();
     let cwd = value.get("cwd")?.as_str()?.to_string();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     let title = value.get("title")?.as_str()?.to_string();
     let archived = value
         .get("archived")
@@ -982,6 +1348,7 @@ fn parse_thread_summary_json(line: &str) -> Option<ThreadSummary> {
         updated_at_ms,
         source,
         cwd,
+        name,
         title,
         archived,
         agent_nickname,
@@ -1009,26 +1376,9 @@ fn observation_from_thread(
             }
         })
         .unwrap_or_else(|| jump_target_from_thread_source(&thread));
-    let thread_updated_at = thread
-        .updated_at_ms
-        .and_then(|updated_at_ms| u64::try_from(updated_at_ms).ok())
-        .map(|updated_at_ms| SystemTime::UNIX_EPOCH + Duration::from_millis(updated_at_ms));
-    let thread_updated_after_task_complete = thread_updated_at
-        .zip(parsed_jsonl.as_ref().and_then(|parsed| parsed.task_completed_at))
-        .is_some_and(|(thread_updated_at, task_completed_at)| {
-            thread_updated_at
-                .duration_since(task_completed_at)
-                .is_ok_and(|age| age > Duration::ZERO)
-        });
     let last_activity_at = jsonl_observation
         .as_ref()
-        .and_then(|observation| {
-            if thread_updated_after_task_complete {
-                None
-            } else {
-                observation.last_activity_at.clone()
-            }
-        })
+        .and_then(|observation| observation.last_activity_at.clone())
         .or_else(|| thread.updated_at_ms.and_then(timestamp_ms_to_iso_utc));
     let has_recent_activity = last_activity_at
         .as_deref()
@@ -1066,8 +1416,6 @@ fn observation_from_thread(
     ) || hook_activity_is_newer_than_jsonl;
     let kind = if has_recent_hook_activity && hook_activity_can_override_terminal {
         ObservationKind::Running
-    } else if thread_updated_after_task_complete && matches!(jsonl_kind, Some(ObservationKind::CompletedImmediate)) {
-        thread_completion_kind
     } else if matches!(
         jsonl_kind,
         Some(
@@ -1093,7 +1441,9 @@ fn observation_from_thread(
         .file_name()
         .and_then(|name| name.to_str())
         .map(ToString::to_string);
-    let label = if !thread.title.trim().is_empty() {
+    let label = if let Some(name) = thread.name.as_deref().filter(|value| !value.trim().is_empty()) {
+        truncate_for_summary(name.trim(), 120)
+    } else if !thread.title.trim().is_empty() {
         truncate_for_summary(thread.title.trim(), 120)
     } else if let Some(preview) = thread.preview.as_deref().filter(|value| !value.trim().is_empty()) {
         truncate_for_summary(preview.trim(), 120)
@@ -1190,9 +1540,9 @@ fn hook_signal_for_thread<'a>(
     hook_signals: &'a HashMap<String, CodexHookSignal>,
     thread: &ThreadSummary,
 ) -> Option<&'a CodexHookSignal> {
-    hook_signals
-        .get(&hook_session_key(&thread.id))
-        .or_else(|| hook_signals.get(&hook_workspace_key(&thread.cwd)))
+    // A workspace can contain many historical threads. Its most recent hook event
+    // cannot identify which one is currently executing.
+    hook_signals.get(&hook_session_key(&thread.id))
 }
 
 fn load_latest_hook_signals(path: &Path) -> HashMap<String, CodexHookSignal> {
@@ -1210,13 +1560,6 @@ fn load_latest_hook_signals(path: &Path) -> HashMap<String, CodexHookSignal> {
             upsert_latest_hook_signal(&mut signals, hook_session_key(session_id), signal.clone());
         }
 
-        if let Some(workspace_path) = signal
-            .workspace_path
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            upsert_latest_hook_signal(&mut signals, hook_workspace_key(workspace_path), signal);
-        }
     }
 
     signals
@@ -1242,19 +1585,11 @@ fn parse_hook_signal_line(line: &str) -> Option<CodexHookSignal> {
         .or_else(|| value.get("thread_id"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let workspace_path = value
-        .get("workspacePath")
-        .or_else(|| value.get("workspace_path"))
-        .or_else(|| value.get("cwd"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-
     Some(CodexHookSignal {
         event_name,
         timestamp,
         timestamp_time,
         session_id,
-        workspace_path,
     })
 }
 
@@ -1275,10 +1610,6 @@ fn upsert_latest_hook_signal(
 
 fn hook_session_key(session_id: &str) -> String {
     format!("session:{session_id}")
-}
-
-fn hook_workspace_key(workspace_path: &str) -> String {
-    format!("workspace:{workspace_path}")
 }
 
 fn is_hook_activity_event(event_name: &str) -> bool {
@@ -1850,6 +2181,37 @@ mod tests {
     }
 
     #[test]
+    fn ignores_response_items_after_task_complete_until_a_new_turn_starts() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-05T16-00-00-019done-response.jsonl"),
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019done-response","cwd":"/Users/edy/project-b","originator":"Codex Desktop"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-05T08:21:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_650_980),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:20:00.000Z")
+        );
+    }
+
+    #[test]
     fn unread_task_complete_within_twelve_hours_stays_immediate() {
         let temp = tempdir().expect("temp dir");
         let session_dir = temp.path().join("2026/06/05");
@@ -1987,6 +2349,41 @@ mod tests {
         assert_eq!(
             rows[0].last_activity_at.as_deref(),
             Some("2026-06-03T03:30:00.000Z")
+        );
+    }
+
+    #[test]
+    fn new_tool_turn_after_task_complete_reopens_session_as_running() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/03");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-03T11-00-00-019continued-tool.jsonl"),
+            r#"{"timestamp":"2026-06-03T03:00:00.000Z","type":"session_meta","payload":{"id":"019continued-tool","cwd":"/Users/edy/project","originator":"Codex Desktop"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:30:00.000Z","type":"event_msg","payload":{"type":"task_started"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:30:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_tool"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-06-03T03:30:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_tool"}}"#
+                + "\n",
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_457_700),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-03T03:30:02.000Z")
         );
     }
 
@@ -2297,6 +2694,73 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_thread_name_is_preferred_over_title_for_listing_and_lookup() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        create_threads_table(&state_db);
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(
+                "alter table threads add column name text;
+                 create table thread_spawn_edges (child_thread_id text primary key, parent_thread_id text not null);",
+            )
+            .status()
+            .expect("add thread name column");
+        insert_thread(
+            &state_db,
+            "019renamed",
+            "/tmp/missing-renamed.jsonl",
+            "/Users/edy/project",
+            "Initial prompt title",
+            1_780_459_000_000,
+        );
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg("update threads set name = 'Renamed session' where id = '019renamed';")
+            .status()
+            .expect("set persisted thread name");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_459_001),
+        );
+        let lookup = discover_codex_observation_by_id(
+            &state_db,
+            "019renamed",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_459_001),
+        )
+        .expect("renamed thread lookup");
+
+        assert_eq!(rows[0].label.as_deref(), Some("Renamed session"));
+        assert_eq!(lookup.label.as_deref(), Some("Renamed session"));
+    }
+
+    #[test]
+    fn sqlite_legacy_schema_without_name_or_spawn_edges_lists_and_looks_up() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019legacy-title",
+            "/tmp/missing-legacy.jsonl",
+            "/Users/edy/project",
+            "Legacy title",
+            1_780_459_000_000,
+        );
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_459_001);
+        let rows = discover_codex_observations_with_state_db(&state_db, temp.path(), 20, now);
+        let lookup = discover_codex_observation_by_id(&state_db, "019legacy-title", now)
+            .expect("legacy thread lookup");
+
+        assert_eq!(rows[0].label.as_deref(), Some("Legacy title"));
+        assert_eq!(lookup.label.as_deref(), Some("Legacy title"));
+    }
+
+    #[test]
     fn sqlite_subagent_thread_by_id_preserves_parent_session_id_from_jsonl() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
@@ -2386,6 +2850,79 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "019parent-capacity");
         assert_eq!(rows[0].thread_source.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn sqlite_thread_discovery_marks_parent_with_active_subagent_count() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let parent_path = session_dir.join("rollout-2026-06-05T08-00-00-019parent.jsonl");
+        let running_child_path = session_dir.join("rollout-2026-06-05T08-01-00-019running-child.jsonl");
+        let completed_child_path = session_dir.join("rollout-2026-06-05T08-02-00-019completed-child.jsonl");
+        fs::write(
+            &parent_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019parent","cwd":"/Users/edy/project-parent","originator":"Codex Desktop","source":"vscode","thread_source":"user"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"parent waiting on agents"}}"#,
+        )
+        .expect("parent session file");
+        fs::write(
+            &running_child_path,
+            r#"{"timestamp":"2026-06-05T08:01:00.000Z","type":"session_meta","payload":{"id":"019running-child","parent_thread_id":"019parent","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}
+{"timestamp":"2026-06-05T08:25:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"child still working"}}"#,
+        )
+        .expect("running child session file");
+        fs::write(
+            &completed_child_path,
+            r#"{"timestamp":"2026-06-05T08:02:00.000Z","type":"session_meta","payload":{"id":"019completed-child","parent_thread_id":"019parent","cwd":"/Users/edy/project-child","originator":"codex-tui","thread_source":"subagent"}}
+{"timestamp":"2026-06-05T08:25:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .expect("completed child session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019parent",
+            parent_path.to_string_lossy().as_ref(),
+            "/Users/edy/project-parent",
+            "Parent session",
+            1_780_648_800_000,
+        );
+        std::process::Command::new("sqlite3")
+            .arg(&state_db)
+            .arg(format!(
+                "insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
+                 values ('019running-child', '{}', 1780646460, 1780647900, 'vscode', 'OpenAI', '/Users/edy/project-child', 'Running child', '{{\"type\":\"disabled\"}}', 'never', 1780647900000, 'subagent', 'Running child');
+                 insert into threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, updated_at_ms, thread_source, preview)
+                 values ('019completed-child', '{}', 1780646520, 1780647900, 'vscode', 'OpenAI', '/Users/edy/project-child', 'Completed child', '{{\"type\":\"disabled\"}}', 'never', 1780647900000, 'subagent', 'Completed child');
+                 create table thread_spawn_edges (child_thread_id text primary key, parent_thread_id text not null);
+                 insert into thread_spawn_edges (child_thread_id, parent_thread_id) values
+                   ('019running-child', '019parent'),
+                   ('019completed-child', '019parent');",
+                running_child_path.display(),
+                completed_child_path.display(),
+            ))
+            .status()
+            .expect("insert subagent threads");
+
+        let rows = discover_codex_observations_with_state_db(
+            &state_db,
+            temp.path(),
+            20,
+            super::parse_utc_timestamp("2026-06-05T08:30:00.000Z").expect("now"),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "019parent");
+        assert_eq!(rows[0].active_subagent_count, Some(1));
+
+        let looked_up = discover_codex_observation_by_id(
+            &state_db,
+            "019parent",
+            super::parse_utc_timestamp("2026-06-05T08:30:00.000Z").expect("now"),
+        )
+        .expect("parent lookup");
+        assert_eq!(looked_up.active_subagent_count, Some(1));
     }
 
     #[test]
@@ -2487,7 +3024,8 @@ mod tests {
         assert!(from_clause.contains("left join thread_spawn_edges"));
         assert!(from_clause.contains("thread_spawn_edges.child_thread_id = threads.id"));
 
-        let select = super::thread_summary_json_select();
+        let select = super::thread_summary_json_select(true);
+        assert!(select.contains("'name', threads.name"));
         assert!(select.contains("'parent_session_id', thread_spawn_edges.parent_thread_id"));
     }
 
@@ -2674,7 +3212,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_thread_update_after_task_complete_marks_completion_as_read() {
+    fn sqlite_thread_update_one_millisecond_after_task_complete_stays_unread() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let session_dir = temp.path().join("2026/06/05");
@@ -2696,7 +3234,7 @@ mod tests {
             rollout_path.to_string_lossy().as_ref(),
             "/Users/edy/agent-session-inbox",
             "按照迁移过来的文档继续吧",
-            1_780_648_200_000,
+            1_780_648_000_001,
         );
 
         let rows = discover_codex_observations_with_state_db(
@@ -2707,15 +3245,15 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, ObservationKind::Completed);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
         assert_eq!(
             rows[0].last_activity_at.as_deref(),
-            Some("2026-06-05T08:30:00.000Z")
+            Some("2026-06-05T08:20:00.000Z")
         );
     }
 
     #[test]
-    fn sqlite_thread_update_uses_configured_follow_up_boundary() {
+    fn sqlite_thread_update_does_not_change_unread_completion_at_follow_up_boundary() {
         let temp = tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let session_dir = temp.path().join("2026/06/05");
@@ -2737,7 +3275,7 @@ mod tests {
             rollout_path.to_string_lossy().as_ref(),
             "/Users/edy/agent-session-inbox",
             "按照迁移过来的文档继续吧",
-            1_780_648_200_000,
+            1_780_648_000_001,
         );
 
         let at_boundary = discover_codex_observations_with_state_db_and_follow_up_window(
@@ -2755,8 +3293,8 @@ mod tests {
             Duration::from_secs(45 * 60),
         );
 
-        assert_eq!(at_boundary[0].kind, ObservationKind::Completed);
-        assert_eq!(after_boundary[0].kind, ObservationKind::CompletedStale);
+        assert_eq!(at_boundary[0].kind, ObservationKind::CompletedImmediate);
+        assert_eq!(after_boundary[0].kind, ObservationKind::CompletedImmediate);
     }
 
     #[test]
@@ -2924,6 +3462,112 @@ mod tests {
             rows[0].evidence_summary.as_deref(),
             Some("Codex hook PreToolUse observed.")
         );
+    }
+
+    #[test]
+    fn hook_activity_only_promotes_the_matching_thread_in_a_shared_workspace() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let completed_rollout = session_dir.join("rollout-2026-06-05T08-00-00-019hook-history.jsonl");
+        let active_rollout = session_dir.join("rollout-2026-06-05T08-01-00-019hook-current.jsonl");
+        fs::write(
+            &completed_rollout,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019hook-history","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .expect("completed session file");
+        fs::write(
+            &active_rollout,
+            r#"{"timestamp":"2026-06-05T08:01:00.000Z","type":"session_meta","payload":{"id":"019hook-current","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}"#,
+        )
+        .expect("active session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019hook-history",
+            completed_rollout.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Historical thread",
+            1_780_648_000_000,
+        );
+        insert_thread(
+            &state_db,
+            "019hook-current",
+            active_rollout.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Current thread",
+            1_780_648_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:21:00.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019hook-current","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let rows_by_id = rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            rows_by_id.get("019hook-current").map(|row| row.kind),
+            Some(ObservationKind::Running)
+        );
+        assert_eq!(
+            rows_by_id.get("019hook-history").map(|row| row.kind),
+            Some(ObservationKind::CompletedImmediate)
+        );
+    }
+
+    #[test]
+    fn workspace_only_hook_does_not_promote_a_historical_thread() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T08-00-00-019workspace-history.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019workspace-history","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        )
+        .expect("historical session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019workspace-history",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Historical workspace thread",
+            1_780_648_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:21:00.000Z","source":"codex-hook","eventType":"PreToolUse","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::CompletedImmediate);
     }
 
     #[test]
@@ -3130,11 +3774,42 @@ mod tests {
             parsed.observation.last_activity_at.as_deref(),
             Some("2026-06-05T08:20:00.000Z")
         );
-        assert!(parsed.task_completed_at.is_some());
     }
 
     #[test]
-    fn status_line_filter_skips_large_response_items() {
+    fn tail_parser_keeps_completion_before_oversized_late_item_output() {
+        let temp = tempdir().expect("temp dir");
+        let rollout_path = temp
+            .path()
+            .join("rollout-2026-06-05T16-00-00-019late-output.jsonl");
+        let oversized_output = "x".repeat(super::SESSION_TAIL_READ_BYTES as usize + 1_024);
+        let content = format!(
+            "{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019late-output","cwd":"/Users/edy/large","originator":"Codex Desktop"}}"#,
+            r#"{"timestamp":"2026-06-05T08:20:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+            format!(
+                r#"{{"timestamp":"2026-06-05T09:50:00.000Z","type":"event_msg","payload":{{"type":"item_completed","turn_id":"turn-1","item":{{"type":"CommandExecution","stdout":"{oversized_output}"}}}}}}"#
+            )
+        );
+        fs::write(&rollout_path, content).expect("session file");
+
+        let parsed = super::parse_session_file_tail_detailed(
+            &rollout_path,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_654_260),
+        )
+        .expect("tail parse")
+        .expect("tail observation");
+
+        assert_eq!(parsed.observation.session_id, "019late-output");
+        assert_eq!(parsed.observation.kind, ObservationKind::CompletedImmediate);
+        assert_eq!(
+            parsed.observation.last_activity_at.as_deref(),
+            Some("2026-06-05T08:20:00.000Z")
+        );
+    }
+
+    #[test]
+    fn status_line_filter_skips_untyped_large_response_items() {
         assert!(super::should_parse_session_status_line(
             r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{}}"#
         ));
@@ -3146,6 +3821,9 @@ mod tests {
         ));
         assert!(!super::should_parse_session_status_line(
             r#"{"timestamp":"2026-06-05T08:10:00.000Z","type":"response_item","payload":{"message":"literal \"type\":\"event_msg\" text"}}"#
+        ));
+        assert!(super::should_parse_session_status_line(
+            r#"{"timestamp":"2026-06-05T08:10:00.000Z","type":"response_item","payload":{"type":"custom_tool_call_output"}}"#
         ));
     }
 

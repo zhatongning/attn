@@ -11,7 +11,7 @@ The status model should answer one question:
 
 > Do I need to do anything with this agent session right now?
 
-Subagent sessions remain available to the source layer for parent-link and process discovery, but they do not appear in the panel. Rows marked `thread_source = subagent` or linked with `parent_session_id` are excluded before panel cards, counters, and actions are derived. The panel reports parent sessions only.
+Subagent sessions remain available to the source layer for parent-link and process discovery, but they do not appear in the panel. Rows marked `thread_source = subagent` or linked with `parent_session_id` are excluded before panel cards, counters, and actions are derived. The panel reports parent sessions only. When one or more child agents are currently running, the parent row carries `activeSubagentCount`, stays visible as working when its own source is idle or non-actionable unknown, and shows a localized `subagent active · N` / `子代理活动 · N` marker; terminal child rows do not contribute to the count.
 
 ## State Layers
 
@@ -88,7 +88,7 @@ These are the rules implemented today.
 | --- | --- |
 | Last relevant event is `task_complete`, the signal is unread, and completion is at most 12 hours old | `CompletedImmediate` |
 | Last relevant event is `turn_aborted` | `Stopped` |
-| Last relevant event after `task_complete` is `user_message` or `agent_message`, and it is recent | `Running` |
+| A recent `task_started`, `user_message`, `agent_message`, or non-waiting tool/model `response_item` follows `task_complete` | `Running` |
 | Recent activity but no terminal event | `Running` |
 | Old activity with no terminal event | `InsufficientEvidence` |
 
@@ -103,14 +103,16 @@ The follow-up duration is configurable: 30 minutes by default, 20 minutes minimu
 Unread-completion retention is 12 hours. After this window, a terminal unread completion becomes `CompletedStale` and stays quiet unless newer source evidence appears.
 
 Generic non-terminal activity is still considered recent for 2 hours.
+When a session starts a new turn after `task_complete`, `task_started` and activity response items such as `custom_tool_call`, `custom_tool_call_output`, `reasoning`, and `message` reopen it as `Running`. An unresolved approval or structured user-input response remains `WaitingForInput` instead.
+The native tail reader preserves the complete status context before an oversized JSONL line. A delayed `item_completed` payload with very large command output must not evict an earlier `task_complete` and fall through to SQLite's recent-activity `Running` inference.
 
 ### SQLite Thread Rules
 
 | SQLite/thread evidence | Source observation |
 | --- | --- |
 | JSONL says `CompletedImmediate`, `Completed`, `Failed`, or `WaitingForInput` | Use JSONL terminal/input state. |
-| JSONL says unread `task_complete` within 12 hours | Keep as `CompletedImmediate` until read or the 12-hour retention window expires. |
-| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Treat this as external read/open evidence. From `updated_at_ms`, a fixed inclusive 5-minute `CompletedImmediate`/`inspect` period applies first; after that, `Completed`/`needsAttention` lasts through the inclusive configured follow-up boundary, then the row becomes `CompletedStale`/`idle`. |
+| JSONL says unread `task_complete` within 12 hours | Keep as `CompletedImmediate` until an Attn acknowledgement or the 12-hour retention window expires. |
+| SQLite `updated_at_ms` is strictly later than JSONL `task_complete` | Metadata only. It does not prove the result was opened or read and cannot change a JSONL terminal state. |
 | Thread is archived without explicit unread completion evidence | Apply completion-age fallback, usually `CompletedStale` for old archived threads. |
 | Desktop thread has recent activity | `Running` |
 | Desktop thread is old and unarchived | `Idle` |
@@ -159,7 +161,7 @@ Minimum event fields:
 | Field | Purpose |
 | --- | --- |
 | `sessionId` | Join hook events to Codex sessions. |
-| `workspacePath` | Fallback join key and display metadata. |
+| `workspacePath` | Display metadata only; it must not join activity to a session because a workspace can contain historical threads. A hook without `sessionId` cannot promote a row to running. |
 | `eventType` | Hook event such as `UserPromptSubmit` or `Stop`. |
 | `timestamp` | Ordering and freshness. |
 | `source` | `codex-hook`. |
@@ -208,7 +210,7 @@ Actionable unknown reasons currently match words such as `failed`, `unavailable`
 | User action | Current transition |
 | --- | --- |
 | Click Jump back on an `inspect` row | Mark the current signal as read, then keep it as quiet `follow-up` for the configured duration (30 minutes by default; 20-minute minimum). |
-| Open the same Codex Desktop thread outside this app | Only transitions if Codex advances SQLite `updated_at_ms` after `task_complete`; otherwise Attn has no reliable read evidence. |
+| Open the same Codex Desktop thread outside this app | No state transition. Attn has no reliable per-thread read/open evidence from Codex Desktop. |
 | Unread completion exceeds 12 hours | Show the row as `idle` until newer source evidence arrives. |
 | Read window exceeds the configured follow-up duration | Show the row as `idle` until newer source evidence arrives. |
 | Click Jump back on `running` or `idle` | No state transition. |
@@ -286,8 +288,7 @@ stateDiagram-v2
     [*] --> Working: recent live activity
     [*] --> Working: hook UserPromptSubmit/PreToolUse
     Working --> Inspect: unread task_complete
-    Inspect --> Needed: user opens/reads result
-    Inspect --> Needed: SQLite updated_at_ms advances after task_complete
+    Inspect --> Needed: Jump back records read acknowledgement
     Inspect --> Idle: unread window exceeds 12 hours
     Needed --> Idle: read window exceeds configured follow-up duration
     Working --> Idle: task_complete older than 12 hours

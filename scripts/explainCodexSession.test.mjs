@@ -14,7 +14,7 @@ afterEach(() => {
 });
 
 describe("explainCodexSession", () => {
-  it("reports completion, sqlite update, inferred state, and reason for a session", () => {
+  it("reports completion and SQLite update without inferring that the result was read", () => {
     const temp = tempDir();
     const stateDb = path.join(temp, "state_5.sqlite");
     const sessionsRoot = path.join(temp, "sessions");
@@ -57,8 +57,8 @@ describe("explainCodexSession", () => {
       taskCompleteAt: "2026-06-06T04:05:00.000Z",
       sqliteUpdatedAt: "2026-06-06T04:10:00.000Z",
       sqliteUpdatedAfterTaskComplete: true,
-      state: "needsAttention",
-      statusReason: "completed task was opened; keep it quiet during the follow-up window",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
       evidenceSummary: "local Codex JSONL activity observed",
     });
   });

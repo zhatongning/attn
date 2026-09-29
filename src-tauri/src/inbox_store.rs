@@ -266,6 +266,9 @@ impl InboxStore {
             now,
             follow_up_window,
         );
+        // A live CLI process can promote a child after source classification. Recompute the
+        // parent marker after that promotion so the panel does not lose the activity signal.
+        let rows = annotate_active_subagent_counts(rows);
 
         let mut rows = rows
             .into_iter()
@@ -686,15 +689,16 @@ impl InboxStore {
             |row| live_cli_tty_for_row_from_sessions(row, &live_cli_sessions),
             now,
         );
-        row = merge_live_cli_sessions_with_codex_rows(
+        let rows = merge_live_cli_sessions_with_codex_rows(
             vec![row],
             live_cli_sessions,
             &codex_state_db_path(),
             now,
             follow_up_window,
-        )
-        .into_iter()
-        .find(|row| row.session_id == session_id)?;
+        );
+        let row = annotate_active_subagent_counts(rows)
+            .into_iter()
+            .find(|row| row.session_id == session_id)?;
         let jump_availability = if row.workspace_path.is_some() {
             if matches!(row.jump_target, JumpTarget::Desktop) {
                 JumpAvailability::Exact
@@ -895,6 +899,32 @@ fn compare_session_rows_for_store(left: &SessionRow, right: &SessionRow) -> std:
 
 fn is_subagent_row(row: &SessionRow) -> bool {
     row.thread_source.as_deref() == Some("subagent") || row.parent_session_id.is_some()
+}
+
+fn annotate_active_subagent_counts(rows: Vec<SessionRow>) -> Vec<SessionRow> {
+    let mut active_counts = HashMap::<String, u32>::new();
+    for row in &rows {
+        if row.state != SessionState::Running || !is_subagent_row(row) {
+            continue;
+        }
+        let Some(parent_session_id) = row.parent_session_id.as_deref() else {
+            continue;
+        };
+        active_counts
+            .entry(parent_session_id.to_string())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+
+    rows.into_iter()
+        .map(|mut row| {
+            row.active_subagent_count = active_counts
+                .get(&row.session_id)
+                .copied()
+                .filter(|count| *count > 0);
+            row
+        })
+        .collect()
 }
 
 fn awaiting_desktop_idle_confirmation_row(
@@ -1299,7 +1329,7 @@ fn merge_live_cli_sessions_with_codex_rows(
 }
 
 fn mark_live_cli_session_running(row: SessionRow, tty: &str) -> SessionRow {
-    if !should_promote_live_cli_row(row.state) {
+    if !should_promote_live_cli_row(&row) {
         return row;
     }
 
@@ -1317,8 +1347,18 @@ fn mark_live_cli_session_running(row: SessionRow, tty: &str) -> SessionRow {
     }
 }
 
-fn should_promote_live_cli_row(state: SessionState) -> bool {
-    matches!(state, SessionState::Unknown | SessionState::Idle)
+fn should_promote_live_cli_row(row: &SessionRow) -> bool {
+    matches!(row.state, SessionState::Unknown | SessionState::Idle)
+        && !matches!(
+            row.observation_kind,
+            Some(
+                ObservationKind::Completed
+                    | ObservationKind::CompletedImmediate
+                    | ObservationKind::CompletedStale
+                    | ObservationKind::Failed
+                    | ObservationKind::Stopped
+            )
+        )
 }
 
 fn live_cli_session_row_with_state_db_and_follow_up_window(
@@ -2160,9 +2200,10 @@ mod tests {
     use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
 
+    use crate::domain::classification::classify_observation;
     use crate::domain::confidence::Confidence;
     use crate::domain::session::{
-        JumpAvailability, JumpTarget, ObservationKind, SessionRow, SessionState,
+        JumpAvailability, JumpTarget, ObservationKind, SessionRow, SessionState, SourceObservation,
     };
     use crate::domain::source_health::SourceStatus;
     use crate::inbox_store::InboxStore;
@@ -2671,6 +2712,52 @@ mod tests {
     }
 
     #[test]
+    fn live_cli_child_promotion_recomputes_parent_active_subagent_count() {
+        let parent = SessionRow::new(
+            "parent-cli",
+            "Parent CLI row",
+            SessionState::Running,
+            Confidence::Exact,
+        )
+        .with_workspace(Some("/repo".to_string()))
+        .with_jump_target(JumpTarget::Cli);
+        let child = SessionRow::new(
+            "child-cli",
+            "Child CLI row",
+            SessionState::Unknown,
+            Confidence::Unknown,
+        )
+        .with_thread_source(Some("subagent".to_string()))
+        .with_parent_session_id(Some("parent-cli".to_string()))
+        .with_workspace(Some("/repo".to_string()))
+        .with_jump_target(JumpTarget::Cli);
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("child-cli".to_string()),
+            session_ids: vec!["child-cli".to_string()],
+            workspace_path: "/repo".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+
+        let rows = super::merge_live_cli_sessions(vec![parent, child], live_sessions);
+        let rows = super::annotate_active_subagent_counts(rows);
+
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "child-cli")
+                .expect("child row")
+                .state,
+            SessionState::Running
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "parent-cli")
+                .expect("parent row")
+                .active_subagent_count,
+            Some(1)
+        );
+    }
+
+    #[test]
     fn live_cli_sessions_missing_from_discovery_are_added_as_running_rows() {
         let rows = vec![SessionRow::new(
             "old",
@@ -2707,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn live_cli_missing_rows_use_the_configured_follow_up_window() {
+    fn live_cli_missing_rows_keep_unread_completion_inspectable() {
         let temp = tempfile::tempdir().expect("temp dir");
         let state_db = temp.path().join("state_5.sqlite");
         let rollout_path = temp.path().join("rollout-019live.jsonl");
@@ -2749,7 +2836,7 @@ mod tests {
             .iter()
             .find(|row| row.session_id == "019live")
             .expect("live CLI row");
-        assert_eq!(row.state, SessionState::NeedsAttention);
+        assert_eq!(row.state, SessionState::Inspect);
         assert_eq!(row.jump_target, JumpTarget::Cli);
     }
 
@@ -2831,6 +2918,31 @@ mod tests {
         assert_eq!(
             rows[0].status_reason,
             "completed task ready to inspect; open it to mark read"
+        );
+    }
+
+    #[test]
+    fn live_cli_sessions_keep_stale_completed_matching_rows_idle() {
+        let rows = vec![classify_observation(
+            SourceObservation::new("live-session", ObservationKind::CompletedStale)
+                .with_workspace("/repo")
+                .with_jump_target(JumpTarget::Cli),
+        )];
+        let live_sessions = vec![super::LiveCliSession {
+            session_id: Some("live-session".to_string()),
+            session_ids: vec!["live-session".to_string()],
+            workspace_path: "/repo".to_string(),
+            tty: "ttys008".to_string(),
+        }];
+
+        let rows = super::merge_live_cli_sessions(rows, live_sessions);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, SessionState::Idle);
+        assert_eq!(rows[0].confidence, Confidence::Inferred);
+        assert_eq!(
+            rows[0].status_reason,
+            "completed task is no longer recent; idle until the next source signal"
         );
     }
 

@@ -142,7 +142,6 @@ function discoverCodexSessionSnapshot({
     sessionsRoot,
     limit,
     nowMs,
-    followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
     unreadCompletionTrackingStartMs: trackingStartMs,
     liveCliTtyForWorkspace,
     liveCliSessions: resolvedLiveCliSessions,
@@ -160,8 +159,11 @@ function discoverCodexSessionSnapshot({
 
   const observedSessionIds = new Set();
   const jsonlRows = [];
+  let parentRowCount = 0;
+  const recentCutoffMs = nowMs - 2 * 60 * 60 * 1000;
   for (const file of collectJsonlFiles(sessionsRoot)
     .sort((left, right) => right.modifiedAt - left.modifiedAt)) {
+    if (parentRowCount >= limit && file.modifiedAt < recentCutoffMs) break;
     const observation = parseSessionFile(file.path, {
       nowMs,
       unreadCompletionTrackingStartMs: trackingStartMs,
@@ -169,19 +171,22 @@ function discoverCodexSessionSnapshot({
     if (!observation || observedSessionIds.has(observation.sessionId)) continue;
 
     observedSessionIds.add(observation.sessionId);
-    if (isSubagentRow(observation)) continue;
+    const row = toSessionRow(observation, {
+      liveCliSessions: resolvedLiveCliSessions,
+      liveCliTtyForWorkspace,
+      nowMs,
+    });
     jsonlRows.push({
       kind: observation.kind,
-      row: toSessionRow(observation, {
-        liveCliSessions: resolvedLiveCliSessions,
-        liveCliTtyForWorkspace,
-        nowMs,
-      }),
+      row,
     });
-    if (jsonlRows.length >= limit) break;
+    if (!isSubagentRow(row)) parentRowCount += 1;
   }
+  const annotatedJsonlRows = annotateActiveSubagentCounts(jsonlRows);
   return {
-    observedRows: jsonlRows,
+    observedRows: annotatedJsonlRows
+      .filter(({ row }) => !isSubagentRow(row))
+      .slice(0, limit),
     isDegraded: true,
     sqliteError: sqliteFallbackDetail(stateDbPath),
     options,
@@ -190,10 +195,10 @@ function discoverCodexSessionSnapshot({
 
 function sessionRowsFromSnapshot(snapshot, sourceRows = snapshot.observedRows.map(({ row }) => row)) {
   const { options } = snapshot;
+  const mergedRows = mergeLiveCliSessions(sourceRows, options.liveCliSessions, (liveSession) =>
+    liveCliSessionRow(liveSession, options));
   return sortAndLimitRows(
-    mergeLiveCliSessions(sourceRows, options.liveCliSessions, (liveSession) =>
-      liveCliSessionRow(liveSession, options))
-      .filter((row) => !isSubagentRow(row)),
+    annotateActiveSubagentCounts(mergedRows).filter((row) => !isSubagentRow(row)),
     options.limit,
   );
 }
@@ -225,7 +230,6 @@ export function discoverCodexThreadById(sessionId, {
   liveCliSessions,
 } = {}) {
   if (!fs.existsSync(stateDbPath)) return null;
-  const normalizedFollowUpToIdleMinutes = normalizeFollowUpToIdleMinutes(followUpToIdleMinutes);
   liveCliSessions ??= liveCliTtyForWorkspace ? [] : findLiveCodexCliSessions();
 
   const stdout = readThreadSummariesFromStateDb(
@@ -234,17 +238,24 @@ export function discoverCodexThreadById(sessionId, {
   );
   if (stdout === null) return null;
 
-  return stdout
+  const row = stdout
     .split("\n")
     .filter(Boolean)
     .map((line) => parseThreadRow(line, {
       nowMs,
-      followUpToIdleMinutes: normalizedFollowUpToIdleMinutes,
       unreadCompletionTrackingStartMs: trackingStartMs,
       liveCliTtyForWorkspace,
       liveCliSessions,
     }))
     .find(Boolean) ?? null;
+
+  return annotateParentRowWithActiveSubagents(row, {
+    stateDbPath,
+    nowMs,
+    unreadCompletionTrackingStartMs: trackingStartMs,
+    liveCliSessions,
+    liveCliTtyForWorkspace,
+  });
 }
 
 export async function jumpToSession(sessionId, options = {}) {
@@ -519,7 +530,7 @@ function annotateDegradedSnapshotRow(row, sqliteError) {
   };
 }
 
-function discoverCodexThreads({ stateDbPath, limit, nowMs, followUpToIdleMinutes, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
+function discoverCodexThreads({ stateDbPath, limit, nowMs, unreadCompletionTrackingStartMs, liveCliSessions, liveCliTtyForWorkspace }) {
   if (!fs.existsSync(stateDbPath)) return null;
   if (limit <= 0) return [];
 
@@ -540,27 +551,97 @@ function discoverCodexThreads({ stateDbPath, limit, nowMs, followUpToIdleMinutes
     if (!line) continue;
     const row = parseThreadRow(line, {
       nowMs,
-      followUpToIdleMinutes,
       unreadCompletionTrackingStartMs,
       liveCliSessions,
       liveCliTtyForWorkspace,
     });
-    if (!row || isSubagentRow(row)) continue;
+    if (!row) continue;
     rows.push(row);
-    if (rows.length >= limit) break;
   }
-  return rows;
+
+  const subagentStdout = readSubagentThreadSummariesFromStateDb(stateDbPath);
+  if (subagentStdout === null) return null;
+  if (subagentStdout) {
+    for (const line of subagentStdout.split("\n")) {
+      if (!line || !recentSubagentThreadCandidate(line, nowMs)) continue;
+      const row = parseThreadRow(line, {
+        nowMs,
+        unreadCompletionTrackingStartMs,
+        liveCliSessions,
+        liveCliTtyForWorkspace,
+      });
+      if (row) rows.push(row);
+    }
+  }
+
+  return annotateActiveSubagentCounts(rows)
+    .filter((row) => !isSubagentRow(row))
+    .slice(0, limit);
 }
 
-function readThreadSummariesFromStateDb(stateDbPath, querySuffix, legacyQuerySuffix = querySuffix) {
-  const joinedQuery = `${threadSummaryJsonSelect()} ${threadSummaryFromSql()} ${querySuffix};`;
+function recentSubagentThreadCandidate(line, nowMs) {
+  let thread;
+  try {
+    thread = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  const updatedAtMs = Number(thread.updated_at_ms);
+  if (!Number.isFinite(updatedAtMs)) return true;
+  const ageMs = nowMs - updatedAtMs;
+  if (ageMs >= 0 && ageMs <= 2 * 60 * 60 * 1000) return true;
+  if (typeof thread.rollout_path !== "string") return false;
+  try {
+    const rolloutMtimeMs = fs.statSync(thread.rollout_path).mtimeMs;
+    const rolloutAgeMs = nowMs - rolloutMtimeMs;
+    return rolloutAgeMs >= 0 && rolloutAgeMs <= 2 * 60 * 60 * 1000;
+  } catch {
+    return false;
+  }
+}
+
+function readThreadSummariesFromStateDb(
+  stateDbPath,
+  querySuffix,
+  legacyQuerySuffix = querySuffix,
+  { includeName = true } = {},
+) {
+  const joinedQuery = `${threadSummaryJsonSelect({ includeName })} ${threadSummaryFromSql()} ${querySuffix};`;
   const joinedResult = runSqliteReadQuery(stateDbPath, joinedQuery);
   if (joinedResult.status === 0) return joinedResult.stdout;
+  if (includeName && missingThreadNameColumn(joinedResult.stderr)) {
+    return readThreadSummariesFromStateDb(stateDbPath, querySuffix, legacyQuerySuffix, {
+      includeName: false,
+    });
+  }
   if (!incompatibleThreadSpawnEdgesSchema(joinedResult.stderr)) return null;
 
-  const fallbackQuery = `${threadSummaryJsonSelect({ includeParentSessionId: false })} from threads ${legacyQuerySuffix};`;
+  const fallbackQuery = `${threadSummaryJsonSelect({ includeName, includeParentSessionId: false })} from threads ${legacyQuerySuffix};`;
   const fallbackResult = runSqliteReadQuery(stateDbPath, fallbackQuery);
-  return fallbackResult.status === 0 ? fallbackResult.stdout : null;
+  if (fallbackResult.status === 0) return fallbackResult.stdout;
+  if (includeName && missingThreadNameColumn(fallbackResult.stderr)) {
+    return readThreadSummariesFromStateDb(stateDbPath, querySuffix, legacyQuerySuffix, {
+      includeName: false,
+    });
+  }
+  return null;
+}
+
+function readSubagentThreadSummariesFromStateDb(stateDbPath, parentSessionId) {
+  const edgeFilter = parentSessionId
+    ? `and (coalesce(threads.thread_source, '') = 'subagent'
+        or thread_spawn_edges.parent_thread_id = '${sqliteStringLiteral(parentSessionId)}')`
+    : `and (coalesce(threads.thread_source, '') = 'subagent'
+        or thread_spawn_edges.parent_thread_id is not null)`;
+  return readThreadSummariesFromStateDb(
+    stateDbPath,
+    `where threads.archived = 0
+      ${edgeFilter}
+      order by coalesce(threads.updated_at_ms, threads.updated_at * 1000) desc`,
+    `where archived = 0
+      and coalesce(thread_source, '') = 'subagent'
+      order by coalesce(updated_at_ms, updated_at * 1000) desc`,
+  );
 }
 
 function runSqliteReadQuery(stateDbPath, query) {
@@ -571,16 +652,22 @@ function incompatibleThreadSpawnEdgesSchema(stderr) {
   return /no such table:\s*thread_spawn_edges|no such column:\s*thread_spawn_edges\./i.test(stderr ?? "");
 }
 
-function threadSummaryJsonSelect({ includeParentSessionId = true } = {}) {
+function missingThreadNameColumn(stderr) {
+  return /no such column:\s*(?:threads\.)?name/i.test(stderr ?? "");
+}
+
+function threadSummaryJsonSelect({ includeName = true, includeParentSessionId = true } = {}) {
   const parentSessionId = includeParentSessionId
     ? ",\n    'parent_session_id', thread_spawn_edges.parent_thread_id"
     : "";
+  const name = includeName ? "threads.name" : "null";
   return `select json_object(
     'id', threads.id,
     'rollout_path', threads.rollout_path,
     'updated_at_ms', threads.updated_at_ms,
     'source', threads.source,
     'cwd', threads.cwd,
+    'name', ${name},
     'title', threads.title,
     'archived', threads.archived,
     'agent_nickname', threads.agent_nickname,
@@ -600,7 +687,6 @@ function sqliteStringLiteral(value) {
 
 function parseThreadRow(line, {
   nowMs,
-  followUpToIdleMinutes,
   unreadCompletionTrackingStartMs,
   liveCliSessions,
   liveCliTtyForWorkspace,
@@ -618,23 +704,20 @@ function parseThreadRow(line, {
   const workspacePath = thread.cwd || jsonlObservation?.workspacePath;
   const jumpTarget = jsonlObservation?.jumpTarget ?? jumpTargetFromThreadSource(thread);
   const jsonlKind = jsonlObservation?.kind;
-  const threadUpdatedAfterTaskComplete = threadUpdatedAfterTaskCompleteFromThread(thread, jsonlObservation);
-  const lastActivityAt = lastActivityAtFromThread(thread, jsonlObservation, threadUpdatedAfterTaskComplete);
+  const lastActivityAt = lastActivityAtFromThread(thread, jsonlObservation);
   const hasRecentActivity = lastActivityAt
     ? nowMs - Date.parse(lastActivityAt) <= 2 * 60 * 60 * 1000
     : false;
-  const threadCompletionKind = completionKindFromLastActivityAt(lastActivityAt, nowMs, followUpToIdleMinutes);
-  const kind = threadUpdatedAfterTaskComplete && jsonlKind === "completedImmediate"
-    ? threadCompletionKind
-    : (terminalOrInputKind(jsonlKind)
-      ? jsonlKind
-      : jumpTarget === "desktop" && hasRecentActivity
-        ? "running"
-        : jumpTarget === "desktop"
-          ? "idle"
-          : jsonlKind ?? "insufficientEvidence");
+  const kind = terminalOrInputKind(jsonlKind)
+    ? jsonlKind
+    : jumpTarget === "desktop" && hasRecentActivity
+      ? "running"
+      : jumpTarget === "desktop"
+        ? "idle"
+        : jsonlKind ?? "insufficientEvidence";
   const workspaceName = workspacePath ? path.basename(workspacePath) : undefined;
   const label = firstNonEmpty(
+    thread.name,
     thread.title,
     thread.preview,
     jsonlObservation?.label,
@@ -662,16 +745,8 @@ function parseThreadRow(line, {
   }, { liveCliSessions, liveCliTtyForWorkspace, nowMs });
 }
 
-function threadUpdatedAfterTaskCompleteFromThread(thread, jsonlObservation) {
-  const updatedAt = timestampMsToIsoUtc(Number(thread.updated_at_ms));
-  const taskCompleteAt = jsonlObservation?.taskCompleteAt;
-  return Boolean(updatedAt && taskCompleteAt && Date.parse(updatedAt) > Date.parse(taskCompleteAt));
-}
-
-function lastActivityAtFromThread(thread, jsonlObservation, threadUpdatedAfterTaskComplete = false) {
-  return threadUpdatedAfterTaskComplete
-    ? timestampMsToIsoUtc(Number(thread.updated_at_ms))
-    : jsonlObservation?.lastActivityAt ?? timestampMsToIsoUtc(Number(thread.updated_at_ms));
+function lastActivityAtFromThread(thread, jsonlObservation) {
+  return jsonlObservation?.lastActivityAt ?? timestampMsToIsoUtc(Number(thread.updated_at_ms));
 }
 
 function terminalOrInputKind(kind) {
@@ -681,13 +756,6 @@ function terminalOrInputKind(kind) {
     || kind === "failed"
     || kind === "stopped"
     || kind === "waitingForInput";
-}
-
-function completionKindFromLastActivityAt(lastActivityAt, nowMs, followUpToIdleMinutes) {
-  const ageMs = lastActivityAt ? nowMs - Date.parse(lastActivityAt) : Number.POSITIVE_INFINITY;
-  if (ageMs <= 5 * 60 * 1000) return "completedImmediate";
-  if (ageMs <= followUpWindowMs(followUpToIdleMinutes)) return "completed";
-  return "completedStale";
 }
 
 function parseSessionFile(filePath, {
@@ -707,6 +775,7 @@ function parseSessionFile(filePath, {
   let jumpTarget = "unknown";
   let lastActivityAt;
   let lastActivityKind = "insufficientEvidence";
+  let terminalTurnClosed = false;
   let lastMessage;
   let pendingToolApproval;
   let taskCompleteAt;
@@ -744,28 +813,49 @@ function parseSessionFile(filePath, {
     }
 
     if (value.type === "event_msg") {
-      if (typeof value.timestamp === "string") {
-        lastActivityAt = value.timestamp;
-      }
       const eventType = value.payload?.type;
       const turnId = typeof value.payload?.turn_id === "string" ? value.payload.turn_id : "";
       if (turnId.startsWith("external-import-turn-")) {
         externalImportSession = true;
       }
       if (eventType === "task_complete") {
+        if (typeof value.timestamp === "string") {
+          lastActivityAt = value.timestamp;
+        }
         lastActivityKind = "completed";
+        terminalTurnClosed = true;
         pendingToolApproval = undefined;
         taskCompleteAt = value.timestamp;
       } else if (eventType === "turn_aborted") {
+        if (typeof value.timestamp === "string") {
+          lastActivityAt = value.timestamp;
+        }
         pendingToolApproval = undefined;
         lastActivityKind = "stopped";
-      } else if (eventType === "user_message" || eventType === "agent_message") {
+        terminalTurnClosed = true;
+      } else if (
+        eventType === "user_message"
+        || eventType === "task_started"
+        || eventType === "turn_started"
+      ) {
+        if (typeof value.timestamp === "string") {
+          lastActivityAt = value.timestamp;
+        }
+        terminalTurnClosed = false;
         lastActivityKind = "running";
+      } else if (!terminalTurnClosed) {
+        if (typeof value.timestamp === "string") {
+          lastActivityAt = value.timestamp;
+        }
+        if (eventType === "agent_message" || eventType === "item_started") {
+          lastActivityKind = "running";
+        }
       }
       if (typeof value.payload?.message === "string") {
         if (value.payload.message === "<EXTERNAL SESSION IMPORTED>") {
           externalImportSession = true;
         }
+        if (terminalTurnClosed) continue;
         if (eventType === "user_message" && !sessionName) {
           sessionName = truncate(value.payload.message.trim(), 120);
         } else {
@@ -775,6 +865,7 @@ function parseSessionFile(filePath, {
     }
 
     if (value.type === "response_item") {
+      if (terminalTurnClosed) continue;
       if (typeof value.timestamp === "string") {
         lastActivityAt = value.timestamp;
       }
@@ -786,8 +877,10 @@ function parseSessionFile(filePath, {
         const callId = value.payload?.call_id;
         if (callId && pendingToolApproval?.callId === callId) {
           pendingToolApproval = undefined;
-          lastActivityKind = "running";
         }
+        lastActivityKind = "running";
+      } else {
+        lastActivityKind = "running";
       }
     }
   }
@@ -867,6 +960,59 @@ function isSubagentRow(row) {
   return isSubagentThreadSource(row.threadSource) || Boolean(row.parentSessionId);
 }
 
+function annotateActiveSubagentCounts(items) {
+  const getRow = (item) => item && Object.prototype.hasOwnProperty.call(item, "row")
+    ? item.row
+    : item;
+  const counts = new Map();
+  for (const item of items) {
+    const row = getRow(item);
+    if (row?.state !== "running" || !isSubagentRow(row) || !row.parentSessionId) continue;
+    counts.set(row.parentSessionId, (counts.get(row.parentSessionId) ?? 0) + 1);
+  }
+
+  return items.map((item) => {
+    const row = getRow(item);
+    const count = counts.get(row?.sessionId);
+    if (!count) return item;
+    const annotatedRow = { ...row, activeSubagentCount: count };
+    const observationKindDescriptor = Object.getOwnPropertyDescriptor(row, "observationKind");
+    if (observationKindDescriptor) {
+      Object.defineProperty(annotatedRow, "observationKind", observationKindDescriptor);
+    }
+    return item && Object.prototype.hasOwnProperty.call(item, "row")
+      ? { ...item, row: annotatedRow }
+      : annotatedRow;
+  });
+}
+
+function annotateParentRowWithActiveSubagents(row, {
+  stateDbPath,
+  nowMs,
+  unreadCompletionTrackingStartMs,
+  liveCliSessions,
+  liveCliTtyForWorkspace,
+}) {
+  if (!row || isSubagentRow(row)) return row;
+
+  const subagentStdout = readSubagentThreadSummariesFromStateDb(stateDbPath, row.sessionId);
+  if (!subagentStdout) return row;
+
+  const childRows = [];
+  for (const line of subagentStdout.split("\n")) {
+    if (!line || !recentSubagentThreadCandidate(line, nowMs)) continue;
+    const child = parseThreadRow(line, {
+      nowMs,
+      unreadCompletionTrackingStartMs,
+      liveCliSessions,
+      liveCliTtyForWorkspace,
+    });
+    if (child?.parentSessionId === row.sessionId) childRows.push(child);
+  }
+
+  return annotateActiveSubagentCounts([row, ...childRows])[0];
+}
+
 function isSubagentThreadSource(threadSource) {
   return typeof threadSource === "string" && threadSource.toLowerCase() === "subagent";
 }
@@ -881,13 +1027,15 @@ function effectiveThreadSource(threadSource, jsonlThreadSource) {
 function toSessionRow(observation, { liveCliSessions = [], liveCliTtyForWorkspace, nowMs = Date.now() }) {
   const classified = classifyObservation(observation);
   const row = applyLiveCliActivitySignal(classified, liveCliSessions, liveCliTtyForWorkspace, nowMs);
-  return {
+  const finalizedRow = {
     ...row,
     dismissabilityReason: dismissabilityReason(row.state),
     jumpAvailability: row.workspacePath
       ? row.jumpTarget === "desktop" ? "exact" : "approximate"
       : "unavailable",
   };
+  Object.defineProperty(finalizedRow, "observationKind", { value: observation.kind });
+  return finalizedRow;
 }
 
 function classifyObservation(observation) {
@@ -902,6 +1050,7 @@ function classifyObservation(observation) {
     workspacePath: observation.workspacePath,
     lastActivityAt: emptyToUndefined(observation.lastActivityAt),
     evidenceSummary: emptyToUndefined(observation.evidenceSummary),
+    activeSubagentCount: observation.activeSubagentCount,
     state: classification.state,
     confidence: classification.confidence,
     statusReason: classification.reason,
@@ -1029,7 +1178,7 @@ function mergeLiveCliSessions(rows, liveCliSessions, missingRow) {
 }
 
 function markLiveCliSessionRunning(row, tty) {
-  if (!shouldPromoteLiveCliRow(row.state)) return row;
+  if (!shouldPromoteLiveCliRow(row)) return row;
 
   return {
     ...row,
@@ -1044,8 +1193,15 @@ function markLiveCliSessionRunning(row, tty) {
   };
 }
 
-function shouldPromoteLiveCliRow(state) {
-  return state === "unknown" || state === "idle";
+function shouldPromoteLiveCliRow(row) {
+  return (row.state === "unknown" || row.state === "idle")
+    && ![
+      "completed",
+      "completedImmediate",
+      "completedStale",
+      "failed",
+      "stopped",
+    ].includes(row.observationKind);
 }
 
 function liveCliSessionRow(liveSession, options) {

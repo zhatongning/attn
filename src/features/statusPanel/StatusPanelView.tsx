@@ -42,12 +42,27 @@ const PANEL_MESSAGE_HEIGHT = 32;
 const PANEL_MAX_HEIGHT = 420;
 const PANEL_STRIP_HEIGHT = 50;
 const COMMAND_MESSAGE_DISMISS_DELAY_MS = 3000;
+const PANEL_REFRESH_INTERVAL_MS = 5000;
 const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "working"];
 const AUTO_COLLAPSE_STATUS_SET = new Set<InterventionStatus>(AUTO_COLLAPSE_STATUS_OPTIONS);
 
 interface StatusPanelViewProps {
   initialRows: SessionRow[];
   sourceHealth: SourceHealth;
+}
+
+interface PendingPanelRefresh {
+  followUpToIdleMinutes: number;
+  refreshId: number;
+}
+
+interface RefreshPanelOptions {
+  invalidateActiveRefresh?: boolean;
+}
+
+interface QueuedDirectPanelRefresh extends PendingPanelRefresh {
+  completion: Promise<void>;
+  resolve: () => void;
 }
 
 interface NativeShortcutStatus {
@@ -77,6 +92,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const [nativeShortcutStatus, setNativeShortcutStatus] = useState<NativeShortcutStatus | null>(null);
   const [shortcutRecording, setShortcutRecording] = useState(false);
   const [shortcutApplyPending, setShortcutApplyPending] = useState(false);
+  const [sessionSourceUnavailable, setSessionSourceUnavailable] = useState(false);
   const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
   const [hookInstallPending, setHookInstallPending] = useState(false);
   const [pendingActions, setPendingActions] = useState<Record<string, "jump" | "dismiss" | "pin" | "unpin">>({});
@@ -91,6 +107,8 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const shortcutApplyPendingRef = useRef(false);
   const shortcutFailedWhileDismissedRef = useRef(false);
   const shortcutVisibilityDismissedRef = useRef(false);
+  const activeRefreshPromiseRef = useRef<Promise<void> | null>(null);
+  const queuedDirectRefreshRef = useRef<QueuedDirectPanelRefresh | null>(null);
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
@@ -114,10 +132,79 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   }, [model.hiddenRows, model.visibleRows]);
   const previousDisplayStatusRef = useRef<Record<string, string>>({});
 
-  async function refreshPanel(followUpToIdleMinutes = configRef.current.followUpToIdleMinutes) {
-    const refreshId = latestRefreshIdRef.current + 1;
-    latestRefreshIdRef.current = refreshId;
+  function refreshPanel(
+    followUpToIdleMinutes = configRef.current.followUpToIdleMinutes,
+    { invalidateActiveRefresh = false }: RefreshPanelOptions = {},
+  ) {
+    if (invalidateActiveRefresh) {
+      latestRefreshIdRef.current += 1;
+    }
+    const refresh = {
+      followUpToIdleMinutes,
+      refreshId: latestRefreshIdRef.current,
+    };
 
+    if (activeRefreshPromiseRef.current) {
+      if (invalidateActiveRefresh) {
+        return queueDirectPanelRefresh(refresh);
+      }
+
+      return queuedDirectRefreshRef.current?.completion ?? activeRefreshPromiseRef.current;
+    }
+
+    return startPanelRefresh(refresh);
+  }
+
+  function queueDirectPanelRefresh(refresh: PendingPanelRefresh) {
+    const queuedRefresh = queuedDirectRefreshRef.current;
+    if (queuedRefresh) {
+      queuedRefresh.followUpToIdleMinutes = refresh.followUpToIdleMinutes;
+      queuedRefresh.refreshId = refresh.refreshId;
+      return queuedRefresh.completion;
+    }
+
+    let resolveQueuedRefresh: () => void = () => undefined;
+    const completion = new Promise<void>((resolve) => {
+      resolveQueuedRefresh = resolve;
+    });
+    queuedDirectRefreshRef.current = {
+      ...refresh,
+      completion,
+      resolve: resolveQueuedRefresh,
+    };
+    return completion;
+  }
+
+  function settleQueuedDirectPanelRefresh() {
+    const queuedRefresh = queuedDirectRefreshRef.current;
+    queuedDirectRefreshRef.current = null;
+    queuedRefresh?.resolve();
+  }
+
+  function startPanelRefresh(refresh: PendingPanelRefresh, onSettled?: () => void) {
+    const activeRefresh = refreshPanelOnce(refresh);
+    activeRefreshPromiseRef.current = activeRefresh;
+    void activeRefresh.then(() => {
+      onSettled?.();
+      if (activeRefreshPromiseRef.current !== activeRefresh) {
+        return;
+      }
+
+      const queuedRefresh = queuedDirectRefreshRef.current;
+      queuedDirectRefreshRef.current = null;
+      if (queuedRefresh) {
+        startPanelRefresh(queuedRefresh, queuedRefresh.resolve);
+        return;
+      }
+
+      if (activeRefreshPromiseRef.current === activeRefresh) {
+        activeRefreshPromiseRef.current = null;
+      }
+    });
+    return activeRefresh;
+  }
+
+  async function refreshPanelOnce({ followUpToIdleMinutes, refreshId }: PendingPanelRefresh) {
     try {
       const loadedRows = await loadSessions(followUpToIdleMinutes);
       if (!mountedRef.current) {
@@ -127,6 +214,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       setRows(loadedRows);
+      setSessionSourceUnavailable(false);
       setErrorMessage(null);
     } catch (error: unknown) {
       if (!mountedRef.current) {
@@ -135,6 +223,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (refreshId !== latestRefreshIdRef.current) {
         return;
       }
+      setSessionSourceUnavailable(true);
       setErrorMessage(messageFromUnknownError(error, model.copy.loadSourceFailedLabel));
     }
   }
@@ -170,10 +259,21 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   useEffect(() => {
     mountedRef.current = true;
     let cancelled = false;
-    void refreshPanel();
-    const refreshTimer = window.setInterval(() => {
-      void refreshPanel();
-    }, 5000);
+    let refreshTimer: number | undefined;
+
+    const pollAfterCurrentRefresh = async () => {
+      await refreshPanel();
+      if (cancelled) {
+        return;
+      }
+
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = undefined;
+        void pollAfterCurrentRefresh();
+      }, PANEL_REFRESH_INTERVAL_MS);
+    };
+
+    void pollAfterCurrentRefresh();
     const shortcutErrorGeneration = shortcutErrorGenerationRef.current;
     void configurePanelShortcutInOrder(configRef.current.panelToggleShortcut, () => !cancelled)
       .then((result) => {
@@ -240,8 +340,11 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     return () => {
       cancelled = true;
       mountedRef.current = false;
+      settleQueuedDirectPanelRefresh();
       actionFeedbackSequenceRef.current += 1;
-      window.clearInterval(refreshTimer);
+      if (refreshTimer !== undefined) {
+        window.clearTimeout(refreshTimer);
+      }
       clearJumpNoticeTimer();
       document.removeEventListener("visibilitychange", dismissShortcutUiOnHide);
       unlistenToggle?.();
@@ -382,7 +485,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       setRows(updatedRows);
-      await refreshPanel(configRef.current.followUpToIdleMinutes);
+      void refreshPanel(configRef.current.followUpToIdleMinutes, { invalidateActiveRefresh: true });
       if (!mountedRef.current) {
         return;
       }
@@ -420,7 +523,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       setRows(updatedRows);
-      await refreshPanel(configRef.current.followUpToIdleMinutes);
+      void refreshPanel(configRef.current.followUpToIdleMinutes, { invalidateActiveRefresh: true });
       if (!mountedRef.current) {
         return;
       }
@@ -451,7 +554,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         acknowledgedSessionIds,
         configRef.current.followUpToIdleMinutes,
       );
-      await refreshPanel();
+      void refreshPanel(configRef.current.followUpToIdleMinutes, { invalidateActiveRefresh: true });
       if (!isLatestActionFeedback(actionFeedbackSequence)) {
         return;
       }
@@ -729,6 +832,14 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   }
 
   function sessionCounters() {
+    if (sessionSourceUnavailable) {
+      return (
+        <div className="panel-counters" aria-label="Session counters">
+          <span className="panel-counter--unavailable">{model.copy.loadSourceFailedLabel}</span>
+        </div>
+      );
+    }
+
     return (
       <div className="panel-counters" aria-label="Session counters">
         <span>{model.interventionCount} {model.copy.alertsLabel}</span>
@@ -942,14 +1053,14 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (managementPresentationGeneration === managementPresentationGenerationRef.current) {
         setView("panel");
       }
-      void refreshPanel(committedConfig.followUpToIdleMinutes);
+      void refreshPanel(committedConfig.followUpToIdleMinutes, { invalidateActiveRefresh: true });
     } catch (error: unknown) {
       if (!mountedRef.current) return;
       setNativeShortcutStatus(nativeShortcutStatusFromError(error));
       const committedConfig = { ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut };
       commitConfig(committedConfig);
       updateDraftConfig(shortcutVisibilityDismissedRef.current ? committedConfig : nextConfig);
-      void refreshPanel(nextConfig.followUpToIdleMinutes);
+      void refreshPanel(nextConfig.followUpToIdleMinutes, { invalidateActiveRefresh: true });
       if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
         setShortcutRegistrationError(true);
       } else if (!shortcutVisibilityDismissedRef.current) {
@@ -1086,10 +1197,13 @@ function StatusRow({
       ? copy.unpinLabel
       : copy.pinLabel;
   const dismissTitle = pendingAction === "dismiss" ? copy.dismissingLabel : copy.dismissLabel;
+  const activeSubagentCount = row.activeSubagentCount ?? 0;
+  const hasActiveSubagents = activeSubagentCount > 0;
   const rowClassName = [
     "status-row",
     `status-row--${row.displayStatus}`,
     `status-row--${row.statusTone}`,
+    hasActiveSubagents ? "status-row--subagent-active" : "",
     row.pinned ? "status-row--pinned" : "",
     attentionCue ? "status-row--attention-cue" : "",
     evidenceOpen ? "status-row--evidence-open" : "",
@@ -1132,6 +1246,16 @@ function StatusRow({
       <div className="status-content">
         <h2>{row.label}</h2>
         <p className="status-meta">
+          {hasActiveSubagents ? (
+            <span
+              className="status-subagent-badge"
+              aria-label={copy.subagentActivityLabel(activeSubagentCount)}
+              data-testid={`status-subagent-${row.sessionId}`}
+              title={copy.subagentActivityLabel(activeSubagentCount)}
+            >
+              {copy.subagentActivityLabel(activeSubagentCount)}
+            </span>
+          ) : null}
           <span className="status-workspace">{rowSubtitle(row)}</span>
           <span className="status-confidence">{copy.confidenceLabels[row.confidence]}</span>
           <span className="status-evidence-anchor" ref={evidenceRef}>
