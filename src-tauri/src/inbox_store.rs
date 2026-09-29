@@ -571,13 +571,15 @@ impl InboxStore {
             .as_ref()
             .map(|row| row.jump_availability)
             .unwrap_or(JumpAvailability::Unavailable);
-        let target = row
-            .as_ref()
-            .map(|row| row.jump_target)
-            .unwrap_or(JumpTarget::Unknown);
         let plan = row
             .as_ref()
             .and_then(build_jump_command_plan);
+        let target = jump_target_for_plan(
+            plan.as_ref(),
+            row.as_ref()
+                .map(|row| row.jump_target)
+                .unwrap_or(JumpTarget::Unknown),
+        );
         let execution = plan.clone().map(execute_jump_command_plan);
         let succeeded = execution.as_ref().is_some_and(Result::is_ok);
         if succeeded {
@@ -1478,16 +1480,16 @@ fn build_jump_command_plan_with_runtime_signals(
     let Some(workspace_path) = row.workspace_path.as_deref() else {
         return build_jump_command_plan_with_cli_context(row, None, None);
     };
+    if app_thread_ids.contains(&row.session_id) {
+        return Some(codex_desktop_jump_command_plan(row, workspace_path));
+    }
+
     let exact_live_tty = live_cli_exact_tty_for_jump_plan(row, live_sessions);
     if let Some(tty) = exact_live_tty {
         return Some(JumpCommandPlan::ITermActivate {
             tty,
             live_codex: true,
         });
-    }
-
-    if app_thread_ids.contains(&row.session_id) {
-        return Some(codex_desktop_jump_command_plan(row, workspace_path));
     }
 
     let live_tty = live_cli_workspace_tty_for_jump_plan(row, live_sessions);
@@ -1561,6 +1563,16 @@ fn codex_desktop_jump_command_plan(row: &SessionRow, workspace_path: &str) -> Ju
         deeplink_url: codex_thread_deeplink(&row.session_id),
         workspace_path: workspace_path.to_string(),
         activate_bundle_id: codex_bundle_id().to_string(),
+    }
+}
+
+fn jump_target_for_plan(plan: Option<&JumpCommandPlan>, fallback: JumpTarget) -> JumpTarget {
+    match plan {
+        Some(JumpCommandPlan::CodexDesktop { .. }) => JumpTarget::Desktop,
+        Some(JumpCommandPlan::ITermActivate { .. } | JumpCommandPlan::ITermResume { .. }) => {
+            JumpTarget::Cli
+        }
+        None => fallback,
     }
 }
 
@@ -1794,13 +1806,16 @@ fn is_codex_cli_args(args: &str) -> bool {
 }
 
 fn is_codex_app_server_args(args: &str) -> bool {
-    let parts = args.split_whitespace().collect::<Vec<_>>();
-    let Some(executable) = parts.first() else {
+    let mut parts = args.split_whitespace();
+    let Some(executable) = parts.next() else {
         return false;
     };
 
+    // Other Codex hosts also run app-server, but only the desktop app owns desktop threads.
     executable.rsplit('/').next().unwrap_or(executable) == "codex"
-        && parts.get(1) == Some(&"app-server")
+        && (executable.contains("/Codex.app/Contents/")
+            || executable.contains("/ChatGPT.app/Contents/"))
+        && parts.any(|part| part == "app-server")
 }
 
 fn live_cli_session_id_from_args(args: &str) -> Option<String> {
@@ -2383,10 +2398,14 @@ mod tests {
                 activate_bundle_id: "com.openai.codex".to_string()
             })
         );
+        assert_eq!(
+            super::jump_target_for_plan(plan.as_ref(), row.jump_target),
+            JumpTarget::Desktop
+        );
     }
 
     #[test]
-    fn matching_live_cli_session_takes_precedence_over_codex_app_signal() {
+    fn desktop_app_owner_takes_precedence_over_cli_resume_process() {
         let row = SessionRow::new(
             "019e8c3e-f343-78d2-a7be-90f318bf303c",
             "CLI row still live",
@@ -2413,9 +2432,11 @@ mod tests {
 
         assert_eq!(
             plan,
-            Some(super::JumpCommandPlan::ITermActivate {
-                tty: "ttys008".to_string(),
-                live_codex: true
+            Some(super::JumpCommandPlan::CodexDesktop {
+                thread_id: "019e8c3e-f343-78d2-a7be-90f318bf303c".to_string(),
+                workspace_path: "/Users/edy/project-b".to_string(),
+                deeplink_url: "codex://threads/019e8c3e-f343-78d2-a7be-90f318bf303c".to_string(),
+                activate_bundle_id: "com.openai.codex".to_string()
             })
         );
     }
@@ -2522,6 +2543,12 @@ mod tests {
     fn parse_codex_app_server_process_line_only_accepts_app_server() {
         let app_server_line =
             "59618 /Applications/Co /Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled";
+        let chatgpt_app_server_line =
+            "21872 /Applications/Ch /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c features.code_mode_host=true app-server --analytics-default-enabled";
+        let vscode_app_server_line =
+            "1478 /Users/edy/.vsco /Users/edy/.vscode/extensions/openai.chatgpt/bin/macos-aarch64/codex -c features.code_mode_host=true app-server --analytics-default-enabled";
+        let managed_daemon_line =
+            "76393 /Users/edy/.code /Users/edy/.codex/packages/app-server-daemon/CodexCLI.app/Contents/MacOS/codex app-server --listen unix://";
         let cli_resume_line =
             "29457 /Applications/Co /Applications/Codex.app/Contents/Resources/codex resume 019e9153-943a-7402-8e61-9e89cee5a6f4 --cd /Users/edy/project";
         let helper_line =
@@ -2531,6 +2558,12 @@ mod tests {
             super::parse_codex_app_server_process_line(app_server_line),
             Some("59618")
         );
+        assert_eq!(
+            super::parse_codex_app_server_process_line(chatgpt_app_server_line),
+            Some("21872")
+        );
+        assert!(super::parse_codex_app_server_process_line(vscode_app_server_line).is_none());
+        assert!(super::parse_codex_app_server_process_line(managed_daemon_line).is_none());
         assert!(super::parse_codex_app_server_process_line(cli_resume_line).is_none());
         assert!(super::parse_codex_app_server_process_line(helper_line).is_none());
     }

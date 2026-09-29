@@ -25,7 +25,7 @@ Codex 有用的会话历史，但没有提供一个本地、可操作的关注�
 - 将会话归类为 `blocked`、`attention`、`inspect`、`running`、`follow-up`、`stopped` 或 `idle`。
 - 将需要处理的行排在安静上下文之前，并支持在需要时展开面板查看更多条目。
 - 支持 Jump back、置顶、忽略和恢复操作。
-- 优先跳转到匹配的 iTerm 中活动的 Codex 会话，其次是同工作区的 iTerm 标签页，最后回退到精确的 Codex Desktop 线程深链。
+- 桌面端来源的会话跳转到精确线程；CLI 来源的会话如果由 Codex Desktop 持有，也会跳转到桌面端，否则聚焦匹配的 iTerm 活动会话，或在 iTerm 中恢复该 CLI 会话。
 - 每五秒刷新一次，并在 macOS 的所有空间中保持面板可见。
 - 支持拖动面板，或通过 macOS 应用菜单定位唯一的面板窗口。
 

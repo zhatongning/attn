@@ -25,7 +25,7 @@ Codex has useful session history, but it does not provide a single local, action
 - Classifies sessions as `blocked`, `attention`, `inspect`, `running`, `follow-up`, `stopped`, or `idle`.
 - Keeps actionable rows ahead of quiet context and lets users expand the panel when they need more detail.
 - Supports Jump back, pin, dismiss, and restore actions.
-- Routes Jump back to a matching live iTerm Codex session when possible, then a matching iTerm workspace tab, and finally the exact Codex Desktop thread deep link.
+- Routes Desktop-sourced sessions to their exact thread. For CLI-sourced sessions, it follows Codex Desktop when that app owns the thread; otherwise it focuses a matching live iTerm session or resumes the CLI session there.
 - Refreshes the panel every five seconds and keeps the panel visible across macOS Spaces.
 - Lets the user position the single panel by dragging it or through the macOS app menu.
 
