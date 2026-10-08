@@ -222,7 +222,8 @@ pub fn run() {
                     }
                 });
                 app.manage(placement);
-                app.state::<PanelPlacement>().snap(Corner::TopRight)?;
+                // React subscribes before restoring native/legacy placement.
+                // The restore command supplies TopRight only when neither exists.
             }
 
             #[cfg(desktop)]

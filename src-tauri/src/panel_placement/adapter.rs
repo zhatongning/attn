@@ -10,9 +10,11 @@ use tauri_plugin_global_shortcut::ShortcutState;
 
 use super::state::{Corner, DisplayFrame, PhysicalFrame, PlacementEffect, PlacementInput,
     PlacementMachine, PlacementSnapshot};
+use super::store::{LoadOutcome, PlacementStore};
 
 pub const PLACEMENT_CONFIRMED_EVENT: &str = "agent-session-inbox://placement-confirmed";
 pub const PLACEMENT_UNCONFIRMED_EVENT: &str = "agent-session-inbox://placement-unconfirmed";
+pub const PLACEMENT_PERSISTENCE_ERROR_EVENT: &str = "agent-session-inbox://placement-persistence-error";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LegacyPlacement {
@@ -28,6 +30,12 @@ pub struct AcceptedPlacement {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UnconfirmedPlacement {
+    pub generation: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlacementPersistenceError {
     pub generation: u64,
     pub reason: String,
 }
@@ -50,6 +58,7 @@ enum NativeEffect {
     SetHeight { generation: u64, width: u32, height: u32 },
     Confirm(PlacementSnapshot),
     ReportUnconfirmed(UnconfirmedPlacement),
+    ReportPersistenceError(PlacementPersistenceError),
     BeginDrag,
 }
 
@@ -93,6 +102,8 @@ impl<R: Runtime> WindowPort for NativeWindow<R> {
                     (None, window.app_handle().emit_to("main", PLACEMENT_CONFIRMED_EVENT, snapshot)),
                 NativeEffect::ReportUnconfirmed(failure) =>
                     (None, window.app_handle().emit_to("main", PLACEMENT_UNCONFIRMED_EVENT, failure)),
+                NativeEffect::ReportPersistenceError(failure) =>
+                    (None, window.app_handle().emit_to("main", PLACEMENT_PERSISTENCE_ERROR_EVENT, failure)),
                 NativeEffect::BeginDrag => (None, window.start_dragging()),
             };
             if let Err(error) = result {
@@ -146,23 +157,37 @@ impl PanelPlacement {
     pub fn new<R: Runtime>(window: WebviewWindow<R>) -> Result<Self, String> {
         let position = window.outer_position().map_err(|error| error.to_string())?;
         let size = window.outer_size().map_err(|error| error.to_string())?;
-        Self::with_port(Arc::new(NativeWindow(window)), PhysicalFrame {
+        let path = window.app_handle().path().app_config_dir()
+            .map_err(|error| error.to_string())?.join("placement.json");
+        Self::with_port_and_store(Arc::new(NativeWindow(window)), PhysicalFrame {
             x: position.x, y: position.y, width: size.width, height: size.height,
-        }, None, Duration::from_secs(3))
+        }, None, Duration::from_secs(3), Some(Arc::new(PlacementStore::new(path))))
     }
 
+    #[cfg(test)]
     fn with_port(
         window: Arc<dyn WindowPort>, observed: PhysicalFrame,
         saved: Option<PlacementSnapshot>, watchdog: Duration,
     ) -> Result<Self, String> {
+        Self::with_port_and_store(window, observed, saved, watchdog, None)
+    }
+
+    fn with_port_and_store(
+        window: Arc<dyn WindowPort>, observed: PhysicalFrame,
+        saved: Option<PlacementSnapshot>, watchdog: Duration, store: Option<Arc<PlacementStore>>,
+    ) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
         let worker_sender = sender.clone();
         std::thread::Builder::new().name("panel-placement".into()).spawn(move || {
+            let placement_active = store.is_none();
+            let loaded = store.as_ref().map_or(Ok(LoadOutcome::Missing), |store|
+                store.load().map_err(|error| error.to_string()));
             PlacementWorker {
                 machine: PlacementMachine::new(observed, saved), window,
                 sender: worker_sender, deadlines: BTreeMap::new(), watchdog,
                 reported_failures: BTreeSet::new(),
                 persisted: None, legacy: None, restoration_requested: false,
+                store, loaded, placement_active,
             }.run(receiver);
         }).map_err(|error| format!("placement worker unavailable: {error}"))?;
         Ok(Self { _lifetime: Arc::new(ShutdownGuard(sender.clone())), sender })
@@ -191,8 +216,8 @@ impl PanelPlacement {
         Ok(receiver)
     }
 
-    /// Task 3 replaces this idempotent staging seam with native storage/migration.
-    /// Enqueueing legacy data currently neither moves nor confirms the window.
+    /// Called after event subscription. Native storage takes priority; legacy
+    /// coordinates are only a one-time Missing/Corrupt migration source.
     pub fn restore(&self, legacy: Option<LegacyPlacement>) -> Result<(), String> {
         self.enqueue(WorkerMessage::Restore(legacy))
     }
@@ -220,10 +245,15 @@ struct PlacementWorker {
     deadlines: BTreeMap<u64, Instant>,
     reported_failures: BTreeSet<u64>,
     watchdog: Duration,
-    // In-memory sink only; Task 3 owns durable persistence.
+    // Updated only after the serialized durable write succeeds.
     persisted: Option<PlacementSnapshot>,
     legacy: Option<LegacyPlacement>,
     restoration_requested: bool,
+    store: Option<Arc<PlacementStore>>,
+    loaded: Result<LoadOutcome, String>,
+    // Startup observations update dimensions, but cannot overwrite a native
+    // record before subscribed restoration or an explicit placement/drag intent.
+    placement_active: bool,
 }
 
 impl PlacementWorker {
@@ -240,7 +270,12 @@ impl PlacementWorker {
                 None => match receiver.recv() { Ok(message) => message, Err(_) => break },
             };
             match message {
-                WorkerMessage::Input(input) => { self.transition(input); }
+                WorkerMessage::Input(input) => {
+                    if matches!(input, PlacementInput::Snap(_) | PlacementInput::CyclePressed) {
+                        self.placement_active = true;
+                    }
+                    self.transition(input);
+                }
                 WorkerMessage::ResizeLogical(height, receipt) => {
                     let result = self.window.scale_factor().and_then(|scale| {
                         let physical = (f64::from(height) * scale).round();
@@ -255,11 +290,12 @@ impl PlacementWorker {
                 }
                 WorkerMessage::Restore(legacy) => {
                     if !self.restoration_requested {
-                        self.legacy = legacy;
                         self.restoration_requested = true;
+                        self.restore(legacy);
                     }
                 }
                 WorkerMessage::BeginDrag => {
+                    self.placement_active = true;
                     self.transition(PlacementInput::BeginDrag);
                     if let Err(error) = self.window.dispatch(NativeEffect::BeginDrag, self.sender.clone()) {
                         eprintln!("panel drag dispatch failed: {error}");
@@ -278,7 +314,11 @@ impl PlacementWorker {
     }
 
     fn transition(&mut self, input: PlacementInput) -> Option<u64> {
-        let displays = self.window.displays(self.machine.observed()).unwrap_or_else(|error| {
+        let display_frame = match input {
+            PlacementInput::RestorePosition { x, y, .. } => PhysicalFrame { x, y, ..self.machine.observed() },
+            _ => self.machine.observed(),
+        };
+        let displays = self.window.displays(display_frame).unwrap_or_else(|error| {
             eprintln!("panel displays unavailable: {error}"); Vec::new()
         });
         let effects = self.machine.reduce(input, &displays);
@@ -296,9 +336,20 @@ impl PlacementWorker {
                 PlacementEffect::Confirm(snapshot) => {
                     generation = Some(snapshot.generation);
                     self.deadlines.retain(|value, _| *value > snapshot.generation);
+                    if !self.placement_active { continue; }
                     NativeEffect::Confirm(snapshot)
                 }
-                PlacementEffect::Persist(snapshot) => { self.persisted = Some(snapshot); continue; }
+                PlacementEffect::Persist(snapshot) => {
+                    if !self.placement_active { continue; }
+                    // Both transition effects and fsync/rename run on this
+                    // worker, so no late background write can race a new drag.
+                    let result = self.store.as_ref().map_or(Ok(()), |store| store.save_confirmed(&snapshot));
+                    match result {
+                        Ok(()) => self.persisted = Some(snapshot),
+                        Err(error) => self.report_persistence_error(snapshot.generation, error.to_string()),
+                    }
+                    continue;
+                }
                 PlacementEffect::ReportUnconfirmed(value) => {
                     generation = Some(value);
                     self.report(value, if displays.is_empty() { "display-unavailable" } else { "unconfirmed-timeout" }.into());
@@ -327,6 +378,45 @@ impl PlacementWorker {
             }
         }
         generation
+    }
+
+    fn restore(&mut self, legacy: Option<LegacyPlacement>) {
+        match self.loaded.clone() {
+            Ok(LoadOutcome::Stored(record)) => {
+                self.placement_active = true;
+                self.transition(PlacementInput::RestorePosition {
+                    x: record.position.x, y: record.position.y, corner: record.corner,
+                });
+            }
+            Ok(outcome) => {
+                self.placement_active = true;
+                if let LoadOutcome::Corrupt(reason) = outcome {
+                    self.report_persistence_error(0, format!("placement record corrupt: {reason}"));
+                }
+                self.legacy = legacy;
+                if let Some(value) = legacy {
+                    self.transition(PlacementInput::RestorePosition {
+                        x: value.position.x, y: value.position.y, corner: value.corner,
+                    });
+                } else {
+                    self.transition(PlacementInput::Snap(Corner::TopRight));
+                }
+            }
+            Err(reason) => {
+                // An unreadable record is neither Missing nor Corrupt. Do not
+                // silently replace a potentially valid native record with legacy.
+                self.report_persistence_error(0, reason);
+            }
+        }
+    }
+
+    fn report_persistence_error(&self, generation: u64, reason: String) {
+        eprintln!("panel placement generation {generation} persistence failed: {reason}");
+        if let Err(error) = self.window.dispatch(
+            NativeEffect::ReportPersistenceError(PlacementPersistenceError { generation, reason }), self.sender.clone(),
+        ) {
+            eprintln!("panel placement persistence failure event unavailable: {error}");
+        }
     }
 
     fn report(&mut self, generation: u64, reason: String) {
@@ -381,6 +471,7 @@ struct WorkerSnapshot {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use crate::panel_placement::store::{LoadOutcome, PlacementStore};
 
     const STRIP: PhysicalFrame = PhysicalFrame {
         x: 16, y: 16, width: 420, height: 50,
@@ -395,6 +486,7 @@ mod tests {
         heights: Vec<(u32, u32)>,
         confirmed: Vec<PlacementSnapshot>,
         unconfirmed: Vec<UnconfirmedPlacement>,
+        persistence_errors: Vec<(u64, String)>,
         drags: usize,
     }
 
@@ -403,11 +495,14 @@ mod tests {
         displays: Vec<DisplayFrame>,
         scale: f64,
         reject_position: bool,
+        current: Option<DisplayFrame>,
+        primary: Option<DisplayFrame>,
+        consume_confirmation: bool,
     }
 
     impl WindowPort for DeferredWindow {
         fn displays(&self, observed: PhysicalFrame) -> Result<Vec<DisplayFrame>, String> {
-            Ok(ordered_displays(observed, self.displays.clone(), None, None))
+            Ok(ordered_displays(observed, self.displays.clone(), self.current, self.primary))
         }
 
         fn scale_factor(&self) -> Result<f64, String> { Ok(self.scale) }
@@ -421,8 +516,11 @@ mod tests {
                     calls.positions.push((x, y));
                 }
                 NativeEffect::SetHeight { width, height, .. } => calls.heights.push((width, height)),
-                NativeEffect::Confirm(snapshot) => calls.confirmed.push(snapshot),
+                NativeEffect::Confirm(snapshot) => {
+                    if self.consume_confirmation { calls.confirmed.push(snapshot); }
+                }
                 NativeEffect::ReportUnconfirmed(failure) => calls.unconfirmed.push(failure),
+                NativeEffect::ReportPersistenceError(failure) => calls.persistence_errors.push((failure.generation, failure.reason)),
                 NativeEffect::BeginDrag => calls.drags += 1,
             }
             Ok(())
@@ -439,6 +537,7 @@ mod tests {
     ) -> (PanelPlacement, Arc<DeferredWindow>) {
         let window = Arc::new(DeferredWindow {
             calls: Mutex::new(Calls::default()), displays, scale, reject_position,
+            current: None, primary: None, consume_confirmation: true,
         });
         let placement = PanelPlacement::with_port(window.clone(), frame, saved, watchdog).unwrap();
         (placement, window)
@@ -650,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_staging_is_idempotent_and_never_claims_confirmation() {
+    fn legacy_restore_is_idempotent_and_waits_for_observed_location() {
         let (placement, window) = setup(STRIP, None);
         let legacy = LegacyPlacement { position: PhysicalPosition::new(310, 205), corner: Some(Corner::BottomLeft) };
         placement.restore(Some(legacy)).unwrap();
@@ -659,6 +758,218 @@ mod tests {
         assert_eq!(state.legacy, Some(legacy));
         assert_eq!(state.confirmed, None);
         assert_eq!(state.persisted, None);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(310, 205)]);
+        moved(&placement, 310, 205);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(310, 205), (16, 1014)]);
+        assert_eq!(inspect(&placement).persisted, None);
+        moved(&placement, 16, 1014);
+        assert_eq!(inspect(&placement).persisted.unwrap().corner, Some(Corner::BottomLeft));
+    }
+
+    fn setup_store(
+        frame: PhysicalFrame, store: Arc<PlacementStore>, displays: Vec<DisplayFrame>,
+        current: Option<DisplayFrame>, primary: Option<DisplayFrame>, consume_confirmation: bool,
+    ) -> (PanelPlacement, Arc<DeferredWindow>) {
+        let window = Arc::new(DeferredWindow {
+            calls: Mutex::new(Calls::default()), displays, scale: 1.0, reject_position: false,
+            current, primary, consume_confirmation,
+        });
+        let placement = PanelPlacement::with_port_and_store(
+            window.clone(), frame, None, Duration::from_secs(3), Some(store),
+        ).unwrap();
+        (placement, window)
+    }
+
+    #[test]
+    fn native_record_beats_legacy_and_restores_negative_monitor_before_corner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        let seed = PlacementSnapshot { generation: 77, corner: Some(Corner::BottomLeft),
+            frame: PhysicalFrame { x: -1904, y: 500, width: 800, height: 600 } };
+        PlacementStore::new(path.clone()).save_confirmed(&seed).unwrap();
+        let store = Arc::new(PlacementStore::new(path));
+        let frame = PhysicalFrame { height: 252, ..STRIP };
+        let (placement, window) = setup_store(frame, store.clone(),
+            vec![DISPLAY, DisplayFrame { x: -1920, ..DISPLAY }], Some(DISPLAY), Some(DISPLAY), true);
+        placement.restore(Some(LegacyPlacement { position: PhysicalPosition::new(310, 205), corner: None })).unwrap();
+        placement.restore(None).unwrap();
+        let snapshot = inspect(&placement);
+        assert_eq!(snapshot.legacy, None);
+        assert_eq!(snapshot.confirmed, None);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(-1904, 500)]);
+        moved(&placement, -1904, 500);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(-1904, 500), (-1904, 812)]);
+        assert_eq!(inspect(&placement).persisted, None);
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record) if record.position.y == 500));
+        moved(&placement, -1904, 812);
+        let confirmed = inspect(&placement).confirmed.unwrap();
+        assert_eq!(confirmed.generation, 1);
+        assert_eq!(confirmed.frame, PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 });
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.position.y == 812 && record.corner == Some(Corner::BottomLeft)));
+        placement.restore(Some(LegacyPlacement { position: PhysicalPosition::new(1, 2), corner: None })).unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().positions.len(), 2);
+    }
+
+    #[test]
+    fn missing_and_corrupt_native_storage_migrate_only_after_confirmation() {
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("placement.json");
+            if corrupt { std::fs::write(&path, b"{invalid").unwrap(); }
+            let store = Arc::new(PlacementStore::new(path.clone()));
+            let (placement, window) = setup_store(STRIP, store.clone(), vec![DISPLAY], None, Some(DISPLAY), true);
+            let legacy = LegacyPlacement { position: PhysicalPosition::new(310, 205), corner: None };
+            placement.restore(Some(legacy)).unwrap();
+            placement.restore(Some(LegacyPlacement { position: PhysicalPosition::new(1, 2), corner: None })).unwrap();
+            assert_eq!(inspect(&placement).legacy, Some(legacy));
+            assert_eq!(window.calls.lock().unwrap().positions, vec![(310, 205)]);
+            if corrupt { assert_eq!(std::fs::read(&path).unwrap(), b"{invalid"); }
+            else { assert!(!path.exists()); }
+            moved(&placement, 310, 205);
+            assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+                if record.position.x == 310 && record.corner == None));
+            if corrupt { assert_eq!(window.calls.lock().unwrap().persistence_errors.len(), 1); }
+        }
+    }
+
+    #[test]
+    fn missing_monitor_uses_current_then_primary_fallback_without_offscreen_claim() {
+        for current in [Some(DisplayFrame { x: 4000, ..DISPLAY }), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("placement.json");
+            PlacementStore::new(path.clone()).save_confirmed(&PlacementSnapshot {
+                generation: 8, corner: Some(Corner::BottomLeft),
+                frame: PhysicalFrame { x: -1904, y: 812, ..STRIP },
+            }).unwrap();
+            let far = DisplayFrame { x: 4000, ..DISPLAY };
+            let store = Arc::new(PlacementStore::new(path));
+            let (placement, window) = setup_store(STRIP, store, vec![DISPLAY, far], current, Some(DISPLAY), true);
+            placement.restore(None).unwrap();
+            assert_eq!(inspect(&placement).confirmed, None);
+            let target = if current.is_some() { (4016, 1014) } else { (16, 1014) };
+            assert_eq!(window.calls.lock().unwrap().positions, vec![target]);
+            moved(&placement, target.0, target.1);
+            assert_eq!(inspect(&placement).confirmed.unwrap().corner, Some(Corner::BottomLeft));
+        }
+    }
+
+    #[test]
+    fn native_restore_noop_confirms_without_moved_and_keeps_current_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        PlacementStore::new(path.clone()).save_confirmed(&PlacementSnapshot {
+            generation: 99, corner: Some(Corner::BottomLeft),
+            frame: PhysicalFrame { x: -1904, y: 812, width: 600, height: 400 },
+        }).unwrap();
+        let frame = PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 };
+        let store = Arc::new(PlacementStore::new(path));
+        let (placement, window) = setup_store(frame, store, vec![DisplayFrame { x: -1920, ..DISPLAY }], None, None, true);
+        placement.restore(None).unwrap();
+        let snapshot = inspect(&placement).persisted.unwrap();
+        assert_eq!(snapshot.frame, frame);
+        assert_eq!(snapshot.generation, 1);
         assert!(window.calls.lock().unwrap().positions.is_empty());
+        assert_eq!(window.calls.lock().unwrap().confirmed.len(), 1);
+    }
+
+    #[test]
+    fn hidden_confirmation_persists_without_frontend_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PlacementStore::new(dir.path().join("placement.json")));
+        let (placement, window) = setup_store(STRIP, store.clone(), vec![DISPLAY], None, None, false);
+        placement.snap(Corner::BottomLeft).unwrap();
+        inspect(&placement);
+        assert_eq!(store.load().unwrap(), LoadOutcome::Missing);
+        moved(&placement, 16, 1014);
+        assert!(window.calls.lock().unwrap().confirmed.is_empty());
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.position.y == 1014 && record.corner == Some(Corner::BottomLeft)));
+    }
+
+    #[test]
+    fn rejected_directory_write_reports_storage_error_without_reverting_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = Arc::new(PlacementStore::new(path.clone()));
+        let (placement, window) = setup_store(STRIP, store, vec![DISPLAY], None, None, true);
+        placement.snap(Corner::BottomLeft).unwrap();
+        moved(&placement, 16, 1014);
+        let state = inspect(&placement);
+        assert_eq!(state.confirmed.unwrap().frame.y, 1014);
+        assert_eq!(state.persisted, None);
+        let calls = window.calls.lock().unwrap();
+        assert!(calls.unconfirmed.is_empty());
+        assert_eq!(calls.confirmed.len(), 1);
+        assert_eq!(calls.persistence_errors.last().unwrap().0, 1);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn absent_native_and_legacy_defaults_once_to_top_right_after_subscription() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PlacementStore::new(dir.path().join("placement.json")));
+        let (placement, window) = setup_store(STRIP, store.clone(), vec![DISPLAY], None, None, true);
+        assert!(window.calls.lock().unwrap().positions.is_empty());
+        placement.restore(None).unwrap();
+        placement.restore(None).unwrap();
+        assert_eq!(inspect(&placement).confirmed, None);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(1484, 16)]);
+        assert_eq!(store.load().unwrap(), LoadOutcome::Missing);
+        moved(&placement, 1484, 16);
+        assert_eq!(inspect(&placement).confirmed.unwrap().corner, Some(Corner::TopRight));
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.position.x == 1484 && record.corner == Some(Corner::TopRight)));
+    }
+
+    #[test]
+    fn stale_native_event_cannot_overwrite_latest_durable_free_drag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PlacementStore::new(dir.path().join("placement.json")));
+        let (placement, window) = setup_store(STRIP, store.clone(), vec![DISPLAY], None, None, false);
+        placement.snap(Corner::TopRight).unwrap();
+        placement.begin_drag().unwrap();
+        moved(&placement, 310, 205);
+        moved(&placement, 320, 215);
+        moved(&placement, 1484, 16);
+        assert_eq!(window.calls.lock().unwrap().positions.last(), Some(&(320, 215)));
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.position.x == 320 && record.position.y == 215 && record.corner == None));
+    }
+
+    #[test]
+    fn storage_read_error_does_not_accept_legacy_as_missing_or_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = Arc::new(PlacementStore::new(path));
+        let (placement, window) = setup_store(STRIP, store, vec![DISPLAY], None, None, true);
+        placement.restore(Some(LegacyPlacement { position: PhysicalPosition::new(310, 205), corner: None })).unwrap();
+        placement.restore(None).unwrap();
+        assert_eq!(inspect(&placement).legacy, None);
+        assert_eq!(inspect(&placement).confirmed, None);
+        let calls = window.calls.lock().unwrap();
+        assert!(calls.positions.is_empty());
+        assert_eq!(calls.persistence_errors.len(), 1);
+    }
+
+    #[test]
+    fn startup_native_resize_cannot_replace_corrupt_record_before_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        std::fs::write(&path, b"{invalid").unwrap();
+        let store = Arc::new(PlacementStore::new(path.clone()));
+        let (placement, window) = setup_store(STRIP, store, vec![DISPLAY], None, None, true);
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        inspect(&placement);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
+        assert!(window.calls.lock().unwrap().confirmed.is_empty());
+        placement.restore(Some(LegacyPlacement { position: PhysicalPosition::new(310, 205), corner: None })).unwrap();
+        inspect(&placement);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
+        moved(&placement, 310, 205);
+        assert_eq!(inspect(&placement).persisted.unwrap().frame.height, 252);
     }
 }

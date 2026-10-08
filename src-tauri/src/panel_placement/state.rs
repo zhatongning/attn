@@ -51,6 +51,7 @@ pub enum PlacementInput {
     CyclePressed,
     CycleReleased,
     Snap(Corner),
+    RestorePosition { x: i32, y: i32, corner: Option<Corner> },
     /// Height is physical pixels, like the native Resized observation.
     ResizeRequested(u32),
     BeginDrag,
@@ -98,6 +99,9 @@ pub struct PlacementMachine {
     drag_generation: u64,
     drag_interrupted: bool,
     waiting: bool,
+    // Some(None) restores a free position. Some(Some(corner)) first restores
+    // the display location, then anchors against the observed current size.
+    restoring: Option<Option<Corner>>,
 }
 
 impl PlacementMachine {
@@ -114,6 +118,7 @@ impl PlacementMachine {
             drag_generation: 0,
             drag_interrupted: false,
             waiting: false,
+            restoring: None,
         }
     }
 
@@ -146,7 +151,9 @@ impl PlacementMachine {
                 Vec::new()
             }
             PlacementInput::Snap(corner) => self.snap(corner, displays),
+            PlacementInput::RestorePosition { x, y, corner } => self.restore_position(x, y, corner, displays),
             PlacementInput::BeginDrag => {
+                self.restoring = None;
                 self.dragging = true;
                 self.drag_moved = false;
                 self.drag_generation = self.generation;
@@ -166,7 +173,9 @@ impl PlacementMachine {
                 self.desired = Some(Target {
                     generation: self.generation,
                     corner,
-                    frame: self.observed,
+                    frame: if self.restoring.is_some() {
+                        self.desired.map_or(self.observed, |target| target.frame)
+                    } else { self.observed },
                     required_height: Some(height),
                     display: self.desired.and_then(|target| target.display)
                         .or_else(|| self.display(displays).copied()),
@@ -188,6 +197,24 @@ impl PlacementMachine {
                 // repeated coordinates across multiple generations.
                 if let Some(index) = self.pending.iter().position(|target| matches_position(x, y, target.x, target.y)) {
                     let target = self.pending.remove(index).expect("matched pending move");
+                    if self.restoring.is_some() && self.ready_to_confirm()
+                        && self.desired.is_some_and(|desired| desired.display.is_some_and(|display| displays.contains(&display)))
+                        && self.pending.iter().all(|pending| matches_position(x, y, pending.x, pending.y))
+                    {
+                        // Resize may supersede the location generation with an
+                        // identical position request. A real arrival at that
+                        // location advances restoration once, without requiring
+                        // another Moved event from a duplicate native setter.
+                        let corner = self.restoring.take().expect("checked restoration");
+                        if let Some(desired) = self.desired.as_mut() { desired.corner = corner; }
+                        let effects = self.reconcile(displays);
+                        if self.ready_to_confirm()
+                            && self.pending.iter().all(|pending| matches_position(x, y, pending.x, pending.y))
+                        {
+                            return self.confirm();
+                        }
+                        return effects;
+                    }
                     if self.dragging && !self.drag_moved && self.drag_interrupted
                         && target.generation <= self.drag_generation
                     {
@@ -198,6 +225,9 @@ impl PlacementMachine {
                             || desired.display.is_some_and(|display| displays.contains(&display))))
                         && self.ready_to_confirm()
                     {
+                        if self.restoring.is_some() {
+                            return self.reconcile(displays);
+                        }
                         return self.confirm();
                     }
                     return self.reconcile(displays);
@@ -261,6 +291,7 @@ impl PlacementMachine {
     }
 
     fn snap(&mut self, corner: Corner, displays: &[DisplayFrame]) -> Vec<PlacementEffect> {
+        self.restoring = None;
         self.dragging = false;
         self.drag_moved = false;
         self.generation += 1;
@@ -275,6 +306,32 @@ impl PlacementMachine {
         self.reconcile(displays)
     }
 
+    fn restore_position(&mut self, x: i32, y: i32, corner: Option<Corner>, displays: &[DisplayFrame]) -> Vec<PlacementEffect> {
+        self.dragging = false;
+        self.drag_moved = false;
+        self.generation += 1;
+        let saved_frame = PhysicalFrame { x, y, ..self.observed };
+        let containing = display_containing(saved_frame, displays);
+        let display = containing.or_else(|| displays.first()).copied();
+        let frame = if containing.is_some() {
+            saved_frame
+        } else if let Some(display) = display {
+            // Never dispatch the missing display's off-screen coordinates.
+            corner_frame(corner.unwrap_or(Corner::TopLeft), self.observed, &display)
+        } else {
+            self.restoring = None;
+            self.waiting = true;
+            self.desired = None;
+            return vec![PlacementEffect::ReportUnconfirmed(self.generation)];
+        };
+        self.restoring = Some(corner);
+        self.desired = Some(Target {
+            generation: self.generation, corner: None, frame,
+            required_height: None, display,
+        });
+        self.reconcile(displays)
+    }
+
     fn reconcile(&mut self, displays: &[DisplayFrame]) -> Vec<PlacementEffect> {
         let Some(mut target) = self.desired else { return Vec::new(); };
         self.waiting = true;
@@ -283,6 +340,15 @@ impl PlacementMachine {
                 PlacementEffect::SetHeight { generation: target.generation, height },
                 PlacementEffect::ScheduleWatchdog(target.generation),
             ];
+        }
+        if let Some(corner) = self.restoring {
+            if !target.display.is_some_and(|display| displays.contains(&display)) {
+                let Some(display) = display_containing(target.frame, displays).or_else(|| displays.first()) else {
+                    return vec![PlacementEffect::ReportUnconfirmed(target.generation)];
+                };
+                target.frame = corner_frame(corner.unwrap_or(Corner::TopLeft), self.observed, display);
+                target.display = Some(*display);
+            }
         }
         if let Some(corner) = target.corner {
             let display = target.display.as_ref()
@@ -299,6 +365,12 @@ impl PlacementMachine {
         }
         self.desired = Some(target);
         if self.ready_to_confirm() && self.pending.is_empty() {
+            if let Some(corner) = self.restoring.take() {
+                if let Some(desired) = self.desired.as_mut() {
+                    desired.corner = corner;
+                }
+                return self.reconcile(displays);
+            }
             return self.confirm();
         }
         if !self.pending.iter().any(|pending| pending.generation == target.generation
@@ -334,6 +406,7 @@ impl PlacementMachine {
     }
 
     fn confirm_manual(&mut self) -> Vec<PlacementEffect> {
+        self.restoring = None;
         self.generation += 1;
         self.desired = Some(Target {
             generation: self.generation, corner: None, frame: self.observed, required_height: None,
@@ -688,6 +761,95 @@ mod tests {
         assert!(!resized.iter().any(|effect| matches!(effect, PlacementEffect::SetPosition { .. })));
         assert!(resized.contains(&PlacementEffect::Persist(PlacementSnapshot {
             generation: 2, corner: None, frame: PhysicalFrame { x: 600, y: 300, width: 420, height: 252 },
+        })));
+    }
+
+    #[test]
+    fn restore_observes_saved_display_location_before_applying_corner() {
+        let external = DisplayFrame { x: -1920, ..DISPLAYS[0] };
+        let mut machine = PlacementMachine::new(STRIP, None);
+        let request = machine.reduce(PlacementInput::RestorePosition {
+            x: -1904, y: 500, corner: Some(Corner::BottomLeft),
+        }, &[external, DISPLAYS[0]]);
+        assert!(request.contains(&PlacementEffect::SetPosition { generation: 1, x: -1904, y: 500 }));
+        assert!(!confirms(&request));
+        assert_eq!(machine.confirmed(), None);
+        let located = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &[external, DISPLAYS[0]]);
+        assert!(located.contains(&PlacementEffect::SetPosition { generation: 1, x: -1904, y: 1014 }));
+        assert!(!confirms(&located));
+        let arrived = machine.reduce(PlacementInput::Moved { x: -1904, y: 1014 }, &[external, DISPLAYS[0]]);
+        assert!(arrived.contains(&PlacementEffect::Persist(PlacementSnapshot {
+            generation: 1, corner: Some(Corner::BottomLeft),
+            frame: PhysicalFrame { x: -1904, y: 1014, ..STRIP },
+        })));
+    }
+
+    #[test]
+    fn restore_noop_confirms_from_current_dimensions_with_fresh_generation() {
+        let frame = PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 };
+        let external = DisplayFrame { x: -1920, ..DISPLAYS[0] };
+        let mut machine = PlacementMachine::new(frame, None);
+        let restored = machine.reduce(PlacementInput::RestorePosition {
+            x: -1904, y: 812, corner: Some(Corner::BottomLeft),
+        }, &[external, DISPLAYS[0]]);
+        assert!(restored.contains(&PlacementEffect::Confirm(PlacementSnapshot {
+            generation: 1, corner: Some(Corner::BottomLeft), frame,
+        })));
+        assert!(!restored.iter().any(|effect| matches!(effect, PlacementEffect::SetPosition { .. })));
+    }
+
+    #[test]
+    fn missing_restore_display_uses_supplied_fallback_without_offscreen_request() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        let restored = machine.reduce(PlacementInput::RestorePosition {
+            x: -1904, y: 812, corner: Some(Corner::BottomLeft),
+        }, &DISPLAYS);
+        assert!(restored.contains(&PlacementEffect::SetPosition { generation: 1, x: 16, y: 1014 }));
+        assert!(!confirms(&restored));
+        assert!(machine.reduce(PlacementInput::RestorePosition {
+            x: -1904, y: 812, corner: None,
+        }, &[]).contains(&PlacementEffect::ReportUnconfirmed(2)));
+    }
+
+    #[test]
+    fn newer_snap_supersedes_restore_without_confirming_stale_location() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::RestorePosition { x: 310, y: 205, corner: Some(Corner::BottomLeft) }, &DISPLAYS);
+        machine.reduce(PlacementInput::Snap(Corner::TopRight), &DISPLAYS);
+        let stale = machine.reduce(PlacementInput::Moved { x: 310, y: 205 }, &DISPLAYS);
+        assert!(!confirms(&stale));
+        assert!(stale.contains(&PlacementEffect::SetPosition { generation: 2, x: 1484, y: 16 }));
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 1484, y: 16 }, &DISPLAYS)));
+    }
+
+    #[test]
+    fn restore_free_position_retargets_when_display_disappears_before_observation() {
+        let external = DisplayFrame { x: -1920, ..DISPLAYS[0] };
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::RestorePosition { x: -1904, y: 500, corner: None }, &[external, DISPLAYS[0]]);
+        let missing = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &DISPLAYS);
+        assert!(!confirms(&missing));
+        assert!(missing.contains(&PlacementEffect::SetPosition { generation: 1, x: 16, y: 16 }));
+        assert!(machine.confirmed().is_none());
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS)));
+        assert_eq!(machine.confirmed().unwrap().corner, None);
+    }
+
+    #[test]
+    fn resize_during_restore_uses_one_location_observation_before_bottom_snap() {
+        let external = DisplayFrame { x: -1920, ..DISPLAYS[0] };
+        let displays = [external, DISPLAYS[0]];
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::RestorePosition { x: -1904, y: 500, corner: Some(Corner::BottomLeft) }, &displays);
+        machine.reduce(PlacementInput::ResizeRequested(252), &displays);
+        machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &displays);
+        let located = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &displays);
+        assert!(located.contains(&PlacementEffect::SetPosition { generation: 2, x: -1904, y: 812 }));
+        assert!(!confirms(&located));
+        let arrived = machine.reduce(PlacementInput::Moved { x: -1904, y: 812 }, &displays);
+        assert!(arrived.contains(&PlacementEffect::Confirm(PlacementSnapshot {
+            generation: 2, corner: Some(Corner::BottomLeft),
+            frame: PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 },
         })));
     }
 }
