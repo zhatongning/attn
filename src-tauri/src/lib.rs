@@ -263,6 +263,7 @@ pub fn run() {
         install_codex_hooks,
         jump_to_session,
         panel_shortcut::configure_panel_shortcut,
+        panel_shortcut::configure_position_shortcut,
         anchor_panel_position,
         panel_placement::adapter::resize_panel,
         panel_placement::adapter::restore_panel_placement,

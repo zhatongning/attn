@@ -63,9 +63,11 @@ describe("buildStatusPanelModel", () => {
 
   it("defaults and localizes the panel shortcut settings contract", () => {
     expect(defaultStatusPanelConfig.panelToggleShortcut).toBe("shift+alt+super+space");
+    expect(defaultStatusPanelConfig.positionCycleShortcut).toBe("shift+control+super+space");
 
     const english = buildStatusPanelModel([]).copy;
     expect(english.panelToggleShortcutLabel).toBe("Panel shortcut");
+    expect(english.positionCycleShortcutLabel).toBe("Cycle panel position");
     expect(english.recordPanelShortcutLabel).toBe("Record shortcut");
     expect(english.recordingPanelShortcutLabel).toBe("Press a key combination");
     expect(english.clearPanelShortcutLabel).toBe("Clear shortcut");
@@ -77,6 +79,7 @@ describe("buildStatusPanelModel", () => {
 
     const chinese = buildStatusPanelModel([], { ...defaultStatusPanelConfig, language: "zh" }).copy;
     expect(chinese.panelToggleShortcutLabel).toBe("面板快捷键");
+    expect(chinese.positionCycleShortcutLabel).toBe("轮换面板位置");
     expect(chinese.recordPanelShortcutLabel).toBe("录制快捷键");
     expect(chinese.recordingPanelShortcutLabel).toBe("请按下组合键");
     expect(chinese.clearPanelShortcutLabel).toBe("清除快捷键");

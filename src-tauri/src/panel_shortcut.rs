@@ -16,7 +16,19 @@ pub const TOGGLE_PANEL_EVENT: &str = "agent-session-inbox://toggle-panel";
 
 #[derive(Default)]
 pub struct PanelShortcutState {
-    active: Mutex<ShortcutRegistrationState>,
+    active: Mutex<PanelShortcutRegistrations>,
+}
+
+#[derive(Default)]
+struct PanelShortcutRegistrations {
+    toggle: ShortcutRegistrationState,
+    position: ShortcutRegistrationState,
+}
+
+#[derive(Clone, Copy)]
+enum ShortcutAction {
+    Toggle,
+    Position,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +103,7 @@ pub trait ShortcutRegistrar {
 
 struct NativeShortcutRegistrar<'a, R: Runtime> {
     app: &'a AppHandle<R>,
+    handler: fn(&AppHandle<R>, &Shortcut, ShortcutEvent),
 }
 
 impl<R: Runtime> ShortcutRegistrar for NativeShortcutRegistrar<'_, R> {
@@ -98,7 +111,7 @@ impl<R: Runtime> ShortcutRegistrar for NativeShortcutRegistrar<'_, R> {
         let shortcut = Shortcut::from_str(shortcut).map_err(|_| ())?;
         self.app
             .global_shortcut()
-            .on_shortcut(shortcut, handle_panel_shortcut_event::<R>)
+            .on_shortcut(shortcut, self.handler)
             .map_err(|_| ())
     }
 
@@ -111,12 +124,48 @@ impl<R: Runtime> ShortcutRegistrar for NativeShortcutRegistrar<'_, R> {
 fn update_native_shortcut<R: Runtime>(
     app: &AppHandle<R>,
     state: &PanelShortcutState,
+    action: ShortcutAction,
     requested: Option<&str>,
 ) -> Result<PanelShortcutUpdate, PanelShortcutError> {
+    let handler: fn(&AppHandle<R>, &Shortcut, ShortcutEvent) = match action {
+        ShortcutAction::Toggle => handle_panel_shortcut_event::<R>,
+        ShortcutAction::Position => handle_position_shortcut_event::<R>,
+    };
+    let mut registrar = NativeShortcutRegistrar { app, handler };
+    update_action_shortcut(state, action, requested, &mut registrar, || {
+        if let Some(placement) = app.try_state::<crate::panel_placement::PanelPlacement>() {
+            if let Err(error) = placement.on_position_shortcut(ShortcutState::Released) {
+                eprintln!("failed to release panel position shortcut: {error}");
+            }
+        }
+    })
+}
+
+fn update_action_shortcut(
+    state: &PanelShortcutState,
+    action: ShortcutAction,
+    requested: Option<&str>,
+    registrar: &mut impl ShortcutRegistrar,
+    release_position: impl FnOnce(),
+) -> Result<PanelShortcutUpdate, PanelShortcutError> {
     let mut active = state.active.lock().unwrap();
-    let mut registrar = NativeShortcutRegistrar { app };
-    let active_shortcut = apply_shortcut_update(&mut active, requested, &mut registrar)?;
-    Ok(PanelShortcutUpdate { active_shortcut })
+    let previous_position = active.position.clone();
+    let result = apply_action_shortcut_update(
+        &mut active,
+        action,
+        requested,
+        registrar,
+    );
+    let position_changed = matches!(action, ShortcutAction::Position)
+        && previous_position != active.position;
+    drop(active);
+    // Unregistering a held key can suppress its native Released event. The
+    // placement reducer owns the latch; a no-op/rejected registration keeps it.
+    // Never reenter placement while holding the registration mutex.
+    if position_changed {
+        release_position();
+    }
+    result.map(|active_shortcut| PanelShortcutUpdate { active_shortcut })
 }
 
 #[tauri::command]
@@ -125,12 +174,27 @@ pub fn configure_panel_shortcut(
     state: tauri::State<'_, PanelShortcutState>,
     shortcut: Option<String>,
 ) -> Result<PanelShortcutUpdate, PanelShortcutError> {
-    update_native_shortcut(&app, state.inner(), shortcut.as_deref())
+    update_native_shortcut(&app, state.inner(), ShortcutAction::Toggle, shortcut.as_deref())
+}
+
+#[tauri::command]
+pub fn configure_position_shortcut(
+    app: AppHandle,
+    state: tauri::State<'_, PanelShortcutState>,
+    shortcut: Option<String>,
+) -> Result<PanelShortcutUpdate, PanelShortcutError> {
+    update_native_shortcut(&app, state.inner(), ShortcutAction::Position, shortcut.as_deref())
 }
 
 pub fn register_default<R: Runtime>(app: &AppHandle<R>) -> Result<(), PanelShortcutError> {
     let state = app.state::<PanelShortcutState>();
-    update_native_shortcut(app, state.inner(), Some(DEFAULT_PANEL_SHORTCUT)).map(|_| ())
+    update_native_shortcut(
+        app,
+        state.inner(),
+        ShortcutAction::Toggle,
+        Some(DEFAULT_PANEL_SHORTCUT),
+    )
+    .map(|_| ())
 }
 
 pub fn canonicalize_shortcut(value: &str) -> Result<String, PanelShortcutErrorCode> {
@@ -252,6 +316,37 @@ fn apply_shortcut_update(
     Ok(requested)
 }
 
+fn apply_action_shortcut_update(
+    registrations: &mut PanelShortcutRegistrations,
+    action: ShortcutAction,
+    requested: Option<&str>,
+    registrar: &mut impl ShortcutRegistrar,
+) -> Result<Option<String>, PanelShortcutError> {
+    let (active, other) = match action {
+        ShortcutAction::Toggle => (&mut registrations.toggle, &registrations.position),
+        ShortcutAction::Position => (&mut registrations.position, &registrations.toggle),
+    };
+    if matches!(active, ShortcutRegistrationState::Uncertain)
+        || matches!(other, ShortcutRegistrationState::Uncertain)
+    {
+        return Err(PanelShortcutError::from_state(
+            PanelShortcutErrorCode::RegistrationUncertain,
+            &ShortcutRegistrationState::Uncertain,
+        ));
+    }
+    let canonical = requested
+        .map(canonicalize_shortcut)
+        .transpose()
+        .map_err(|code| PanelShortcutError::from_state(code, active))?;
+    if matches!(other, ShortcutRegistrationState::Known(Some(existing)) if canonical.as_ref() == Some(existing)) {
+        return Err(PanelShortcutError::from_state(
+            PanelShortcutErrorCode::RegistrationFailed,
+            active,
+        ));
+    }
+    apply_shortcut_update(active, canonical.as_deref(), registrar)
+}
+
 pub fn is_pressed(state: ShortcutState) -> bool {
     matches!(state, ShortcutState::Pressed)
 }
@@ -369,6 +464,18 @@ fn handle_panel_shortcut_event<R: Runtime>(
             emit_panel_toggle(app, was_hidden);
         }
     });
+}
+
+fn handle_position_shortcut_event<R: Runtime>(
+    app: &AppHandle<R>,
+    _shortcut: &Shortcut,
+    event: ShortcutEvent,
+) {
+    if let Some(placement) = app.try_state::<crate::panel_placement::PanelPlacement>() {
+        if let Err(error) = placement.on_position_shortcut(event.state) {
+            eprintln!("failed to cycle panel position: {error}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +786,169 @@ mod tests {
         handle_shortcut_event(ShortcutState::Released, || called = true);
 
         assert!(!called);
+    }
+
+    #[test]
+    fn position_shortcut_cannot_replace_the_existing_panel_toggle_binding() {
+        let mut registrations = super::PanelShortcutRegistrations {
+            toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
+            position: ShortcutRegistrationState::Known(Some("shift+control+super+space".into())),
+        };
+        let mut registrar = FakeRegistrar::default();
+
+        let error = super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Position,
+            Some("shift+alt+super+space"),
+            &mut registrar,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(
+            error.active_shortcut.as_deref(),
+            Some("shift+control+super+space")
+        );
+        assert!(registrar.operations.is_empty());
+    }
+
+    fn held_position_fixture() -> (
+        super::PanelShortcutState,
+        crate::panel_placement::state::PlacementMachine,
+        [crate::panel_placement::state::DisplayFrame; 1],
+    ) {
+        use crate::panel_placement::state::{DisplayFrame, PhysicalFrame, PlacementInput, PlacementMachine};
+        let state = super::PanelShortcutState {
+            active: std::sync::Mutex::new(super::PanelShortcutRegistrations {
+                toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
+                position: ShortcutRegistrationState::Known(Some("shift+control+super+space".into())),
+            }),
+        };
+        let displays = [DisplayFrame { x: 0, y: 0, width: 1920, height: 1080, scale_factor: 1.0 }];
+        let mut placement = PlacementMachine::new(
+            PhysicalFrame { x: 16, y: 16, width: 420, height: 50 }, None,
+        );
+        assert!(placement.reduce(PlacementInput::CyclePressed, &displays).iter().any(|effect|
+            matches!(effect, crate::panel_placement::state::PlacementEffect::SetPosition { x: 1484, y: 16, .. })));
+        (state, placement, displays)
+    }
+
+    #[test]
+    fn position_shortcut_rebinding_releases_held_cycle_outside_registration_lock() {
+        use crate::panel_placement::state::{PlacementEffect, PlacementInput};
+        for requested in [Some("alt+super+p"), None] {
+            let (state, mut placement, displays) = held_position_fixture();
+            let mut registrar = FakeRegistrar::default();
+            let next = super::update_action_shortcut(
+                &state, super::ShortcutAction::Position, requested, &mut registrar,
+                || {
+                    assert!(state.active.try_lock().is_ok(), "placement must run after unlocking registration");
+                    placement.reduce(PlacementInput::CycleReleased, &displays);
+                },
+            ).unwrap();
+            assert_eq!(next.active_shortcut.as_deref(), requested);
+            assert_eq!(state.active.lock().unwrap().toggle,
+                ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())));
+            // The old binding's Released may never arrive after unregistering it.
+            // A press on the replacement/re-enabled key must still advance.
+            let effects = placement.reduce(PlacementInput::CyclePressed, &displays);
+            assert!(effects.iter().any(|effect|
+                matches!(effect, PlacementEffect::SetPosition { x: 1484, y: 1014, .. })),
+                "changing or clearing a held shortcut must allow the next cycle");
+        }
+    }
+
+    #[test]
+    fn position_shortcut_noop_apply_preserves_held_cycle() {
+        use crate::panel_placement::state::PlacementInput;
+        let (state, mut placement, displays) = held_position_fixture();
+        let mut registrar = FakeRegistrar::default();
+        super::update_action_shortcut(
+            &state, super::ShortcutAction::Position, Some("CONTROL+SUPER+SHIFT+SPACE"),
+            &mut registrar, || { placement.reduce(PlacementInput::CycleReleased, &displays); },
+        ).unwrap();
+        assert!(registrar.operations.is_empty());
+        assert!(placement.reduce(PlacementInput::CyclePressed, &displays).is_empty());
+        placement.reduce(PlacementInput::CycleReleased, &displays);
+        assert!(!placement.reduce(PlacementInput::CyclePressed, &displays).is_empty());
+    }
+
+    #[test]
+    fn position_shortcut_failed_registration_preserves_toggle_and_held_cycle() {
+        use crate::panel_placement::state::PlacementInput;
+        let (state, mut placement, displays) = held_position_fixture();
+        let mut registrar = FakeRegistrar { fail_register: true, ..Default::default() };
+        let error = super::update_action_shortcut(
+            &state, super::ShortcutAction::Position, Some("alt+super+p"),
+            &mut registrar, || { placement.reduce(PlacementInput::CycleReleased, &displays); },
+        ).unwrap_err();
+        assert_eq!(error.active_shortcut.as_deref(), Some("shift+control+super+space"));
+        assert_eq!(registrar.operations, vec!["register:alt+super+p"]);
+        assert_eq!(state.active.lock().unwrap().toggle,
+            ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())));
+        assert!(placement.reduce(PlacementInput::CyclePressed, &displays).is_empty());
+    }
+
+    #[test]
+    fn position_shortcut_replacement_does_not_change_the_panel_toggle_binding() {
+        let mut registrations = super::PanelShortcutRegistrations {
+            toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
+            position: ShortcutRegistrationState::Known(Some("shift+control+super+space".into())),
+        };
+        let mut registrar = FakeRegistrar::default();
+
+        let next = super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Position,
+            Some("alt+super+p"),
+            &mut registrar,
+        )
+        .unwrap();
+
+        assert_eq!(next.as_deref(), Some("alt+super+p"));
+        assert_eq!(
+            registrations.toggle,
+            ShortcutRegistrationState::Known(Some("shift+alt+super+space".into()))
+        );
+        assert_eq!(
+            registrar.operations,
+            vec![
+                "register:alt+super+p".to_owned(),
+                "unregister:shift+control+super+space".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn existing_custom_toggle_takes_priority_over_position_default_at_startup() {
+        let mut registrations = super::PanelShortcutRegistrations {
+            toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
+            position: ShortcutRegistrationState::Known(None),
+        };
+        let mut registrar = FakeRegistrar::default();
+
+        super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Toggle,
+            Some("shift+control+super+space"),
+            &mut registrar,
+        )
+        .unwrap();
+        let error = super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Position,
+            Some("shift+control+super+space"),
+            &mut registrar,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(error.active_shortcut, None);
+        assert_eq!(registrar.operations.len(), 2);
+        assert_eq!(
+            registrations.toggle,
+            ShortcutRegistrationState::Known(Some("shift+control+super+space".into()))
+        );
     }
 
     #[cfg(target_os = "macos")]

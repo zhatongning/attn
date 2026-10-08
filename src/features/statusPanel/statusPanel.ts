@@ -1,10 +1,11 @@
 import type { Confidence, SessionRow } from "../../shared/types/session";
-import { DEFAULT_PANEL_TOGGLE_SHORTCUT } from "./panelShortcut";
+import { DEFAULT_PANEL_TOGGLE_SHORTCUT, DEFAULT_POSITION_CYCLE_SHORTCUT } from "./panelShortcut";
 
 export type InterventionStatus = "blocked" | "input" | "inspect" | "stopped" | "needed" | "working" | "idle";
 
 export interface StatusPanelConfig {
   panelToggleShortcut: string | null;
+  positionCycleShortcut: string | null;
   styleFamily: "atom";
   palette: "oneDark";
   language: "en" | "zh";
@@ -53,6 +54,10 @@ export interface StatusPanelModel {
 
 export interface StatusPanelCopy {
   panelToggleShortcutLabel: string;
+  positionCycleShortcutLabel: string;
+  recordPositionShortcutLabel: string;
+  clearPositionShortcutLabel: string;
+  restorePositionShortcutLabel: string;
   recordPanelShortcutLabel: string;
   recordingPanelShortcutLabel: string;
   clearPanelShortcutLabel: string;
@@ -134,6 +139,7 @@ export interface StatusPanelCopy {
 
 export const defaultStatusPanelConfig: StatusPanelConfig = {
   panelToggleShortcut: DEFAULT_PANEL_TOGGLE_SHORTCUT,
+  positionCycleShortcut: DEFAULT_POSITION_CYCLE_SHORTCUT,
   styleFamily: "atom",
   palette: "oneDark",
   language: "en",
@@ -229,6 +235,10 @@ const statusLabels: Record<StatusPanelConfig["language"], Record<InterventionSta
 const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   en: {
     panelToggleShortcutLabel: "Panel shortcut",
+    positionCycleShortcutLabel: "Cycle panel position",
+    recordPositionShortcutLabel: "Record position shortcut",
+    clearPositionShortcutLabel: "Clear position shortcut",
+    restorePositionShortcutLabel: "Restore position default",
     recordPanelShortcutLabel: "Record shortcut",
     recordingPanelShortcutLabel: "Press a key combination",
     clearPanelShortcutLabel: "Clear shortcut",
@@ -324,6 +334,10 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   },
   zh: {
     panelToggleShortcutLabel: "面板快捷键",
+    positionCycleShortcutLabel: "轮换面板位置",
+    recordPositionShortcutLabel: "录制位置快捷键",
+    clearPositionShortcutLabel: "清除位置快捷键",
+    restorePositionShortcutLabel: "恢复位置默认键",
     recordPanelShortcutLabel: "录制快捷键",
     recordingPanelShortcutLabel: "请按下组合键",
     clearPanelShortcutLabel: "清除快捷键",

@@ -1,12 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_PANEL_TOGGLE_SHORTCUT,
+  DEFAULT_POSITION_CYCLE_SHORTCUT,
   capturePanelShortcut,
   formatPanelShortcut,
   normalizePanelToggleShortcut,
+  normalizePositionCycleShortcut,
 } from "./panelShortcut";
 
 describe("panel shortcut contract", () => {
+  it("normalizes missing and disabled position-cycle shortcuts independently", () => {
+    expect(DEFAULT_POSITION_CYCLE_SHORTCUT).toBe("shift+control+super+space");
+    expect(normalizePositionCycleShortcut(undefined)).toBe("shift+control+super+space");
+    expect(normalizePositionCycleShortcut(null)).toBeNull();
+    expect(normalizePositionCycleShortcut("CONTROL+SUPER+SHIFT+SPACE")).toBe("shift+control+super+space");
+    expect(normalizePositionCycleShortcut("shift+p")).toBe("shift+control+super+space");
+  });
   it("uses the stable default and canonical modifier order", () => {
     expect(DEFAULT_PANEL_TOGGLE_SHORTCUT).toBe("shift+alt+super+space");
     expect(capturePanelShortcut({

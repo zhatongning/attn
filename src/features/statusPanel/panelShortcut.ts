@@ -1,4 +1,5 @@
 export const DEFAULT_PANEL_TOGGLE_SHORTCUT = "shift+alt+super+space" as const;
+export const DEFAULT_POSITION_CYCLE_SHORTCUT = "shift+control+super+space" as const;
 
 export interface PanelShortcutKeyboardEvent {
   code: string;
@@ -74,6 +75,13 @@ export function normalizePanelToggleShortcut(value: unknown): string | null {
 
   const normalized = normalizeShortcutString(value);
   return normalized ?? DEFAULT_PANEL_TOGGLE_SHORTCUT;
+}
+
+export function normalizePositionCycleShortcut(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string") return DEFAULT_POSITION_CYCLE_SHORTCUT;
+
+  return normalizeShortcutString(value) ?? DEFAULT_POSITION_CYCLE_SHORTCUT;
 }
 
 export function formatPanelShortcut(value: string | null): string {

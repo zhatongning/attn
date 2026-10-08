@@ -1013,6 +1013,20 @@ describe("StatusPanelView", () => {
     await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space"));
   });
 
+  it.each([
+    [undefined, "shift+control+super+space"],
+    [null, null],
+    ["shift+p", "shift+control+super+space"],
+    ["CONTROL+SUPER+SHIFT+SPACE", "shift+control+super+space"],
+  ])("normalizes a legacy position shortcut %s before saving other settings", async (saved, expected) => {
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ positionCycleShortcut: saved }));
+    await renderShortcutSettings();
+    fireEvent.change(screen.getByLabelText("Language"), { target: { value: "zh" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+    await waitFor(() => expect(readPersistedConfig().language).toBe("zh"));
+    expect(readPersistedConfig().positionCycleShortcut).toBe(expected);
+  });
+
   it("keeps a shortcut conflict draft while persisting other settings, then retries", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     let conflict = true;

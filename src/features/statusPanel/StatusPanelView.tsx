@@ -27,6 +27,7 @@ import {
   DEFAULT_PANEL_TOGGLE_SHORTCUT,
   formatPanelShortcut,
   normalizePanelToggleShortcut,
+  normalizePositionCycleShortcut,
 } from "./panelShortcut";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
@@ -1504,6 +1505,7 @@ function normalizeConfig(value: unknown): StatusPanelConfig {
 
   return {
     panelToggleShortcut: normalizePanelToggleShortcut(value.panelToggleShortcut),
+    positionCycleShortcut: normalizePositionCycleShortcut(value.positionCycleShortcut),
     styleFamily: value.styleFamily === "atom" ? value.styleFamily : defaultStatusPanelConfig.styleFamily,
     palette: value.palette === "oneDark" ? value.palette : defaultStatusPanelConfig.palette,
     language: value.language === "zh" ? "zh" : "en",
