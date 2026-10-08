@@ -96,6 +96,7 @@ pub struct PlacementMachine {
     dragging: bool,
     drag_moved: bool,
     drag_generation: u64,
+    drag_interrupted: bool,
     waiting: bool,
 }
 
@@ -111,6 +112,7 @@ impl PlacementMachine {
             dragging: false,
             drag_moved: false,
             drag_generation: 0,
+            drag_interrupted: false,
             waiting: false,
         }
     }
@@ -148,6 +150,7 @@ impl PlacementMachine {
                 self.dragging = true;
                 self.drag_moved = false;
                 self.drag_generation = self.generation;
+                self.drag_interrupted = self.waiting;
                 // A click alone must not erase the confirmed anchor.
                 self.waiting = false;
                 Vec::new()
@@ -185,10 +188,14 @@ impl PlacementMachine {
                 // repeated coordinates across multiple generations.
                 if let Some(index) = self.pending.iter().position(|target| matches_position(x, y, target.x, target.y)) {
                     let target = self.pending.remove(index).expect("matched pending move");
-                    if self.dragging && !self.drag_moved && target.generation <= self.drag_generation {
+                    if self.dragging && !self.drag_moved && self.drag_interrupted
+                        && target.generation <= self.drag_generation
+                    {
                         return Vec::new();
                     }
-                    if self.desired.is_some_and(|desired| desired.generation == target.generation)
+                    if self.desired.is_some_and(|desired| desired.generation == target.generation
+                        && (desired.corner.is_none()
+                            || desired.display.is_some_and(|display| displays.contains(&display))))
                         && self.ready_to_confirm()
                     {
                         return self.confirm();
@@ -214,7 +221,7 @@ impl PlacementMachine {
                 let unchanged = self.observed.width == width && self.observed.height == height;
                 self.observed.width = width;
                 self.observed.height = height;
-                if self.dragging && !self.drag_moved
+                if self.dragging && !self.drag_moved && self.drag_interrupted
                     && self.desired.is_some_and(|target| target.generation <= self.drag_generation)
                 {
                     return Vec::new();
@@ -249,7 +256,6 @@ impl PlacementMachine {
 
     fn display<'a>(&self, displays: &'a [DisplayFrame]) -> Option<&'a DisplayFrame> {
         display_containing(self.observed, displays)
-            .or_else(|| self.confirmed.and_then(|saved| display_containing(saved.frame, displays)))
             // The adapter supplies current/primary fallback first.
             .or_else(|| displays.first())
     }
@@ -450,6 +456,19 @@ mod tests {
         assert_eq!(machine.confirmed(), Some(saved));
     }
 
+    // Catches suppressing an established bottom anchor after a click-only drag.
+    #[test]
+    fn confirmed_bottom_anchor_resizes_after_no_movement_drag() {
+        let bottom = PhysicalFrame { x: 1484, y: 1014, width: 420, height: 50 };
+        let mut machine = PlacementMachine::new(bottom, None);
+        assert!(confirms(&machine.reduce(PlacementInput::Snap(Corner::BottomRight), &DISPLAYS)));
+        machine.reduce(PlacementInput::BeginDrag, &DISPLAYS);
+        let resized = machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &DISPLAYS);
+        assert!(resized.contains(&PlacementEffect::SetPosition { generation: 2, x: 1484, y: 812 }));
+        assert!(!confirms(&resized));
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 1484, y: 812 }, &DISPLAYS)));
+    }
+
     // Catches a click erasing a valid anchor without an actual drag observation.
     #[test]
     fn begin_drag_without_movement_preserves_anchor() {
@@ -571,6 +590,36 @@ mod tests {
         assert!(machine.reduce(PlacementInput::Snap(Corner::TopRight), &DISPLAYS).contains(
             &PlacementEffect::SetPosition { generation: 7, x: 1484, y: 16 }
         ));
+    }
+
+    // Catches confirming a delayed target after its requested display disappears.
+    #[test]
+    fn delayed_move_on_removed_display_reasserts_available_fallback() {
+        let external = DisplayFrame { x: -2560, y: -100, width: 2560, height: 1440, scale_factor: 2.0 };
+        let frame = PhysicalFrame { x: -2528, y: -68, width: 420, height: 50 };
+        let mut machine = PlacementMachine::new(frame, None);
+        machine.reduce(PlacementInput::Snap(Corner::TopRight), &[external, DISPLAYS[0]]);
+        let delayed = machine.reduce(PlacementInput::Moved { x: -452, y: -68 }, &DISPLAYS);
+        assert!(!confirms(&delayed));
+        assert!(!delayed.iter().any(|effect| matches!(effect, PlacementEffect::Persist(_))));
+        assert!(delayed.contains(&PlacementEffect::SetPosition { generation: 1, x: 1484, y: 16 }));
+        assert!(machine.confirmed().is_none());
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 1484, y: 16 }, &DISPLAYS)));
+    }
+
+    // Catches saved display preference overriding the adapter's current/primary fallback.
+    #[test]
+    fn offscreen_observation_uses_first_display_before_saved_display() {
+        let external = DisplayFrame { x: -2560, y: -100, width: 2560, height: 1440, scale_factor: 2.0 };
+        let saved = PlacementSnapshot {
+            generation: 4, corner: Some(Corner::TopLeft),
+            frame: PhysicalFrame { x: -2528, y: -68, width: 420, height: 50 },
+        };
+        let observed = PhysicalFrame { x: 5000, y: 5000, width: 420, height: 50 };
+        let mut machine = PlacementMachine::new(observed, Some(saved));
+        let effects = machine.reduce(PlacementInput::Snap(Corner::TopRight), &[DISPLAYS[0], external]);
+        assert!(effects.contains(&PlacementEffect::SetPosition { generation: 5, x: 1484, y: 16 }));
+        assert!(!confirms(&effects));
     }
 
     // Catches persisting an unobserved timeout target or discarding late confirmation.
