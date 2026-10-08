@@ -84,6 +84,7 @@ struct PendingMove {
     generation: u64,
     x: i32,
     y: i32,
+    from_restore: bool,
 }
 
 /// Setters are requests. Only native observations (or a verified no-op) confirm.
@@ -301,9 +302,15 @@ impl PlacementMachine {
     fn snap(&mut self, corner: Corner, displays: &[DisplayFrame]) -> Vec<PlacementEffect> {
         if self.restoring.take().is_some() {
             // An explicit corner command cancels restoration, including its
-            // superseded location generations. Retain only late-arrival guards
-            // so an already-observed new corner can complete without a setter.
-            self.retired.extend(self.pending.drain(..));
+            // superseded location generations. Earlier ordinary corner moves
+            // remain active and still prevent premature no-op confirmation.
+            let retired = &mut self.retired;
+            self.pending.retain(|pending| {
+                if pending.from_restore {
+                    retired.push_back(*pending);
+                    false
+                } else { true }
+            });
         }
         self.dragging = false;
         self.drag_moved = false;
@@ -404,6 +411,7 @@ impl PlacementMachine {
         {
             self.pending.push_back(PendingMove {
                 generation: target.generation, x: target.frame.x, y: target.frame.y,
+                from_restore: self.restoring.is_some(),
             });
         }
         vec![
@@ -959,5 +967,33 @@ mod tests {
         assert!(late.contains(&PlacementEffect::SetPosition { generation: 3, x: 16, y: 16 }));
         assert_eq!(machine.confirmed(), confirmed);
         assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS)));
+    }
+
+    #[test]
+    fn canceled_restore_retires_only_its_requests_and_keeps_earlier_ordinary_snap_active() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::Snap(Corner::TopRight), &DISPLAYS);
+        machine.reduce(PlacementInput::RestorePosition { x: 310, y: 205, corner: None }, &DISPLAYS);
+        let snap = machine.reduce(PlacementInput::Snap(Corner::TopLeft), &DISPLAYS);
+        assert!(!snap.iter().any(|effect| matches!(effect,
+            PlacementEffect::Confirm(_) | PlacementEffect::Persist(_))));
+        assert!(snap.contains(&PlacementEffect::SetPosition { generation: 3, x: 16, y: 16 }));
+        assert_eq!(machine.confirmed(), None);
+
+        let earlier = machine.reduce(PlacementInput::Moved { x: 1484, y: 16 }, &DISPLAYS);
+        assert!(!earlier.iter().any(|effect| matches!(effect,
+            PlacementEffect::Confirm(_) | PlacementEffect::Persist(_))));
+        assert!(earlier.contains(&PlacementEffect::SetPosition { generation: 3, x: 16, y: 16 }));
+        let latest = machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS);
+        assert!(latest.contains(&PlacementEffect::Persist(PlacementSnapshot {
+            generation: 3, corner: Some(Corner::TopLeft), frame: STRIP,
+        })));
+
+        let confirmed = machine.confirmed();
+        let canceled = machine.reduce(PlacementInput::Moved { x: 310, y: 205 }, &DISPLAYS);
+        assert!(!canceled.iter().any(|effect| matches!(effect,
+            PlacementEffect::Confirm(_) | PlacementEffect::Persist(_))));
+        assert!(canceled.contains(&PlacementEffect::SetPosition { generation: 3, x: 16, y: 16 }));
+        assert_eq!(machine.confirmed(), confirmed);
     }
 }
