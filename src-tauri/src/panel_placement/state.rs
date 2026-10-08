@@ -93,6 +93,9 @@ pub struct PlacementMachine {
     desired: Option<Target>,
     generation: u64,
     pending: VecDeque<PendingMove>,
+    // Obsolete requests no longer block observed no-ops. Keep their coordinates
+    // until an arrival is seen so truly late native moves cannot become manual.
+    retired: VecDeque<PendingMove>,
     held: bool,
     dragging: bool,
     drag_moved: bool,
@@ -112,6 +115,7 @@ impl PlacementMachine {
             desired: None,
             generation: saved.map_or(0, |snapshot| snapshot.generation),
             pending: VecDeque::new(),
+            retired: VecDeque::new(),
             held: false,
             dragging: false,
             drag_moved: false,
@@ -193,10 +197,14 @@ impl PlacementMachine {
                 let unchanged = self.observed.x == x && self.observed.y == y;
                 self.observed.x = x;
                 self.observed.y = y;
-                // Consume the oldest matching request, conservatively handling
-                // repeated coordinates across multiple generations.
-                if let Some(index) = self.pending.iter().position(|target| matches_position(x, y, target.x, target.y)) {
-                    let target = self.pending.remove(index).expect("matched pending move");
+                // Consume an active matching request before a retired arrival,
+                // using the oldest match within each queue.
+                let arrival = if let Some(index) = self.pending.iter().position(|target| matches_position(x, y, target.x, target.y)) {
+                    self.pending.remove(index)
+                } else if let Some(index) = self.retired.iter().position(|target| matches_position(x, y, target.x, target.y)) {
+                    self.retired.remove(index)
+                } else { None };
+                if let Some(target) = arrival {
                     if self.restoring.is_some() && self.ready_to_confirm()
                         && self.desired.is_some_and(|desired| desired.display.is_some_and(|display| displays.contains(&display)))
                         && self.pending.iter().all(|pending| matches_position(x, y, pending.x, pending.y))
@@ -363,6 +371,19 @@ impl PlacementMachine {
             target.frame.width = self.observed.width;
             target.frame.height = self.observed.height;
         }
+        let previous = self.desired.expect("reconciliation requires a desired target");
+        if previous.frame.x != target.frame.x || previous.frame.y != target.frame.y {
+            let display_changed = previous.display != target.display;
+            let mut active = VecDeque::new();
+            while let Some(pending) = self.pending.pop_front() {
+                if display_changed || pending.generation == target.generation {
+                    self.retired.push_back(pending);
+                } else {
+                    active.push_back(pending);
+                }
+            }
+            self.pending = active;
+        }
         self.desired = Some(target);
         if self.ready_to_confirm() && self.pending.is_empty() {
             if let Some(corner) = self.restoring.take() {
@@ -402,6 +423,9 @@ impl PlacementMachine {
         };
         self.waiting = false;
         self.confirmed = Some(snapshot);
+        // Every remaining request is superseded by this observed confirmation.
+        // It remains a late-arrival guard, not an active positioning barrier.
+        self.retired.extend(self.pending.drain(..));
         vec![PlacementEffect::Confirm(snapshot), PlacementEffect::Persist(snapshot)]
     }
 
@@ -851,5 +875,56 @@ mod tests {
             generation: 2, corner: Some(Corner::BottomLeft),
             frame: PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 },
         })));
+    }
+
+    #[test]
+    fn satisfied_restore_requests_do_not_block_same_height_resize_and_late_moves_are_guarded() {
+        let external = DisplayFrame { x: -1920, ..DISPLAYS[0] };
+        let displays = [external, DISPLAYS[0]];
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::RestorePosition { x: -1904, y: 500, corner: Some(Corner::BottomLeft) }, &displays);
+        machine.reduce(PlacementInput::ResizeRequested(252), &displays);
+        machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &displays);
+        machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &displays);
+        machine.reduce(PlacementInput::Moved { x: -1904, y: 812 }, &displays);
+        let noop = machine.reduce(PlacementInput::ResizeRequested(252), &displays);
+        assert!(noop.contains(&PlacementEffect::Persist(PlacementSnapshot {
+            generation: 3, corner: Some(Corner::BottomLeft),
+            frame: PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 },
+        })));
+        assert!(!noop.iter().any(|effect| matches!(effect,
+            PlacementEffect::SetPosition { .. } | PlacementEffect::ScheduleWatchdog(_))));
+        assert!(machine.reduce(PlacementInput::TimedOut(3), &displays).is_empty());
+
+        let confirmed = machine.confirmed();
+        let late = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &displays);
+        assert!(!confirms(&late));
+        assert!(late.contains(&PlacementEffect::SetPosition { generation: 3, x: -1904, y: 812 }));
+        assert_eq!(machine.confirmed(), confirmed);
+        machine.reduce(PlacementInput::Moved { x: -1904, y: 812 }, &displays);
+        machine.reduce(PlacementInput::BeginDrag, &displays);
+        machine.reduce(PlacementInput::Moved { x: 310, y: 205 }, &displays);
+        assert_eq!(machine.confirmed().unwrap().corner, None);
+    }
+
+    #[test]
+    fn obsolete_offscreen_restore_request_cannot_block_observed_fallback_or_overwrite_it_later() {
+        let external = DisplayFrame { x: -1920, ..DISPLAYS[0] };
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::RestorePosition { x: -1904, y: 500, corner: None }, &[external, DISPLAYS[0]]);
+        let fallback = machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS);
+        assert!(fallback.contains(&PlacementEffect::Persist(PlacementSnapshot {
+            generation: 1, corner: None, frame: STRIP,
+        })));
+        assert!(!fallback.iter().any(|effect| matches!(effect,
+            PlacementEffect::SetPosition { .. } | PlacementEffect::ScheduleWatchdog(_))));
+        assert!(machine.reduce(PlacementInput::TimedOut(1), &DISPLAYS).is_empty());
+
+        let confirmed = machine.confirmed();
+        let late = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &DISPLAYS);
+        assert!(!confirms(&late));
+        assert!(late.contains(&PlacementEffect::SetPosition { generation: 1, x: 16, y: 16 }));
+        assert_eq!(machine.confirmed(), confirmed);
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS)));
     }
 }
