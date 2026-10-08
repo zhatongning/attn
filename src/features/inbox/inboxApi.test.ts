@@ -2,10 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { initialSessions } from "./fakeSessions";
 import {
   PanelShortcutConfigureError,
+  beginPanelDrag,
   configurePanelShortcut,
+  configurePositionShortcut,
   jumpToSession,
   loadSessions,
   loadSourceHealth,
+  resizePanel,
+  restorePanelPlacement,
 } from "./inboxApi";
 
 const tauriCoreMock = vi.hoisted(() => ({
@@ -90,6 +94,45 @@ describe("inboxApi", () => {
     expect(tauriCoreMock.invoke).toHaveBeenCalledWith("configure_panel_shortcut", {
       shortcut: "shift+alt+super+space",
     });
+  });
+
+  it("configures the position shortcut independently through the desktop runtime", async () => {
+    enableTauriRuntime();
+    tauriCoreMock.invoke.mockResolvedValue({ activeShortcut: "shift+control+super+space" });
+
+    await expect(configurePositionShortcut("shift+control+super+space")).resolves.toEqual({
+      activeShortcut: "shift+control+super+space",
+    });
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("configure_position_shortcut", {
+      shortcut: "shift+control+super+space",
+    });
+  });
+
+  it("requests a logical panel resize as placement acceptance only", async () => {
+    enableTauriRuntime();
+    tauriCoreMock.invoke.mockResolvedValue({ generation: 11 });
+
+    await expect(resizePanel(252)).resolves.toEqual({ generation: 11 });
+
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("resize_panel", { height: 252 });
+  });
+
+  it("submits legacy placement for native restore without returning a confirmed snapshot", async () => {
+    enableTauriRuntime();
+    tauriCoreMock.invoke.mockResolvedValue(undefined);
+    const legacy = { position: { x: -1904, y: 812 }, corner: null };
+
+    await expect(restorePanelPlacement(legacy)).resolves.toBeUndefined();
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("restore_panel_placement", { legacy });
+    await expect(beginPanelDrag()).resolves.toBeUndefined();
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("begin_panel_drag");
+  });
+
+  it("makes placement commands no-ops in browser preview", async () => {
+    await expect(restorePanelPlacement(null)).resolves.toBeUndefined();
+    await expect(resizePanel(50)).resolves.toEqual({ generation: 0 });
+    await expect(beginPanelDrag()).resolves.toBeUndefined();
+    expect(tauriCoreMock.invoke).not.toHaveBeenCalled();
   });
 
   it("returns the requested panel shortcut in preview mode without making a request", async () => {

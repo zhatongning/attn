@@ -92,6 +92,54 @@ export async function configurePanelShortcut(shortcut: string | null): Promise<P
   }
 }
 
+export async function configurePositionShortcut(shortcut: string | null): Promise<PanelShortcutUpdate> {
+  if (!hasTauriRuntime()) return { activeShortcut: shortcut };
+  try {
+    return await invoke<PanelShortcutUpdate>("configure_position_shortcut", { shortcut });
+  } catch (error) {
+    throw normalizePanelShortcutError(error);
+  }
+}
+
+export type PanelCorner = "top-left" | "top-right" | "bottom-right" | "bottom-left";
+
+export interface PanelCoordinates {
+  x: number;
+  y: number;
+}
+
+export interface LegacyPlacement {
+  position: PanelCoordinates;
+  corner: PanelCorner | null;
+}
+
+export interface PlacementSnapshot {
+  generation: number;
+  corner: PanelCorner | null;
+  frame: PanelCoordinates & { width: number; height: number };
+}
+
+export interface PlacementFailure {
+  generation: number;
+  reason: string;
+}
+
+// Command completion acknowledges submission. Only placement-confirmed proves arrival.
+export async function restorePanelPlacement(legacy: LegacyPlacement | null): Promise<void> {
+  if (!hasTauriRuntime()) return;
+  await invoke<void>("restore_panel_placement", { legacy });
+}
+
+export async function resizePanel(height: number): Promise<{ generation: number }> {
+  if (!hasTauriRuntime()) return { generation: 0 };
+  return invoke<{ generation: number }>("resize_panel", { height });
+}
+
+export async function beginPanelDrag(): Promise<void> {
+  if (!hasTauriRuntime()) return;
+  await invoke<void>("begin_panel_drag");
+}
+
 export async function loadCodexHookIntegrationStatus(): Promise<CodexHookIntegrationStatus> {
   const fallback: CodexHookIntegrationStatus = {
     installed: false,

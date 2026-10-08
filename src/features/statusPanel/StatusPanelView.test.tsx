@@ -8,16 +8,23 @@ import { join } from "node:path";
 import type { SessionRow } from "../../shared/types/session";
 import { fakeSourceHealth, initialSessions } from "../inbox/fakeSessions";
 import { StatusPanelView } from "./StatusPanelView";
+import type { PlacementSnapshot } from "../inbox/inboxApi";
+import * as inboxApi from "../inbox/inboxApi";
 
 const tauriWindowMock = vi.hoisted(() => ({
   setSize: vi.fn<(size: { width: number; height: number }) => Promise<void>>(async () => undefined),
-  setPosition: vi.fn(async () => undefined),
+  setPosition: vi.fn<(position: { x: number; y: number }) => Promise<void>>(async () => undefined),
   startDragging: vi.fn(async () => undefined),
   onMoved: vi.fn(async (_handler: unknown) => vi.fn()),
+  show: vi.fn(async () => undefined),
+  setFocus: vi.fn(async () => undefined),
 }));
 
+const tauriEventMock = vi.hoisted(() => ({
+  listen: vi.fn<(event: string, callback: unknown) => Promise<() => void>>(async () => vi.fn<() => void>()),
+}));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => vi.fn()),
+  listen: tauriEventMock.listen,
 }));
 
 const tauriCoreMock = vi.hoisted(() => ({
@@ -34,6 +41,8 @@ vi.mock("@tauri-apps/api/window", () => ({
     setPosition: tauriWindowMock.setPosition,
     startDragging: tauriWindowMock.startDragging,
     onMoved: tauriWindowMock.onMoved,
+    show: tauriWindowMock.show,
+    setFocus: tauriWindowMock.setFocus,
   })),
 }));
 
@@ -54,11 +63,17 @@ afterEach(() => {
   vi.useRealTimers();
   window.localStorage.clear();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
-  tauriWindowMock.setSize.mockClear();
-  tauriWindowMock.setPosition.mockClear();
+  tauriWindowMock.setSize.mockReset();
+  tauriWindowMock.setSize.mockImplementation(async () => undefined);
+  tauriWindowMock.setPosition.mockReset();
+  tauriWindowMock.setPosition.mockImplementation(async () => undefined);
   tauriWindowMock.startDragging.mockClear();
   tauriWindowMock.onMoved.mockReset();
   tauriWindowMock.onMoved.mockImplementation(async (_handler: unknown) => vi.fn());
+  tauriWindowMock.show.mockClear();
+  tauriWindowMock.setFocus.mockClear();
+  tauriEventMock.listen.mockReset();
+  tauriEventMock.listen.mockImplementation(async () => vi.fn<() => void>());
   tauriCoreMock.invoke.mockReset();
   vi.unstubAllGlobals();
 });
@@ -498,8 +513,8 @@ describe("StatusPanelView", () => {
   it("persists panel display behavior after management confirmation", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
 
@@ -525,8 +540,8 @@ describe("StatusPanelView", () => {
   it("does not offer follow-up as a keep-open status", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
 
@@ -546,8 +561,8 @@ describe("StatusPanelView", () => {
   it("applies the configured follow-up idle duration and refreshes immediately", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
@@ -582,8 +597,8 @@ describe("StatusPanelView", () => {
   it("normalizes persisted follow-up idle duration to the minimum without capping valid values", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ followUpToIdleMinutes: 12 }));
@@ -606,8 +621,8 @@ describe("StatusPanelView", () => {
     }));
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
 
@@ -792,45 +807,169 @@ describe("StatusPanelView", () => {
     expect(screen.queryByRole("button", { name: "Manage settings" })).toBeNull();
   });
 
-  it("starts native window dragging from the panel header", () => {
-    const { container } = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
-    const header = container.querySelector(".panel-header");
+  it("subscribes all placement listeners before submitting legacy restore", async () => {
+    enablePlacementRuntime();
+    window.localStorage.setItem("attn.panelPosition", JSON.stringify({ x: -1904, y: 812 }));
+    window.localStorage.setItem("attn.panelCorner", "bottom-left");
+    const registrations: Array<{ event: string; resolve: (unlisten: () => void) => void }> = [];
+    tauriEventMock.listen.mockImplementation((event) => event.includes("placement-")
+      ? new Promise((resolve) => registrations.push({ event, resolve }))
+      : Promise.resolve(vi.fn()));
 
-    expect(header).toBeTruthy();
-    fireEvent.pointerDown(header as Element, { button: 0 });
-
-    expect(tauriWindowMock.startDragging).toHaveBeenCalledTimes(1);
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => expect(registrations).toHaveLength(3));
+    expect(tauriCoreMock.invoke.mock.calls.some(([command]) => command === "restore_panel_placement")).toBe(false);
+    await act(async () => registrations[0].resolve(vi.fn()));
+    expect(tauriCoreMock.invoke.mock.calls.some(([command]) => command === "restore_panel_placement")).toBe(false);
+    await act(async () => registrations.slice(1).forEach(({ resolve }) => resolve(vi.fn())));
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("restore_panel_placement", {
+      legacy: { position: { x: -1904, y: 812 }, corner: "bottom-left" },
+    }));
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "restore_panel_placement")).toHaveLength(1);
+    expect(tauriWindowMock.setPosition).not.toHaveBeenCalled();
   });
 
-  it("restores a persisted panel position on mount", async () => {
+  it("keeps placement unknown after restore and resize acceptance until a confirmed event", async () => {
+    const events = await capturePlacementEvents();
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await openPlacementSettings(events);
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("resize_panel", { height: 420 }));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Unknown");
+    expect(setItem.mock.calls.filter(([key]) => key === "attn.panelPosition" || key === "attn.panelCorner")).toHaveLength(0);
+
+    await act(async () => events.confirmed(10, "top-right"));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Unknown");
+    await act(async () => events.confirmed(11, "bottom-left"));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Left");
+    await act(async () => events.confirmed(10, "top-right"));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Left");
+    expect(setItem.mock.calls.filter(([key]) => key === "attn.panelPosition" || key === "attn.panelCorner")).toHaveLength(0);
+    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+    expect(tauriWindowMock.onMoved).not.toHaveBeenCalled();
+  });
+
+  it("keeps the confirmed placement through a header click and waits for delayed drag confirmation", async () => {
+    const events = await capturePlacementEvents();
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await act(async () => events.confirmed(11, "bottom-right"));
+    fireEvent.pointerDown(document.querySelector(".panel-header") as Element, { button: 0 });
+    fireEvent.pointerUp(document);
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("begin_panel_drag"));
+    await openPlacementSettings(events);
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Right");
+    await act(async () => events.confirmed(12, null));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Free position");
+    expect(tauriWindowMock.startDragging).not.toHaveBeenCalled();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Apply settings" }), { button: 0 });
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "begin_panel_drag")).toHaveLength(1);
+  });
+
+  it("retains confirmed placement when an unconfirmed request or persistence error arrives", async () => {
+    const events = await capturePlacementEvents();
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await openPlacementSettings(events);
+    await act(async () => events.confirmed(11, "bottom-left"));
+    await act(async () => events.emit("placement-persistence-error", { generation: 11, reason: "write failed" }));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Left");
+    expect(screen.getByRole("alert").textContent).toContain("Unable to save panel position");
+    await act(async () => events.emit("placement-unconfirmed", { generation: 12, reason: "timeout" }));
+    expect(screen.getByText(/Panel position could not be confirmed/)).toBeTruthy();
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Left");
+    await act(async () => events.confirmed(12, "top-left"));
+    expect(screen.queryByText(/Panel position could not be confirmed/)).toBeNull();
+    expect(screen.queryByText(/Unable to save panel position/)).toBeNull();
+    await act(async () => events.emit("placement-persistence-error", { generation: 10, reason: "stale write" }));
+    expect(screen.queryByText(/Unable to save panel position/)).toBeNull();
+  });
+
+  it("consumes hidden placement events without revealing or focusing the panel", async () => {
+    const events = await capturePlacementEvents();
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      events.confirmed(15, "top-right");
+    });
+    expect(tauriWindowMock.show).not.toHaveBeenCalled();
+    expect(tauriWindowMock.setFocus).not.toHaveBeenCalled();
+    await openPlacementSettings(events);
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Top Right");
+  });
+
+  it("shows a persistence error for the confirmed placement while a newer resize awaits confirmation", async () => {
+    const events = await capturePlacementEvents();
+    let resizeGeneration = 11;
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command.startsWith("configure_")) return { activeShortcut: args?.shortcut ?? null };
+      if (command === "resize_panel") return { generation: resizeGeneration++ };
+      return undefined;
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("resize_panel", { height: 50 }));
+    await act(async () => events.confirmed(11, "bottom-left"));
+    await openPlacementSettings(events);
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("resize_panel", { height: 420 }));
+    await act(async () => events.emit("placement-persistence-error", { generation: 11, reason: "write failed" }));
+    expect(screen.getByText(/Unable to save panel position/)).toBeTruthy();
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Left");
+  });
+
+  it("releases successful placement listeners when a sibling listener registration fails", async () => {
+    enablePlacementRuntime();
+    const unlisten = vi.fn();
+    tauriEventMock.listen.mockImplementation(async (event) => {
+      if (event.endsWith("placement-unconfirmed")) throw new Error("listen failed");
+      return event.includes("placement-") ? unlisten : vi.fn<() => void>();
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => expect(unlisten).toHaveBeenCalledTimes(2));
+    expect(tauriCoreMock.invoke.mock.calls.some(([command]) => command === "restore_panel_placement")).toBe(false);
+  });
+
+  it.each(["{bad", '{"x":null,"y":812}', '{"x":1.5,"y":812}', '{"x":2147483648,"y":812}'])(
+    "ignores malformed legacy placement %s rather than rejecting native restoration", async (saved) => {
+      const events = await capturePlacementEvents();
+      window.localStorage.setItem("attn.panelPosition", saved);
+      window.localStorage.setItem("attn.panelCorner", "not-a-corner");
+      render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+      await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("restore_panel_placement", { legacy: null }));
+      await openPlacementSettings(events);
+      expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Unknown");
+      expect(window.localStorage.getItem("attn.panelPosition")).toBe(saved);
+    },
+  );
+
+  it("keeps browser-preview placement unknown and never dispatches a native move", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let menu: ((event: { payload: string }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event.endsWith("open-management")) menu = callback as typeof menu;
+      return vi.fn<() => void>();
+    });
     window.localStorage.setItem("attn.panelPosition", JSON.stringify({ x: 144, y: 88 }));
-
     render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
-
-    await waitFor(() => {
-      expect(tauriWindowMock.setPosition).toHaveBeenCalledWith(expect.objectContaining({
-        x: 144,
-        y: 88,
-      }));
-    });
+    await act(async () => menu?.({ payload: "management" }));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Unknown");
+    expect(tauriCoreMock.invoke).not.toHaveBeenCalled();
+    expect(tauriWindowMock.setPosition).not.toHaveBeenCalled();
   });
 
-  it("persists the panel position after the native window moves", async () => {
-    let movedHandler: ((event: { payload: { x: number; y: number } }) => void) | undefined;
-    tauriWindowMock.onMoved.mockImplementation(async (handler) => {
-      movedHandler = handler as (event: { payload: { x: number; y: number } }) => void;
-      return vi.fn();
-    });
-
-    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
-
-    await waitFor(() => {
-      expect(movedHandler).toBeTruthy();
-    });
-
-    movedHandler?.({ payload: { x: 256, y: 192 } });
-
-    expect(window.localStorage.getItem("attn.panelPosition")).toBe(JSON.stringify({ x: 256, y: 192 }));
+  it("unlistens late placement registrations from StrictMode cleanup without restoring", async () => {
+    enablePlacementRuntime();
+    const registrations: Array<{ resolve: (unlisten: () => void) => void }> = [];
+    tauriEventMock.listen.mockImplementation((event) => event.includes("placement-")
+      ? new Promise((resolve) => registrations.push({ resolve }))
+      : Promise.resolve(vi.fn()));
+    const rendered = render(<StrictMode><StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} /></StrictMode>);
+    await waitFor(() => expect(registrations).toHaveLength(6));
+    rendered.unmount();
+    const unlisten = vi.fn();
+    await act(async () => registrations.forEach(({ resolve }) => resolve(unlisten)));
+    expect(unlisten).toHaveBeenCalledTimes(6);
+    expect(tauriCoreMock.invoke.mock.calls.some(([command]) => command === "restore_panel_placement")).toBe(false);
   });
 
   it("grants native window movement permissions to the single panel window", () => {
@@ -938,8 +1077,8 @@ describe("StatusPanelView", () => {
   it("opens management from a native menu event", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
 
@@ -1013,6 +1152,27 @@ describe("StatusPanelView", () => {
     await waitFor(() => expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space"));
   });
 
+  it("records and clears the position-cycle shortcut without changing the panel toggle shortcut", async () => {
+    const openSettings = await renderShortcutSettings();
+    expect((screen.getByRole("textbox", { name: "Cycle panel position" }) as HTMLInputElement).value)
+      .toBe("Shift-Control-Command-Space");
+
+    fireEvent.click(screen.getByRole("button", { name: "Record position shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+    await waitFor(() => expect(readPersistedConfig().positionCycleShortcut).toBe("alt+super+p"));
+    expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
+
+    await openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear position shortcut" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+    await waitFor(() => expect(readPersistedConfig().positionCycleShortcut).toBeNull());
+    await openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Restore position default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+    await waitFor(() => expect(readPersistedConfig().positionCycleShortcut).toBe("shift+control+super+space"));
+  });
+
   it.each([
     [undefined, "shift+control+super+space"],
     [null, null],
@@ -1025,6 +1185,111 @@ describe("StatusPanelView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
     await waitFor(() => expect(readPersistedConfig().language).toBe("zh"));
     expect(readPersistedConfig().positionCycleShortcut).toBe(expected);
+  });
+
+  it("reconciles the saved toggle before the position shortcut default and exposes its conflict", async () => {
+    const savedToggle = "shift+control+super+space";
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelToggleShortcut: savedToggle }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let resolveToggle: (() => void) | undefined;
+    const toggleRegistration = new Promise<void>((resolve) => { resolveToggle = resolve; });
+    let activeToggle = "shift+alt+super+space";
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_panel_shortcut") {
+        await toggleRegistration;
+        activeToggle = args?.shortcut ?? "";
+        return { activeShortcut: activeToggle };
+      }
+      if (command === "configure_position_shortcut") {
+        if (args?.shortcut === activeToggle) throw {
+          code: "registration_failed", activeShortcut: null, stateUncertain: false,
+        };
+        return { activeShortcut: args?.shortcut ?? null };
+      }
+      if (command === "list_sessions") return initialSessions;
+      return undefined;
+    });
+    await renderShortcutSettings();
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) =>
+      command === "configure_panel_shortcut" || command === "configure_position_shortcut"))
+      .toEqual([["configure_panel_shortcut", { shortcut: savedToggle }]]);
+    await act(async () => resolveToggle?.());
+    await waitFor(() => expect(screen.getByRole("alert").textContent)
+      .toBe("That shortcut could not be registered."));
+    expect(tauriCoreMock.invoke.mock.calls.filter(([command]) =>
+      command === "configure_panel_shortcut" || command === "configure_position_shortcut"))
+      .toEqual([
+        ["configure_panel_shortcut", { shortcut: savedToggle }],
+        ["configure_position_shortcut", { shortcut: savedToggle }],
+      ]);
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value)
+      .toBe("Shift-Control-Command-Space");
+    expect(screen.getByText("Currently active: Disabled")).toBeTruthy();
+    expect(readPersistedConfig().panelToggleShortcut).toBe(savedToggle);
+  });
+
+  it("keeps the active panel shortcut when the new position shortcut conflicts with it", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_position_shortcut" && args?.shortcut === "shift+alt+super+space") {
+        throw {
+          code: "registration_failed",
+          activeShortcut: "shift+control+super+space",
+          stateUncertain: false,
+        };
+      }
+      if (command === "configure_panel_shortcut" || command === "configure_position_shortcut") {
+        return { activeShortcut: args?.shortcut ?? null };
+      }
+      if (command === "list_sessions") return initialSessions;
+      return undefined;
+    });
+    await renderShortcutSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Record position shortcut" }));
+    fireEvent.keyDown(window, { code: "Space", key: " ", altKey: true, shiftKey: true, metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("That shortcut could not be registered."));
+    expect(readPersistedConfig().positionCycleShortcut).toBe("shift+control+super+space");
+    expect(readPersistedConfig().panelToggleShortcut).toBe("shift+alt+super+space");
+    expect((screen.getByRole("textbox", { name: "Cycle panel position" }) as HTMLInputElement).value)
+      .toBe("Option-Shift-Command-Space");
+  });
+
+  it("commits a successful panel shortcut update when a position shortcut update fails", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
+      if (command === "configure_position_shortcut" && args?.shortcut === "alt+super+p") {
+        throw {
+          code: "registration_failed",
+          activeShortcut: "shift+control+super+space",
+          stateUncertain: false,
+        };
+      }
+      if (command === "configure_panel_shortcut" || command === "configure_position_shortcut") {
+        return { activeShortcut: args?.shortcut ?? null };
+      }
+      if (command === "list_sessions") return initialSessions;
+      return undefined;
+    });
+    await renderShortcutSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyQ", key: "q", altKey: true, metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Record position shortcut" }));
+    fireEvent.keyDown(window, { code: "KeyP", key: "p", altKey: true, metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Apply settings" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("That shortcut could not be registered."));
+    expect(readPersistedConfig()).toMatchObject({
+      panelToggleShortcut: "alt+super+q",
+      positionCycleShortcut: "shift+control+super+space",
+    });
+    expect((screen.getByRole("textbox", { name: "Cycle panel position" }) as HTMLInputElement).value)
+      .toBe("Option-Command-P");
+    expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value)
+      .toBe("Option-Command-Q");
   });
 
   it("keeps a shortcut conflict draft while persisting other settings, then retries", async () => {
@@ -1051,7 +1316,7 @@ describe("StatusPanelView", () => {
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("无法注册该快捷键。"));
     expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value).toBe("Option-Command-P");
-    expect(screen.getByRole("status").textContent).toBe("当前生效: Option-Shift-Command-Space");
+    expect(screen.getByRole("status", { name: /Panel shortcut|面板快捷键/ }).textContent).toBe("当前生效: Option-Shift-Command-Space");
     expect(readPersistedConfig()).toMatchObject({ language: "zh", panelToggleShortcut: "shift+alt+super+space" });
     expect(screen.getByRole("main").className).toContain("management-shell");
 
@@ -1105,12 +1370,12 @@ describe("StatusPanelView", () => {
 
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("That shortcut could not be registered."));
     expect((screen.getByRole("textbox", { name: "Panel shortcut" }) as HTMLInputElement).value).toBe("Option-Command-P");
-    expect(screen.getByRole("status").textContent).toBe(`Currently active: ${activeLabel}`);
+    expect(screen.getByRole("status", { name: /Panel shortcut|面板快捷键/ }).textContent).toBe(`Currently active: ${activeLabel}`);
     expect(readPersistedConfig().panelToggleShortcut).toBe("alt+super+p");
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await openSettings();
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByRole("status").textContent).toBe(`Currently active: ${activeLabel}`);
+    expect(screen.getByRole("status", { name: /Panel shortcut|面板快捷键/ }).textContent).toBe(`Currently active: ${activeLabel}`);
   });
 
   it("keeps restart-required status after an uncertain native failure is dismissed", async () => {
@@ -1127,11 +1392,11 @@ describe("StatusPanelView", () => {
     const openSettings = await renderShortcutSettings();
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
-    expect(screen.getByRole("status").textContent).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
+    expect(screen.getByRole("status", { name: /Panel shortcut|面板快捷键/ }).textContent).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await openSettings();
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByRole("status").textContent).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
+    expect(screen.getByRole("status", { name: /Panel shortcut|面板快捷键/ }).textContent).toBe("Shortcut state is uncertain. Restart Attn to restore shortcut settings.");
   });
 
   it("continues shortcut settings Apply after a startup conflict without a stale alert", async () => {
@@ -1361,7 +1626,7 @@ describe("StatusPanelView", () => {
     await act(async () => openManagement?.({ payload: "management" }));
     expect(screen.queryByRole("alert")).toBeNull();
     expect((screen.getByRole("textbox", { name: "面板快捷键" }) as HTMLInputElement).value).toBe("Option-Command-P");
-    expect(screen.getByRole("status").textContent).toBe("当前生效: Option-Shift-Command-Space");
+    expect(screen.getByRole("status", { name: /Panel shortcut|面板快捷键/ }).textContent).toBe("当前生效: Option-Shift-Command-Space");
   });
 
   it("normalizes failed shortcut settings drafts and refreshes with the committed follow-up threshold", async () => {
@@ -1738,8 +2003,8 @@ describe("StatusPanelView", () => {
   it("applies management settings only after confirmation", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
 
@@ -1767,8 +2032,8 @@ describe("StatusPanelView", () => {
   it("shows Codex hook integration status and installs only after confirmation", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
@@ -1813,8 +2078,8 @@ describe("StatusPanelView", () => {
   it("persists language settings across panel remounts", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
 
@@ -1835,8 +2100,8 @@ describe("StatusPanelView", () => {
   it("localizes built-in panel and management copy when Chinese is selected", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
@@ -1992,8 +2257,8 @@ describe("StatusPanelView", () => {
   it("uses Chinese feedback after installing Codex hooks", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
@@ -2026,8 +2291,8 @@ describe("StatusPanelView", () => {
   it("keeps an unexpected Codex hook diagnostic visible in Chinese", async () => {
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
@@ -2088,10 +2353,11 @@ describe("StatusPanelView", () => {
   });
 
   it("shows five rows only after visible-item settings are confirmed", async () => {
+    const resize = mockPanelResize();
     const { listen } = await import("@tauri-apps/api/event");
     let handler: ((event: { payload: string }) => void) | undefined;
-    vi.mocked(listen).mockImplementation(async (_event, callback) => {
-      handler = callback as (event: { payload: string }) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://open-management") handler = callback as (event: { payload: string }) => void;
       return () => undefined;
     });
     const rows: SessionRow[] = Array.from({ length: 5 }, (_, index) => ({
@@ -2126,14 +2392,12 @@ describe("StatusPanelView", () => {
       expect(screen.getAllByRole("article")).toHaveLength(5);
     });
     await waitFor(() => {
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 324,
-        width: 420,
-      }));
+      expect(resize).toHaveBeenCalledWith(324);
     });
   });
 
   it("makes the status list scrollable when configured rows reach the window height cap", async () => {
+    const resize = mockPanelResize();
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ visibleItemCount: 8 }));
     const rows: SessionRow[] = Array.from({ length: 8 }, (_, index) => ({
       ...initialSessions[0],
@@ -2148,14 +2412,12 @@ describe("StatusPanelView", () => {
 
     expect(screen.getByLabelText("Codex status panel").className).toContain("status-list--scrollable");
     await waitFor(() => {
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 420,
-        width: 420,
-      }));
+      expect(resize).toHaveBeenCalledWith(420);
     });
   });
 
   it("sizes the transparent window to the actual rendered row count", async () => {
+    const resize = mockPanelResize();
     const rows: SessionRow[] = [
       {
         ...initialSessions[0],
@@ -2175,21 +2437,16 @@ describe("StatusPanelView", () => {
     render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
 
     await waitFor(() => {
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 50,
-        width: 420,
-      }));
+      expect(resize).toHaveBeenCalledWith(50);
     });
     expandPanel();
     await waitFor(() => {
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 128,
-        width: 420,
-      }));
+      expect(resize).toHaveBeenCalledWith(128);
     });
   });
 
-  it("keeps the latest multi-row native height when an earlier resize resolves late", async () => {
+  it("submits the latest multi-row height while earlier resize acceptance is delayed", async () => {
+    const resize = mockPanelResize();
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
       visibleItemCount: 2,
       panelMode: "persistent",
@@ -2212,21 +2469,20 @@ describe("StatusPanelView", () => {
       },
     ];
     let resolveInitialNativeResize: (() => void) | undefined;
-    let nativeWindowHeight: number | undefined;
+    let lastRequestedHeight: number | undefined;
     let resizeCallCount = 0;
-    tauriWindowMock.setSize.mockImplementation((size: { height: number }) => {
+    resize.mockImplementation((height: number) => {
       resizeCallCount += 1;
+      lastRequestedHeight = height;
       if (resizeCallCount === 1) {
-        return new Promise<void>((resolve) => {
+        return new Promise<{ generation: number }>((resolve) => {
           resolveInitialNativeResize = () => {
-            nativeWindowHeight = size.height;
-            resolve();
+            resolve({ generation: 1 });
           };
         });
       }
 
-      nativeWindowHeight = size.height;
-      return Promise.resolve();
+      return Promise.resolve({ generation: 2 });
     });
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
       const pathname = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
@@ -2241,10 +2497,8 @@ describe("StatusPanelView", () => {
     });
     await waitFor(() => {
       expect(resolveInitialNativeResize).toBeTypeOf("function");
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 128,
-        width: 420,
-      }));
+      expect(resize).toHaveBeenCalledWith(128);
+      expect(resize).toHaveBeenCalledWith(177);
     });
 
     await act(async () => {
@@ -2253,7 +2507,7 @@ describe("StatusPanelView", () => {
     });
 
     await waitFor(() => {
-      expect(nativeWindowHeight).toBe(177);
+      expect(lastRequestedHeight).toBe(177);
     });
   });
 
@@ -2266,6 +2520,7 @@ describe("StatusPanelView", () => {
   });
 
   it("keeps jump feedback inline without a quiet overflow control or resize", async () => {
+    const resize = mockPanelResize();
     const row: SessionRow = {
       ...initialSessions[0],
       sessionId: "jump-message-row",
@@ -2298,12 +2553,9 @@ describe("StatusPanelView", () => {
     const footer = document.querySelector(".panel-footer") as HTMLElement;
     expect(within(footer).queryByRole("button")).toBeNull();
     await waitFor(() => {
-      expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-        height: 128,
-        width: 420,
-      }));
+      expect(resize).toHaveBeenCalledWith(128);
     });
-    tauriWindowMock.setSize.mockClear();
+    resize.mockClear();
 
     fireEvent.click(screen.getByTitle("Jump back"));
 
@@ -2324,10 +2576,11 @@ describe("StatusPanelView", () => {
     expect(footer.lastElementChild?.className).toContain("panel-counters");
     expect(within(footer).queryByRole("button")).toBeNull();
     expect(document.querySelector(".panel-message")).toBeNull();
-    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+    expect(resize).not.toHaveBeenCalled();
   });
 
   it("keeps jump feedback, hidden alerts, and counters in one footer row", async () => {
+    const resize = mockPanelResize();
     window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
       panelMode: "persistent",
       visibleItemCount: 1,
@@ -2361,7 +2614,8 @@ describe("StatusPanelView", () => {
     render(<StatusPanelView initialRows={[visibleRow, hiddenRow]} sourceHealth={fakeSourceHealth} />);
     const footer = document.querySelector(".panel-footer") as HTMLElement;
     expect(within(footer).getByRole("button", { name: "+1 alerts" })).toBeTruthy();
-    tauriWindowMock.setSize.mockClear();
+    await waitFor(() => expect(resize).toHaveBeenCalledWith(128));
+    resize.mockClear();
 
     fireEvent.click(screen.getByTitle("Jump back"));
     expect(within(footer).queryByRole("button", { name: "+1 alerts" })).toBeNull();
@@ -2382,10 +2636,11 @@ describe("StatusPanelView", () => {
     ]);
     expect(within(footer).getByRole("button", { name: "+1 alerts" })).toBeTruthy();
     expect(footer.lastElementChild?.getAttribute("aria-label")).toBe("Session counters");
-    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+    expect(resize).not.toHaveBeenCalled();
   });
 
   it("shows and clears jump feedback without waiting for a slow reconciliation", async () => {
+    const resize = mockPanelResize();
     vi.useFakeTimers();
     const row: SessionRow = {
       ...initialSessions[0],
@@ -2421,7 +2676,7 @@ describe("StatusPanelView", () => {
       await Promise.resolve();
     });
     const jumpButton = screen.getByTitle("Jump back");
-    tauriWindowMock.setSize.mockClear();
+    resize.mockClear();
     fireEvent.click(jumpButton);
 
     expect(resolveJump).toBeTruthy();
@@ -2436,7 +2691,7 @@ describe("StatusPanelView", () => {
     expect(within(pendingFooter).getByText("Opening session")).toBeTruthy();
     expect(within(pendingFooter).queryByRole("button")).toBeNull();
     expect(document.querySelector(".panel-message")).toBeNull();
-    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+    expect(resize).not.toHaveBeenCalled();
 
     await act(async () => {
       resolveJump?.(jsonResponse({
@@ -2475,10 +2730,11 @@ describe("StatusPanelView", () => {
     const footer = document.querySelector(".panel-footer") as HTMLElement;
     expect(footer).toBeTruthy();
     expect(within(footer).queryByText("Opened Codex Desktop session.")).toBeNull();
-    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+    expect(resize).not.toHaveBeenCalled();
   });
 
   it("keeps failed jump feedback visible when its target is exact", async () => {
+    const resize = mockPanelResize();
     vi.useFakeTimers();
     const row: SessionRow = {
       ...initialSessions[0],
@@ -2508,11 +2764,8 @@ describe("StatusPanelView", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(tauriWindowMock.setSize).toHaveBeenCalledWith(expect.objectContaining({
-      height: 128,
-      width: 420,
-    }));
-    tauriWindowMock.setSize.mockClear();
+    expect(resize).toHaveBeenCalledWith(128);
+    resize.mockClear();
     fireEvent.click(screen.getByTitle("Jump back"));
 
     await act(async () => {
@@ -2522,7 +2775,7 @@ describe("StatusPanelView", () => {
     const footer = document.querySelector(".panel-footer") as HTMLElement;
     expect(within(footer).getByText("Jump-back failed: open failed.")).toBeTruthy();
     expect(document.querySelector(".panel-message")).toBeNull();
-    expect(tauriWindowMock.setSize).not.toHaveBeenCalled();
+    expect(resize).not.toHaveBeenCalled();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
@@ -3288,6 +3541,45 @@ describe("StatusPanelView", () => {
     expect(popoverBlock).toContain("z-index: 10;");
   });
 });
+
+function mockPanelResize() {
+  return vi.spyOn(inboxApi, "resizePanel").mockResolvedValue({ generation: 0 });
+}
+
+function enablePlacementRuntime() {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+  tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null }) => {
+    if (command === "list_sessions") return initialSessions;
+    if (command === "configure_panel_shortcut" || command === "configure_position_shortcut") {
+      return { activeShortcut: args?.shortcut ?? null };
+    }
+    if (command === "resize_panel") return { generation: 11 };
+    return undefined;
+  });
+}
+
+async function capturePlacementEvents() {
+  enablePlacementRuntime();
+  const { listen } = await import("@tauri-apps/api/event");
+  const handlers = new Map<string, (event: { payload: unknown }) => void>();
+  vi.mocked(listen).mockImplementation(async (event, callback) => {
+    handlers.set(event, callback as (event: { payload: unknown }) => void);
+    return vi.fn<() => void>();
+  });
+  return {
+    emit: (event: string, payload: unknown) => handlers.get(`agent-session-inbox://${event}`)?.({ payload }),
+    confirmed: (generation: number, corner: PlacementSnapshot["corner"]) => {
+      handlers.get("agent-session-inbox://placement-confirmed")?.({ payload: {
+        generation, corner, frame: { x: -1904, y: 812, width: 420, height: 252 },
+      } });
+    },
+  };
+}
+
+async function openPlacementSettings(events: Awaited<ReturnType<typeof capturePlacementEvents>>) {
+  await act(async () => events.emit("open-management", "management"));
+  await screen.findByRole("button", { name: "Apply settings" });
+}
 
 async function renderShortcutSettings() {
   const { listen } = await import("@tauri-apps/api/event");

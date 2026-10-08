@@ -1,18 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { CodexHookIntegrationStatus, SessionRow, SourceHealth } from "../../shared/types/session";
 import {
+  beginPanelDrag,
   dismissSession as dismissSessionCommand,
   configurePanelShortcut,
+  configurePositionShortcut,
   PanelShortcutConfigureError,
   installCodexHooks,
   jumpToSession as jumpToSessionCommand,
   loadCodexHookIntegrationStatus,
   loadSessions,
+  resizePanel,
+  restorePanelPlacement,
   pinSession as pinSessionCommand,
   unpinSession as unpinSessionCommand,
+  type LegacyPlacement,
+  type PanelCorner,
+  type PlacementSnapshot,
+  type PlacementFailure,
 } from "../inbox/inboxApi";
 import {
   buildStatusPanelModel,
@@ -25,6 +31,7 @@ import {
 import {
   capturePanelShortcut,
   DEFAULT_PANEL_TOGGLE_SHORTCUT,
+  DEFAULT_POSITION_CYCLE_SHORTCUT,
   formatPanelShortcut,
   normalizePanelToggleShortcut,
   normalizePositionCycleShortcut,
@@ -33,7 +40,7 @@ import {
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
 const PANEL_POSITION_STORAGE_KEY = "attn.panelPosition";
-const PANEL_WIDTH = 420;
+const PANEL_CORNER_STORAGE_KEY = "attn.panelCorner";
 const MANAGEMENT_HEIGHT = 420;
 const PANEL_BASE_HEIGHT = 128;
 const PANEL_BASE_VISIBLE_ITEMS = 1;
@@ -90,8 +97,11 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const [jumpNotice, setJumpNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [shortcutRegistrationError, setShortcutRegistrationError] = useState(false);
+  const [positionShortcutRegistrationError, setPositionShortcutRegistrationError] = useState(false);
   const [nativeShortcutStatus, setNativeShortcutStatus] = useState<NativeShortcutStatus | null>(null);
+  const [nativePositionShortcutStatus, setNativePositionShortcutStatus] = useState<NativeShortcutStatus | null>(null);
   const [shortcutRecording, setShortcutRecording] = useState(false);
+  const [positionShortcutRecording, setPositionShortcutRecording] = useState(false);
   const [shortcutApplyPending, setShortcutApplyPending] = useState(false);
   const [sessionSourceUnavailable, setSessionSourceUnavailable] = useState(false);
   const [hookStatus, setHookStatus] = useState<CodexHookIntegrationStatus | null>(null);
@@ -113,8 +123,15 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
-  const resizeInFlightRef = useRef(false);
-  const queuedResizeHeightRef = useRef<number | undefined>(undefined);
+  const [legacyPlacement] = useState(loadLegacyPlacement);
+  const initialPlacementRestoreRef = useRef<Promise<boolean>>(Promise.resolve(true));
+  const latestRequestedGenerationRef = useRef(0);
+  const latestPlacementEventGenerationRef = useRef(0);
+  const confirmedGenerationRef = useRef(-1);
+  const latestPersistenceErrorGenerationRef = useRef(-1);
+  const [confirmedPlacement, setConfirmedPlacement] = useState<PlacementSnapshot | null>(null);
+  const [placementUnconfirmed, setPlacementUnconfirmed] = useState<PlacementFailure | null>(null);
+  const [placementPersistenceError, setPlacementPersistenceError] = useState<PlacementFailure | null>(null);
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
   const hasPendingJump = Object.values(pendingActions).includes("jump");
@@ -257,6 +274,14 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     return update;
   }
 
+  function configurePositionShortcutInOrder(shortcut: string | null, isCurrent: () => boolean) {
+    const update = shortcutUpdateQueueRef.current.then(() => isCurrent()
+      ? configurePositionShortcut(shortcut)
+      : { activeShortcut: shortcut });
+    shortcutUpdateQueueRef.current = update.then(() => undefined, () => undefined);
+    return update;
+  }
+
   useEffect(() => {
     mountedRef.current = true;
     let cancelled = false;
@@ -289,6 +314,19 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
           setShortcutRegistrationError(true);
         }
       });
+    void configurePositionShortcutInOrder(configRef.current.positionCycleShortcut, () => !cancelled)
+      .then((result) => {
+        if (!cancelled && result && (typeof result.activeShortcut === "string" || result.activeShortcut === null)) {
+          setNativePositionShortcutStatus({ activeShortcut: result.activeShortcut, stateUncertain: false });
+        }
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setNativePositionShortcutStatus(nativeShortcutStatusFromError(error));
+        if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
+          setPositionShortcutRegistrationError(true);
+        }
+      });
     const dismissShortcutUiOnHide = () => {
       if (cancelled || (!document.hidden && document.visibilityState !== "hidden")) return;
       shortcutErrorGenerationRef.current += 1;
@@ -296,7 +334,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       shortcutFailedWhileDismissedRef.current = false;
       shortcutVisibilityDismissedRef.current = true;
       setShortcutRecording(false);
+      setPositionShortcutRecording(false);
       setShortcutRegistrationError(false);
+      setPositionShortcutRegistrationError(false);
       updateDraftConfig(configRef.current);
       setView("panel");
     };
@@ -323,6 +363,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       }
       if (event.payload === "management") {
         setShortcutRecording(false);
+        setPositionShortcutRecording(false);
         if (shortcutVisibilityDismissedRef.current || (!shortcutApplyPendingRef.current && !shortcutFailedWhileDismissedRef.current)) {
           updateDraftConfig(configRef.current);
         }
@@ -354,7 +395,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   }, []);
 
   useEffect(() => {
-    if (!shortcutRecording || view !== "management") return;
+    if ((!shortcutRecording && !positionShortcutRecording) || view !== "management") return;
 
     const recordKeydown = (event: KeyboardEvent) => {
       const target = event.target;
@@ -364,15 +405,19 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       event.preventDefault();
       const captured = capturePanelShortcut(event);
       if (captured.status === "captured") {
-        updateDraftConfig((current) => ({ ...current, panelToggleShortcut: captured.value }));
+        updateDraftConfig((current) => ({
+          ...current,
+          [positionShortcutRecording ? "positionCycleShortcut" : "panelToggleShortcut"]: captured.value,
+        }));
       }
       if (captured.status !== "ignored") {
         setShortcutRecording(false);
+        setPositionShortcutRecording(false);
       }
     };
     window.addEventListener("keydown", recordKeydown, true);
     return () => window.removeEventListener("keydown", recordKeydown, true);
-  }, [shortcutRecording, view]);
+  }, [shortcutRecording, positionShortcutRecording, view]);
 
   useEffect(() => {
     configRef.current = config;
@@ -380,26 +425,62 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   }, [config]);
 
   useEffect(() => {
-    try {
-      const appWindow = getCurrentWindow();
-      const savedPosition = loadPanelPosition();
-      if (savedPosition) {
-        void appWindow.setPosition(new PhysicalPosition(savedPosition.x, savedPosition.y)).catch(() => undefined);
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let cancelled = false;
+    let listeningFailed = false;
+    let subscribed = false;
+    const unlisteners: Array<() => void> = [];
+    const keepListener = (unlisten: () => void) => {
+      if (cancelled || listeningFailed) unlisten();
+      else unlisteners.push(unlisten);
+    };
+    const isCurrentGeneration = (generation: number) => generation >= Math.max(
+      latestRequestedGenerationRef.current, latestPlacementEventGenerationRef.current,
+    );
+    const subscribe = async () => {
+      try {
+        await Promise.all([
+          listen<PlacementSnapshot>("agent-session-inbox://placement-confirmed", ({ payload }) => {
+            if (cancelled || listeningFailed || !isPlacementSnapshot(payload) || !isCurrentGeneration(payload.generation)) return;
+            latestPlacementEventGenerationRef.current = payload.generation;
+            confirmedGenerationRef.current = payload.generation;
+            setConfirmedPlacement(payload);
+            setPlacementUnconfirmed(null);
+            setPlacementPersistenceError((failure) => failure && failure.generation >= payload.generation ? failure : null);
+          }).then(keepListener),
+          listen<PlacementFailure>("agent-session-inbox://placement-unconfirmed", ({ payload }) => {
+            if (cancelled || listeningFailed || !isPlacementFailure(payload) || !isCurrentGeneration(payload.generation)
+              || payload.generation <= confirmedGenerationRef.current) return;
+            latestPlacementEventGenerationRef.current = payload.generation;
+            setPlacementUnconfirmed(payload);
+          }).then(keepListener),
+          listen<PlacementFailure>("agent-session-inbox://placement-persistence-error", ({ payload }) => {
+            if (cancelled || listeningFailed || !isPlacementFailure(payload)
+              || payload.generation < Math.max(confirmedGenerationRef.current, latestPersistenceErrorGenerationRef.current)) return;
+            // A newer accepted request does not resolve a failed save of the last confirmed move.
+            latestPersistenceErrorGenerationRef.current = payload.generation;
+            latestPlacementEventGenerationRef.current = Math.max(latestPlacementEventGenerationRef.current, payload.generation);
+            setPlacementPersistenceError(payload);
+          }).then(keepListener),
+        ]);
+        subscribed = true;
+        if (cancelled) return false;
+        await restorePanelPlacement(legacyPlacement);
+        return !cancelled;
+      } catch {
+        if (!subscribed) {
+          listeningFailed = true;
+          unlisteners.splice(0).forEach((unlisten) => unlisten());
+        }
+        if (!cancelled) setPlacementUnconfirmed({ generation: latestRequestedGenerationRef.current, reason: "restore failed" });
+        return false;
       }
-
-      let unlistenMoved: (() => void) | undefined;
-      void appWindow.onMoved((event) => {
-        persistPanelPosition(event.payload);
-      }).then((unlisten) => {
-        unlistenMoved = unlisten;
-      }).catch(() => undefined);
-
-      return () => {
-        unlistenMoved?.();
-      };
-    } catch {
-      return undefined;
-    }
+    };
+    initialPlacementRestoreRef.current = subscribe();
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
   }, []);
 
   useEffect(() => {
@@ -408,7 +489,17 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       : panelOpen
         ? panelHeight
         : PANEL_STRIP_HEIGHT;
-    queuePanelWindowResize(nextHeight);
+    let cancelled = false;
+    void initialPlacementRestoreRef.current.then(async (ready) => {
+      if (!ready || cancelled) return;
+      const accepted = await resizePanel(nextHeight);
+      if (!cancelled && isPlacementGeneration(accepted?.generation)) {
+        latestRequestedGenerationRef.current = Math.max(latestRequestedGenerationRef.current, accepted.generation);
+      }
+    }).catch(() => {
+      if (!cancelled) setPlacementUnconfirmed({ generation: latestRequestedGenerationRef.current, reason: "resize failed" });
+    });
+    return () => { cancelled = true; };
   }, [panelHeight, panelOpen, view]);
 
   useEffect(() => {
@@ -688,7 +779,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
                 : formatPanelShortcut(draftConfig.panelToggleShortcut)}
             />
             <div className="shortcut-settings__actions">
-              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => setShortcutRecording(true)}>
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+                setPositionShortcutRecording(false);
+                setShortcutRecording(true);
+              }}>
                 {model.copy.recordPanelShortcutLabel}
               </button>
               <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
@@ -707,14 +801,70 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
             {shortcutRecording ? <span className="shortcut-settings__recording" role="status" aria-live="polite" aria-label={model.copy.panelToggleShortcutLabel}>{model.copy.recordingPanelShortcutLabel}</span> : null}
             {shortcutRegistrationError ? <span className="shortcut-settings__error" role="alert">{model.copy.panelShortcutRegistrationErrorLabel}</span> : null}
             {nativeShortcutStatus?.stateUncertain ? (
-              <span className="shortcut-settings__error" role="status">{model.copy.panelShortcutRestartRequiredLabel}</span>
+              <span className="shortcut-settings__error" role="status" aria-label={model.copy.panelToggleShortcutLabel}>{model.copy.panelShortcutRestartRequiredLabel}</span>
             ) : nativeShortcutStatus && nativeShortcutStatus.activeShortcut !== draftConfig.panelToggleShortcut ? (
-              <span className="shortcut-settings__active" role="status">
+              <span className="shortcut-settings__active" role="status" aria-label={model.copy.panelToggleShortcutLabel}>
                 {model.copy.currentActivePanelShortcutLabel}: {nativeShortcutStatus.activeShortcut === null
                   ? model.copy.disabledPanelShortcutLabel
                   : formatPanelShortcut(nativeShortcutStatus.activeShortcut)}
               </span>
             ) : null}
+          </div>
+
+          <div className="shortcut-settings" data-no-window-drag>
+            <label className="setting-field" htmlFor="position-cycle-shortcut">
+              <span>{model.copy.positionCycleShortcutLabel}</span>
+            </label>
+            <input
+              id="position-cycle-shortcut"
+              className="shortcut-settings__value"
+              type="text"
+              aria-label={model.copy.positionCycleShortcutLabel}
+              readOnly
+              value={draftConfig.positionCycleShortcut === null
+                ? model.copy.disabledPanelShortcutLabel
+                : formatPanelShortcut(draftConfig.positionCycleShortcut)}
+            />
+            <div className="shortcut-settings__actions">
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+                setShortcutRecording(false);
+                setPositionShortcutRecording(true);
+              }}>
+                {model.copy.recordPositionShortcutLabel}
+              </button>
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+                setPositionShortcutRecording(false);
+                updateDraftConfig((current) => ({ ...current, positionCycleShortcut: null }));
+              }}>
+                {model.copy.clearPositionShortcutLabel}
+              </button>
+              <button type="button" data-no-window-drag disabled={shortcutApplyPending} onClick={() => {
+                setPositionShortcutRecording(false);
+                updateDraftConfig((current) => ({ ...current, positionCycleShortcut: DEFAULT_POSITION_CYCLE_SHORTCUT }));
+              }}>
+                {model.copy.restorePositionShortcutLabel}
+              </button>
+            </div>
+            {positionShortcutRecording ? <span className="shortcut-settings__recording" role="status" aria-live="polite" aria-label={model.copy.positionCycleShortcutLabel}>{model.copy.recordingPanelShortcutLabel}</span> : null}
+            {positionShortcutRegistrationError ? <span className="shortcut-settings__error" role="alert">{model.copy.panelShortcutRegistrationErrorLabel}</span> : null}
+            {nativePositionShortcutStatus?.stateUncertain ? (
+              <span className="shortcut-settings__error" role="status">{model.copy.panelShortcutRestartRequiredLabel}</span>
+            ) : nativePositionShortcutStatus && nativePositionShortcutStatus.activeShortcut !== draftConfig.positionCycleShortcut ? (
+              <span className="shortcut-settings__active" role="status">
+                {model.copy.currentActivePanelShortcutLabel}: {nativePositionShortcutStatus.activeShortcut === null
+                  ? model.copy.disabledPanelShortcutLabel
+                  : formatPanelShortcut(nativePositionShortcutStatus.activeShortcut)}
+              </span>
+            ) : null}
+            <span role="status" aria-live="polite" aria-label={config.language === "zh" ? "面板位置" : "Panel position"}>
+              {panelPlacementLabel(confirmedPlacement, config.language)}
+            </span>
+            {placementUnconfirmed ? <span className="shortcut-settings__error" role="alert">
+              {config.language === "zh" ? "面板位置未能确认，保留上次确认的位置。" : "Panel position could not be confirmed. Last confirmed position retained."}
+            </span> : null}
+            {placementPersistenceError ? <span className="shortcut-settings__error" role="alert">
+              {config.language === "zh" ? "无法保存面板位置。" : "Unable to save panel position."}
+            </span> : null}
           </div>
 
           <label className="setting-field">
@@ -933,27 +1083,6 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     });
   }
 
-  function queuePanelWindowResize(height: number) {
-    if (resizeInFlightRef.current) {
-      queuedResizeHeightRef.current = height;
-      return;
-    }
-
-    void resizePanelWindowInOrder(height);
-  }
-
-  async function resizePanelWindowInOrder(height: number) {
-    resizeInFlightRef.current = true;
-    await resizePanelWindow(height);
-    resizeInFlightRef.current = false;
-
-    const queuedHeight = queuedResizeHeightRef.current;
-    queuedResizeHeightRef.current = undefined;
-    if (queuedHeight !== undefined) {
-      void resizePanelWindowInOrder(queuedHeight);
-    }
-  }
-
   function clearJumpNoticeTimer() {
     if (jumpNoticeTimerRef.current === undefined) return;
     window.clearTimeout(jumpNoticeTimerRef.current);
@@ -1035,39 +1164,60 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     const managementPresentationGeneration = managementPresentationGenerationRef.current;
     const nextConfig = normalizeConfig(draftConfigRef.current);
     setShortcutRecording(false);
+    setPositionShortcutRecording(false);
     setShortcutApplyPending(true);
     try {
-      const result = await configurePanelShortcutInOrder(nextConfig.panelToggleShortcut, () => mountedRef.current);
+      const [toggleUpdate, positionUpdate] = await Promise.allSettled([
+        configurePanelShortcutInOrder(nextConfig.panelToggleShortcut, () => mountedRef.current),
+        configurePositionShortcutInOrder(nextConfig.positionCycleShortcut, () => mountedRef.current),
+      ]);
       if (!mountedRef.current) return;
-      setNativeShortcutStatus({ activeShortcut: result.activeShortcut, stateUncertain: false });
+      if (toggleUpdate.status === "fulfilled" && toggleUpdate.value) {
+        setNativeShortcutStatus({ activeShortcut: toggleUpdate.value.activeShortcut, stateUncertain: false });
+      } else if (toggleUpdate.status === "rejected") {
+        setNativeShortcutStatus(nativeShortcutStatusFromError(toggleUpdate.reason));
+      }
+      if (positionUpdate.status === "fulfilled" && positionUpdate.value) {
+        setNativePositionShortcutStatus({ activeShortcut: positionUpdate.value.activeShortcut, stateUncertain: false });
+      } else if (positionUpdate.status === "rejected") {
+        setNativePositionShortcutStatus(nativeShortcutStatusFromError(positionUpdate.reason));
+      }
       const committedConfig = {
         ...nextConfig,
-        panelToggleShortcut: result?.activeShortcut === undefined
+        panelToggleShortcut: toggleUpdate.status === "rejected"
+          ? configRef.current.panelToggleShortcut
+          : toggleUpdate.value?.activeShortcut === undefined
           ? nextConfig.panelToggleShortcut
-          : result.activeShortcut,
+          : toggleUpdate.value.activeShortcut,
+        positionCycleShortcut: positionUpdate.status === "rejected"
+          ? configRef.current.positionCycleShortcut
+          : positionUpdate.value?.activeShortcut === undefined
+          ? nextConfig.positionCycleShortcut
+          : positionUpdate.value.activeShortcut,
       };
       commitConfig(committedConfig);
-      updateDraftConfig(committedConfig);
-      shortcutFailedWhileDismissedRef.current = false;
+      const failed = toggleUpdate.status === "rejected" || positionUpdate.status === "rejected";
+      updateDraftConfig(shortcutVisibilityDismissedRef.current
+        ? committedConfig
+        : {
+          ...committedConfig,
+          panelToggleShortcut: toggleUpdate.status === "rejected"
+            ? nextConfig.panelToggleShortcut : committedConfig.panelToggleShortcut,
+          positionCycleShortcut: positionUpdate.status === "rejected"
+            ? nextConfig.positionCycleShortcut : committedConfig.positionCycleShortcut,
+        });
+      shortcutFailedWhileDismissedRef.current = failed
+        && shortcutErrorGeneration !== shortcutErrorGenerationRef.current
+        && !shortcutVisibilityDismissedRef.current;
+      if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
+        setShortcutRegistrationError(toggleUpdate.status === "rejected");
+        setPositionShortcutRegistrationError(positionUpdate.status === "rejected");
+      }
       shortcutVisibilityDismissedRef.current = false;
-      setShortcutRegistrationError(false);
-      if (managementPresentationGeneration === managementPresentationGenerationRef.current) {
+      if (!failed && managementPresentationGeneration === managementPresentationGenerationRef.current) {
         setView("panel");
       }
       void refreshPanel(committedConfig.followUpToIdleMinutes, { invalidateActiveRefresh: true });
-    } catch (error: unknown) {
-      if (!mountedRef.current) return;
-      setNativeShortcutStatus(nativeShortcutStatusFromError(error));
-      const committedConfig = { ...nextConfig, panelToggleShortcut: configRef.current.panelToggleShortcut };
-      commitConfig(committedConfig);
-      updateDraftConfig(shortcutVisibilityDismissedRef.current ? committedConfig : nextConfig);
-      void refreshPanel(nextConfig.followUpToIdleMinutes, { invalidateActiveRefresh: true });
-      if (shortcutErrorGeneration === shortcutErrorGenerationRef.current) {
-        setShortcutRegistrationError(true);
-      } else if (!shortcutVisibilityDismissedRef.current) {
-        shortcutFailedWhileDismissedRef.current = true;
-      }
-      shortcutVisibilityDismissedRef.current = false;
     } finally {
       shortcutApplyPendingRef.current = false;
       if (mountedRef.current) setShortcutApplyPending(false);
@@ -1133,7 +1283,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       shortcutErrorGenerationRef.current += 1;
       managementPresentationGenerationRef.current += 1;
       setShortcutRecording(false);
+      setPositionShortcutRecording(false);
       setShortcutRegistrationError(false);
+      setPositionShortcutRegistrationError(false);
       setView("panel");
       setPanelOpen(true);
       return;
@@ -1406,24 +1558,12 @@ function messageFromUnknownError(error: unknown, fallback: string) {
   return typeof error === "string" ? error : fallback;
 }
 
-async function resizePanelWindow(height: number) {
-  try {
-    await getCurrentWindow().setSize(new LogicalSize(PANEL_WIDTH, height));
-  } catch {
-    // Browser preview and restricted window capabilities should not block the panel.
-  }
-}
-
 function startPanelDrag(event: React.PointerEvent<HTMLElement>) {
   if (event.button !== 0 || shouldSkipWindowDrag(event.target)) {
     return;
   }
 
-  try {
-    void getCurrentWindow().startDragging().catch(() => undefined);
-  } catch {
-    // Browser preview does not expose native window dragging.
-  }
+  void beginPanelDrag().catch(() => undefined);
 }
 
 function shouldSkipWindowDrag(target: EventTarget | null) {
@@ -1448,21 +1588,59 @@ function loadPanelPosition() {
   }
 }
 
-function persistPanelPosition(position: { x: number; y: number }) {
+function loadPanelCorner(): PanelCorner | null {
+  if (typeof window === "undefined") return null;
   try {
-    if (!isPersistablePanelPosition(position)) {
-      return;
-    }
-
-    window.localStorage.setItem(PANEL_POSITION_STORAGE_KEY, JSON.stringify({ x: position.x, y: position.y }));
+    const value = window.localStorage.getItem(PANEL_CORNER_STORAGE_KEY);
+    return isPanelCorner(value) ? value : null;
   } catch {
-    // Position persistence should not affect the panel itself.
+    return null;
   }
+}
+
+function loadLegacyPlacement(): LegacyPlacement | null {
+  const position = loadPanelPosition();
+  return position ? { position, corner: loadPanelCorner() } : null;
+}
+
+function isPanelCorner(value: unknown): value is PanelCorner {
+  return value === "top-left" || value === "top-right" || value === "bottom-right" || value === "bottom-left";
 }
 
 function isPersistablePanelPosition(value: unknown): value is { x: number; y: number } {
   if (!isObject(value)) return false;
-  return Number.isFinite(value.x) && Number.isFinite(value.y);
+  const isPhysicalCoordinate = (coordinate: unknown) => typeof coordinate === "number"
+    && Number.isInteger(coordinate) && coordinate >= -2147483648 && coordinate <= 2147483647;
+  return isPhysicalCoordinate(value.x) && isPhysicalCoordinate(value.y);
+}
+
+function isPlacementGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPlacementSnapshot(value: unknown): value is PlacementSnapshot {
+  if (!isObject(value) || !isPlacementGeneration(value.generation)
+    || (value.corner !== null && !isPanelCorner(value.corner))
+    || !isPersistablePanelPosition(value.frame)) return false;
+  const frame = value.frame as Record<string, unknown>;
+  return typeof frame.width === "number" && Number.isInteger(frame.width) && frame.width > 0
+    && typeof frame.height === "number" && Number.isInteger(frame.height) && frame.height > 0;
+}
+
+function isPlacementFailure(value: unknown): value is PlacementFailure {
+  return isObject(value) && isPlacementGeneration(value.generation) && typeof value.reason === "string";
+}
+
+function panelPlacementLabel(placement: PlacementSnapshot | null, language: StatusPanelConfig["language"]) {
+  if (!placement) return language === "zh" ? "未知（等待确认）" : "Unknown (awaiting confirmation)";
+  if (placement.corner === null) return language === "zh" ? "自由位置" : "Free position";
+  const labels = {
+    "top-left": ["Top Left", "左上角"],
+    "top-right": ["Top Right", "右上角"],
+    "bottom-right": ["Bottom Right", "右下角"],
+    "bottom-left": ["Bottom Left", "左下角"],
+  };
+  return labels[placement.corner][language === "zh" ? 1 : 0];
 }
 
 function loadInitialConfig(): StatusPanelConfig {
