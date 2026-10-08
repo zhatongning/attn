@@ -299,7 +299,12 @@ impl PlacementMachine {
     }
 
     fn snap(&mut self, corner: Corner, displays: &[DisplayFrame]) -> Vec<PlacementEffect> {
-        self.restoring = None;
+        if self.restoring.take().is_some() {
+            // An explicit corner command cancels restoration, including its
+            // superseded location generations. Retain only late-arrival guards
+            // so an already-observed new corner can complete without a setter.
+            self.retired.extend(self.pending.drain(..));
+        }
         self.dragging = false;
         self.drag_moved = false;
         self.generation += 1;
@@ -924,6 +929,34 @@ mod tests {
         let late = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &DISPLAYS);
         assert!(!confirms(&late));
         assert!(late.contains(&PlacementEffect::SetPosition { generation: 1, x: 16, y: 16 }));
+        assert_eq!(machine.confirmed(), confirmed);
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS)));
+    }
+
+    #[test]
+    fn explicit_observed_snap_retires_superseded_restore_without_blocking_noop_resize() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::RestorePosition {
+            x: 310, y: 205, corner: Some(Corner::BottomLeft),
+        }, &DISPLAYS);
+        let snap = machine.reduce(PlacementInput::Snap(Corner::TopLeft), &DISPLAYS);
+        assert!(snap.contains(&PlacementEffect::Persist(PlacementSnapshot {
+            generation: 2, corner: Some(Corner::TopLeft), frame: STRIP,
+        })));
+        assert!(!snap.iter().any(|effect| matches!(effect,
+            PlacementEffect::SetPosition { .. } | PlacementEffect::ScheduleWatchdog(_))));
+        let resize = machine.reduce(PlacementInput::ResizeRequested(50), &DISPLAYS);
+        assert!(resize.contains(&PlacementEffect::Persist(PlacementSnapshot {
+            generation: 3, corner: Some(Corner::TopLeft), frame: STRIP,
+        })));
+        assert!(!resize.iter().any(|effect| matches!(effect,
+            PlacementEffect::SetPosition { .. } | PlacementEffect::ScheduleWatchdog(_))));
+        assert!(machine.reduce(PlacementInput::TimedOut(3), &DISPLAYS).is_empty());
+        let confirmed = machine.confirmed();
+        let late = machine.reduce(PlacementInput::Moved { x: 310, y: 205 }, &DISPLAYS);
+        assert!(!confirms(&late));
+        assert!(!late.iter().any(|effect| matches!(effect, PlacementEffect::Persist(_))));
+        assert!(late.contains(&PlacementEffect::SetPosition { generation: 3, x: 16, y: 16 }));
         assert_eq!(machine.confirmed(), confirmed);
         assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 16, y: 16 }, &DISPLAYS)));
     }
