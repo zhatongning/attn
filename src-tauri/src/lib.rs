@@ -9,7 +9,8 @@ pub mod panel_shortcut;
 use std::sync::Arc;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{Emitter, LogicalPosition, Manager, Monitor, Runtime, WebviewWindow};
+use tauri::{Emitter, Manager, Runtime, WebviewWindow};
+use panel_placement::{Corner, PanelPlacement};
 
 #[tauri::command]
 async fn list_sessions(
@@ -135,86 +136,29 @@ async fn jump_to_session(
         }))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelPosition {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
-
-impl PanelPosition {
-    fn from_menu_id(menu_id: &str) -> Option<Self> {
-        match menu_id {
-            "position_top_left" => Some(Self::TopLeft),
-            "position_top_right" => Some(Self::TopRight),
-            "position_bottom_left" => Some(Self::BottomLeft),
-            "position_bottom_right" => Some(Self::BottomRight),
-            _ => None,
-        }
+fn corner_from_menu_id(menu_id: &str) -> Option<Corner> {
+    match menu_id {
+        "position_top_left" => Some(Corner::TopLeft),
+        "position_top_right" => Some(Corner::TopRight),
+        "position_bottom_left" => Some(Corner::BottomLeft),
+        "position_bottom_right" => Some(Corner::BottomRight),
+        _ => None,
     }
 }
 
 fn apply_panel_window_behavior<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.set_always_on_top(true);
     let _ = window.set_visible_on_all_workspaces(true);
-    let _ = move_panel_window(window, PanelPosition::TopRight);
 }
 
-fn position_on_monitor(
-    monitor: &Monitor,
-    window_width: f64,
-    window_height: f64,
-    position: PanelPosition,
-) -> LogicalPosition<f64> {
-    let monitor_position = monitor.position();
-    let monitor_size = monitor.size();
-    let scale_factor = monitor.scale_factor();
-    let margin = 16.0;
-    let monitor_x = monitor_position.x as f64 / scale_factor;
-    let monitor_y = monitor_position.y as f64 / scale_factor;
-    let monitor_width = monitor_size.width as f64 / scale_factor;
-    let monitor_height = monitor_size.height as f64 / scale_factor;
-    let x = match position {
-        PanelPosition::TopLeft | PanelPosition::BottomLeft => monitor_x + margin,
-        PanelPosition::TopRight | PanelPosition::BottomRight => {
-            monitor_x + monitor_width - window_width - margin
-        }
-    };
-    let y = match position {
-        PanelPosition::TopLeft | PanelPosition::TopRight => monitor_y + margin,
-        PanelPosition::BottomLeft | PanelPosition::BottomRight => {
-            monitor_y + monitor_height - window_height - margin
-        }
-    };
-
-    LogicalPosition::new(x, y)
-}
-
-fn move_panel_window<R: Runtime>(
-    window: &WebviewWindow<R>,
-    position: PanelPosition,
-) -> tauri::Result<()> {
-    let Some(monitor) = window.current_monitor()? else {
-        return Ok(());
-    };
-    let window_size = window.outer_size()?;
-    let scale_factor = monitor.scale_factor();
-    let window_width = window_size.width as f64 / scale_factor;
-    let window_height = window_size.height as f64 / scale_factor;
-    window.set_position(position_on_monitor(
-        &monitor,
-        window_width,
-        window_height,
-        position,
-    ))
-}
-
-
-fn move_main_panel_window<R: Runtime>(app: &tauri::AppHandle<R>, position: PanelPosition) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = move_panel_window(&window, position);
-    }
+#[cfg(desktop)]
+#[tauri::command]
+fn anchor_panel_position(state: tauri::State<'_, PanelPlacement>, anchor: String) -> Result<(), String> {
+    // Temporary accepted-intent compatibility for the WIP frontend (Task 5).
+    // A null response carries no coordinates and cannot claim OS completion.
+    let corner: Corner = serde_json::from_value(serde_json::Value::String(anchor))
+        .map_err(|_| "invalid corner".to_owned())?;
+    state.snap(corner)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -270,13 +214,21 @@ pub fn run() {
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 apply_panel_window_behavior(&window);
+                let placement = PanelPlacement::new(window.clone())?;
+                let observer = placement.clone();
+                window.on_window_event(move |event| {
+                    if let Err(error) = observer.on_window_event(event) {
+                        eprintln!("panel placement observation rejected: {error}");
+                    }
+                });
+                app.manage(placement);
+                app.state::<PanelPlacement>().snap(Corner::TopRight)?;
             }
 
             #[cfg(desktop)]
             if let Err(error) = panel_shortcut::register_default(app.handle()) {
                 eprintln!("failed to register default panel shortcut: {error}");
             }
-
             app.handle().on_menu_event(|app, event| {
                 let menu_id = event.id().as_ref();
                 if menu_id == "open_management" {
@@ -285,8 +237,12 @@ pub fn run() {
                         let _ = window.set_focus();
                         let _ = window.emit("agent-session-inbox://open-management", "management");
                     }
-                } else if let Some(position) = PanelPosition::from_menu_id(menu_id) {
-                    move_main_panel_window(app, position);
+                } else if let Some(corner) = corner_from_menu_id(menu_id) {
+                    if let Some(placement) = app.try_state::<PanelPlacement>() {
+                        if let Err(error) = placement.snap(corner) {
+                            eprintln!("panel placement request rejected: {error}");
+                        }
+                    }
                 }
             });
 
@@ -305,7 +261,11 @@ pub fn run() {
         codex_hook_integration_status,
         install_codex_hooks,
         jump_to_session,
-        panel_shortcut::configure_panel_shortcut
+        panel_shortcut::configure_panel_shortcut,
+        anchor_panel_position,
+        panel_placement::adapter::resize_panel,
+        panel_placement::adapter::restore_panel_placement,
+        panel_placement::adapter::begin_panel_drag
     ]);
     #[cfg(not(desktop))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -318,7 +278,10 @@ pub fn run() {
         source_health,
         codex_hook_integration_status,
         install_codex_hooks,
-        jump_to_session
+        jump_to_session,
+        panel_placement::adapter::resize_panel,
+        panel_placement::adapter::restore_panel_placement,
+        panel_placement::adapter::begin_panel_drag
     ]);
 
     builder
