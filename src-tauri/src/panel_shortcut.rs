@@ -280,6 +280,23 @@ fn reveal_plan(app_hidden: bool, window_visible: bool) -> RevealPlan {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn reveal_then_emit<E>(
+    reveal: impl FnOnce(std::sync::mpsc::SyncSender<bool>) -> Result<(), E>,
+    emit: impl FnOnce(bool),
+) -> Result<bool, E> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    reveal(sender)?;
+    // with_webview runs synchronously on the macOS shortcut callback's main thread.
+    // Its window-id lock must be released before emit_to evaluates JavaScript.
+    if let Ok(was_hidden) = receiver.try_recv() {
+        emit(was_hidden);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn emit_panel_toggle<R: Runtime>(app: &AppHandle<R>, was_hidden: bool) {
     if let Err(error) = app.emit_to(
         EventTarget::webview_window("main"),
@@ -302,29 +319,35 @@ fn handle_panel_shortcut_event<R: Runtime>(
 
         #[cfg(target_os = "macos")]
         {
-            let app = app.clone();
-            if let Err(error) = window.with_webview(move |webview| {
-                let main_thread = MainThreadMarker::new()
-                    .expect("Tauri with_webview callbacks run on the main thread");
-                let application = NSApplication::sharedApplication(main_thread);
-                let native_window = webview.ns_window();
-                if native_window.is_null() {
-                    eprintln!("main panel has no native NSWindow for global shortcut");
-                    return;
-                }
-                // Tauri owns the NSWindow; its pointer is valid for this main-thread callback.
-                let native_window: &NSWindow = unsafe { &*native_window.cast() };
-                let plan = reveal_plan(application.isHidden(), native_window.isVisible());
+            match reveal_then_emit(
+                |sender| {
+                    window.with_webview(move |webview| {
+                        let main_thread = MainThreadMarker::new()
+                            .expect("Tauri with_webview callbacks run on the main thread");
+                        let application = NSApplication::sharedApplication(main_thread);
+                        let native_window = webview.ns_window();
+                        if native_window.is_null() {
+                            eprintln!("main panel has no native NSWindow for global shortcut");
+                            return;
+                        }
+                        // Tauri owns the NSWindow; its pointer is valid for this main-thread callback.
+                        let native_window: &NSWindow = unsafe { &*native_window.cast() };
+                        let plan = reveal_plan(application.isHidden(), native_window.isVisible());
 
-                if plan.unhide_app {
-                    application.unhideWithoutActivation();
-                }
-                if plan.order_front {
-                    native_window.orderFrontRegardless();
-                }
-                emit_panel_toggle(&app, plan.was_hidden);
-            }) {
-                eprintln!("failed to access main panel for global shortcut: {error}");
+                        if plan.unhide_app {
+                            application.unhideWithoutActivation();
+                        }
+                        if plan.order_front {
+                            native_window.orderFrontRegardless();
+                        }
+                        let _ = sender.send(plan.was_hidden);
+                    })
+                },
+                |was_hidden| emit_panel_toggle(app, was_hidden),
+            ) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("main panel shortcut reveal did not return a window state"),
+                Err(error) => eprintln!("failed to access main panel for global shortcut: {error}"),
             }
         }
 
@@ -351,13 +374,15 @@ fn handle_panel_shortcut_event<R: Runtime>(
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
-    use super::reveal_plan;
+    use super::{reveal_plan, reveal_then_emit};
     use super::{
         apply_shortcut_update, canonicalize_shortcut, handle_shortcut_event, is_pressed,
         PanelShortcutError, PanelShortcutErrorCode, PanelShortcutUpdate, ShortcutRegistrar,
         ShortcutRegistrationState,
     };
     use tauri_plugin_global_shortcut::ShortcutState;
+    #[cfg(target_os = "macos")]
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct FakeRegistrar {
@@ -681,5 +706,31 @@ mod tests {
         assert!(plan.was_hidden);
         assert!(!plan.unhide_app);
         assert!(plan.order_front);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emits_only_after_native_reveal_releases_its_callback_lock() {
+        let callback_lock = Mutex::new(());
+        let mut received = None;
+
+        let delivered = reveal_then_emit(
+            |sender| {
+                let _guard = callback_lock.lock().unwrap();
+                sender.send(false).unwrap();
+                Ok::<(), ()>(())
+            },
+            |was_hidden| {
+                assert!(
+                    callback_lock.try_lock().is_ok(),
+                    "emitting inside the native callback would reenter its lock"
+                );
+                received = Some(was_hidden);
+            },
+        )
+        .unwrap();
+
+        assert!(delivered);
+        assert_eq!(received, Some(false));
     }
 }
