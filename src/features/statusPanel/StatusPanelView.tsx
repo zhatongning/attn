@@ -128,6 +128,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const latestRequestedGenerationRef = useRef(0);
   const latestPlacementEventGenerationRef = useRef(0);
   const confirmedGenerationRef = useRef(-1);
+  const confirmedPlacementSequenceRef = useRef(0);
   const latestPersistenceErrorGenerationRef = useRef(-1);
   const [confirmedPlacement, setConfirmedPlacement] = useState<PlacementSnapshot | null>(null);
   const [placementUnconfirmed, setPlacementUnconfirmed] = useState<PlacementFailure | null>(null);
@@ -444,6 +445,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
             if (cancelled || listeningFailed || !isPlacementSnapshot(payload) || !isCurrentGeneration(payload.generation)) return;
             latestPlacementEventGenerationRef.current = payload.generation;
             confirmedGenerationRef.current = payload.generation;
+            confirmedPlacementSequenceRef.current += 1;
             setConfirmedPlacement(payload);
             setPlacementUnconfirmed(null);
             setPlacementPersistenceError((failure) => failure && failure.generation >= payload.generation ? failure : null);
@@ -490,14 +492,19 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         ? panelHeight
         : PANEL_STRIP_HEIGHT;
     let cancelled = false;
+    let confirmationSequenceAtRequest: number | undefined;
     void initialPlacementRestoreRef.current.then(async (ready) => {
       if (!ready || cancelled) return;
+      confirmationSequenceAtRequest = confirmedPlacementSequenceRef.current;
       const accepted = await resizePanel(nextHeight);
       if (!cancelled && isPlacementGeneration(accepted?.generation)) {
         latestRequestedGenerationRef.current = Math.max(latestRequestedGenerationRef.current, accepted.generation);
       }
     }).catch(() => {
-      if (!cancelled) setPlacementUnconfirmed({ generation: latestRequestedGenerationRef.current, reason: "resize failed" });
+      // A pre-acceptance rejection has no native generation. A later confirmation supersedes it.
+      if (!cancelled && confirmationSequenceAtRequest === confirmedPlacementSequenceRef.current) {
+        setPlacementUnconfirmed({ generation: latestRequestedGenerationRef.current, reason: "resize failed" });
+      }
     });
     return () => { cancelled = true; };
   }, [panelHeight, panelOpen, view]);

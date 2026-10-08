@@ -865,6 +865,78 @@ describe("StatusPanelView", () => {
     expect(tauriCoreMock.invoke.mock.calls.filter(([command]) => command === "begin_panel_drag")).toHaveLength(1);
   });
 
+  it.each([
+    [12, "top-right", "Top Right"],
+    [11, null, "Free position"],
+  ] as const)("ignores a delayed resize rejection after a newer placement confirmation %s %s", async (generation, corner, label) => {
+    const events = await capturePlacementEvents();
+    let rejectResize: ((reason: unknown) => void) | undefined;
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null; height?: number }) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command.startsWith("configure_")) return { activeShortcut: args?.shortcut ?? null };
+      if (command === "resize_panel" && args?.height === 420) {
+        return new Promise((_resolve, reject) => { rejectResize = reject; });
+      }
+      if (command === "resize_panel") return { generation: 11 };
+      return undefined;
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await openPlacementSettings(events);
+    await waitFor(() => expect(rejectResize).toBeTypeOf("function"));
+
+    await act(async () => events.confirmed(generation, corner));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain(label);
+    await act(async () => rejectResize?.("scale factor unavailable"));
+    expect(screen.queryByText(/Panel position could not be confirmed/)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain(label);
+  });
+
+  it("keeps native placement confirmed before its resize IPC receipt arrives", async () => {
+    const events = await capturePlacementEvents();
+    let acceptResize: ((receipt: { generation: number }) => void) | undefined;
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null; height?: number }) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command.startsWith("configure_")) return { activeShortcut: args?.shortcut ?? null };
+      if (command === "resize_panel" && args?.height === 420) {
+        return new Promise((resolve) => { acceptResize = resolve; });
+      }
+      if (command === "resize_panel") return { generation: 11 };
+      return undefined;
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await openPlacementSettings(events);
+    await waitFor(() => expect(acceptResize).toBeTypeOf("function"));
+
+    await act(async () => events.confirmed(12, "bottom-right"));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Right");
+    await act(async () => acceptResize?.({ generation: 12 }));
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Right");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("still reports the current resize rejection when no later placement was confirmed", async () => {
+    const events = await capturePlacementEvents();
+    let rejectResize: ((reason: unknown) => void) | undefined;
+    tauriCoreMock.invoke.mockImplementation(async (command: string, args?: { shortcut?: string | null; height?: number }) => {
+      if (command === "list_sessions") return initialSessions;
+      if (command.startsWith("configure_")) return { activeShortcut: args?.shortcut ?? null };
+      if (command === "resize_panel" && args?.height === 420) {
+        return new Promise((_resolve, reject) => { rejectResize = reject; });
+      }
+      if (command === "resize_panel") return { generation: 11 };
+      return undefined;
+    });
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await act(async () => events.confirmed(11, "bottom-left"));
+    await openPlacementSettings(events);
+    await waitFor(() => expect(rejectResize).toBeTypeOf("function"));
+
+    await act(async () => rejectResize?.("scale factor unavailable"));
+    expect(screen.getByRole("alert").textContent).toContain("Panel position could not be confirmed");
+    expect(screen.getByRole("status", { name: "Panel position" }).textContent).toContain("Bottom Left");
+  });
+
   it("retains confirmed placement when an unconfirmed request or persistence error arrives", async () => {
     const events = await capturePlacementEvents();
     render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
