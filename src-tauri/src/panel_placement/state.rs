@@ -52,8 +52,8 @@ pub enum PlacementInput {
     CycleReleased,
     Snap(Corner),
     RestorePosition { x: i32, y: i32, corner: Option<Corner> },
-    /// Height is physical pixels, like the native Resized observation.
-    ResizeRequested(u32),
+    /// Dimensions are physical pixels, like the native Resized observation.
+    ResizeRequested { width: u32, height: u32 },
     BeginDrag,
     Moved { x: i32, y: i32 },
     Resized { width: u32, height: u32 },
@@ -75,6 +75,7 @@ struct Target {
     generation: u64,
     corner: Option<Corner>,
     frame: PhysicalFrame,
+    required_width: Option<u32>,
     required_height: Option<u32>,
     display: Option<DisplayFrame>,
 }
@@ -87,6 +88,13 @@ struct PendingMove {
     from_restore: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingSize {
+    generation: u64,
+    width: u32,
+    height: u32,
+}
+
 /// Setters are requests. Only native observations (or a verified no-op) confirm.
 pub struct PlacementMachine {
     observed: PhysicalFrame,
@@ -94,9 +102,11 @@ pub struct PlacementMachine {
     desired: Option<Target>,
     generation: u64,
     pending: VecDeque<PendingMove>,
+    pending_sizes: VecDeque<PendingSize>,
     // Obsolete requests no longer block observed no-ops. Keep their coordinates
     // until an arrival is seen so truly late native moves cannot become manual.
     retired: VecDeque<PendingMove>,
+    retired_sizes: VecDeque<PendingSize>,
     held: bool,
     dragging: bool,
     drag_moved: bool,
@@ -116,7 +126,9 @@ impl PlacementMachine {
             desired: None,
             generation: saved.map_or(0, |snapshot| snapshot.generation),
             pending: VecDeque::new(),
+            pending_sizes: VecDeque::new(),
             retired: VecDeque::new(),
+            retired_sizes: VecDeque::new(),
             held: false,
             dragging: false,
             drag_moved: false,
@@ -133,6 +145,49 @@ impl PlacementMachine {
 
     pub fn observed(&self) -> PhysicalFrame {
         self.observed
+    }
+
+    pub fn requested_width(&self) -> u32 {
+        self.desired.and_then(|target| target.required_width).unwrap_or(self.observed.width)
+    }
+
+    pub fn size_dispatch_failed(&mut self, generation: u64) {
+        // A rejected setter cannot produce a native resize observation. Keep
+        // the desired size, but let the next explicit request issue a retry.
+        self.pending_sizes.retain(|pending| pending.generation != generation);
+    }
+
+    /// Tao reports the whole virtual desktop using the window's current
+    /// backing scale. When the window crosses displays, normalize outstanding
+    /// intents to the scale of the next native observation before reducing it.
+    pub fn rescale(&mut self, old_scale: f64, new_scale: f64) {
+        if !old_scale.is_finite() || old_scale <= 0.0
+            || !new_scale.is_finite() || new_scale <= 0.0 || old_scale == new_scale
+        {
+            return;
+        }
+        self.observed = rescale_frame(self.observed, old_scale, new_scale);
+        if let Some(snapshot) = self.confirmed.as_mut() {
+            snapshot.frame = rescale_frame(snapshot.frame, old_scale, new_scale);
+        }
+        if let Some(target) = self.desired.as_mut() {
+            target.frame = rescale_frame(target.frame, old_scale, new_scale);
+            target.required_width = target.required_width
+                .map(|width| rescale_dimension(width, old_scale, new_scale));
+            target.required_height = target.required_height
+                .map(|height| rescale_dimension(height, old_scale, new_scale));
+            if let Some(display) = target.display.as_mut() {
+                *display = rescale_display(*display, old_scale, new_scale);
+            }
+        }
+        for pending in self.pending.iter_mut().chain(self.retired.iter_mut()) {
+            pending.x = rescale_coordinate(pending.x, old_scale, new_scale);
+            pending.y = rescale_coordinate(pending.y, old_scale, new_scale);
+        }
+        for pending in self.pending_sizes.iter_mut().chain(self.retired_sizes.iter_mut()) {
+            pending.width = rescale_dimension(pending.width, old_scale, new_scale);
+            pending.height = rescale_dimension(pending.height, old_scale, new_scale);
+        }
     }
 
     pub fn reduce(
@@ -167,7 +222,7 @@ impl PlacementMachine {
                 self.waiting = false;
                 Vec::new()
             }
-            PlacementInput::ResizeRequested(height) => {
+            PlacementInput::ResizeRequested { width, height } => {
                 self.generation += 1;
                 let corner = if self.dragging && !self.drag_moved {
                     self.confirmed.and_then(|snapshot| snapshot.corner)
@@ -181,18 +236,13 @@ impl PlacementMachine {
                     frame: if self.restoring.is_some() {
                         self.desired.map_or(self.observed, |target| target.frame)
                     } else { self.observed },
+                    required_width: Some(width),
                     required_height: Some(height),
                     display: self.desired.and_then(|target| target.display)
                         .or_else(|| self.display(displays).copied()),
                 });
                 self.waiting = true;
-                if self.observed.height == height {
-                    return self.reconcile(displays);
-                }
-                vec![
-                    PlacementEffect::SetHeight { generation: self.generation, height },
-                    PlacementEffect::ScheduleWatchdog(self.generation),
-                ]
+                self.reconcile(displays)
             }
             PlacementInput::Moved { x, y } => {
                 let unchanged = self.observed.x == x && self.observed.y == y;
@@ -260,6 +310,15 @@ impl PlacementMachine {
                 let unchanged = self.observed.width == width && self.observed.height == height;
                 self.observed.width = width;
                 self.observed.height = height;
+                let arrival = if let Some(index) = self.pending_sizes.iter()
+                    .position(|pending| pending.width == width && pending.height == height)
+                {
+                    self.pending_sizes.remove(index)
+                } else if let Some(index) = self.retired_sizes.iter()
+                    .position(|pending| pending.width == width && pending.height == height)
+                {
+                    self.retired_sizes.remove(index)
+                } else { None };
                 if self.dragging && !self.drag_moved && self.drag_interrupted
                     && self.desired.is_some_and(|target| target.generation <= self.drag_generation)
                 {
@@ -271,15 +330,21 @@ impl PlacementMachine {
                         generation: self.generation,
                         corner: self.confirmed.and_then(|snapshot| snapshot.corner),
                         frame: self.observed,
+                        required_width: None,
                         required_height: None,
                         display: self.display(displays).copied(),
                     });
-                } else if !self.waiting && !unchanged {
+                } else if !self.waiting && !unchanged && arrival.is_none() {
                     self.generation += 1;
                     if let Some(target) = self.desired.as_mut() {
                         target.generation = self.generation;
+                        target.required_width = None;
                         target.required_height = None;
                     }
+                } else if arrival.is_some_and(|pending| pending.generation < self.generation) && !unchanged {
+                    // A delayed native resize is still programmatic after a
+                    // newer no-op confirmation; converge on the latest size.
+                    self.waiting = true;
                 }
                 self.reconcile(displays)
             }
@@ -319,8 +384,10 @@ impl PlacementMachine {
             generation: self.generation,
             corner: Some(corner),
             frame: self.observed,
+            required_width: self.desired.and_then(|target| target.required_width)
+                .filter(|width| *width != self.observed.width || !self.pending_sizes.is_empty()),
             required_height: self.desired.and_then(|target| target.required_height)
-                .filter(|height| *height != self.observed.height),
+                .filter(|height| *height != self.observed.height || !self.pending_sizes.is_empty()),
             display: self.display(displays).copied(),
         });
         self.reconcile(displays)
@@ -347,6 +414,7 @@ impl PlacementMachine {
         self.restoring = Some(corner);
         self.desired = Some(Target {
             generation: self.generation, corner: None, frame,
+            required_width: None,
             required_height: None, display,
         });
         self.reconcile(displays)
@@ -355,11 +423,25 @@ impl PlacementMachine {
     fn reconcile(&mut self, displays: &[DisplayFrame]) -> Vec<PlacementEffect> {
         let Some(mut target) = self.desired else { return Vec::new(); };
         self.waiting = true;
-        if let Some(height) = target.required_height.filter(|height| *height != self.observed.height) {
+        let requested_width = target.required_width.unwrap_or(self.observed.width);
+        let requested_height = target.required_height.unwrap_or(self.observed.height);
+        if requested_width != self.observed.width || requested_height != self.observed.height {
+            if self.pending_sizes.iter().any(|pending|
+                pending.width == requested_width && pending.height == requested_height)
+            {
+                return vec![PlacementEffect::ScheduleWatchdog(target.generation)];
+            }
+            self.pending_sizes.push_back(PendingSize {
+                generation: target.generation, width: requested_width, height: requested_height,
+            });
             return vec![
-                PlacementEffect::SetHeight { generation: target.generation, height },
+                PlacementEffect::SetHeight { generation: target.generation, height: requested_height },
                 PlacementEffect::ScheduleWatchdog(target.generation),
             ];
+        }
+        if !self.pending_sizes.is_empty() {
+            // An older setter can still arrive and undo an observed no-op.
+            return vec![PlacementEffect::ScheduleWatchdog(target.generation)];
         }
         if let Some(corner) = self.restoring {
             if !target.display.is_some_and(|display| displays.contains(&display)) {
@@ -425,7 +507,9 @@ impl PlacementMachine {
             matches_position(self.observed.x, self.observed.y, target.frame.x, target.frame.y)
                 && self.observed.width == target.frame.width
                 && self.observed.height == target.frame.height
+                && target.required_width.is_none_or(|width| width == self.observed.width)
                 && target.required_height.is_none_or(|height| height == self.observed.height)
+                && self.pending_sizes.is_empty()
         })
     }
 
@@ -439,6 +523,7 @@ impl PlacementMachine {
         // Every remaining request is superseded by this observed confirmation.
         // It remains a late-arrival guard, not an active positioning barrier.
         self.retired.extend(self.pending.drain(..));
+        self.retired_sizes.extend(self.pending_sizes.drain(..));
         vec![PlacementEffect::Confirm(snapshot), PlacementEffect::Persist(snapshot)]
     }
 
@@ -447,6 +532,7 @@ impl PlacementMachine {
         self.generation += 1;
         self.desired = Some(Target {
             generation: self.generation, corner: None, frame: self.observed, required_height: None,
+            required_width: None,
             display: None,
         });
         self.confirm()
@@ -456,6 +542,35 @@ impl PlacementMachine {
 fn matches_position(x: i32, y: i32, target_x: i32, target_y: i32) -> bool {
     (i64::from(x) - i64::from(target_x)).abs() <= 2
         && (i64::from(y) - i64::from(target_y)).abs() <= 2
+}
+
+fn rescale_coordinate(value: i32, old_scale: f64, new_scale: f64) -> i32 {
+    ((f64::from(value) / old_scale) * new_scale).round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn rescale_dimension(value: u32, old_scale: f64, new_scale: f64) -> u32 {
+    ((f64::from(value) / old_scale) * new_scale).round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn rescale_frame(frame: PhysicalFrame, old_scale: f64, new_scale: f64) -> PhysicalFrame {
+    PhysicalFrame {
+        x: rescale_coordinate(frame.x, old_scale, new_scale),
+        y: rescale_coordinate(frame.y, old_scale, new_scale),
+        width: rescale_dimension(frame.width, old_scale, new_scale),
+        height: rescale_dimension(frame.height, old_scale, new_scale),
+    }
+}
+
+fn rescale_display(display: DisplayFrame, old_scale: f64, new_scale: f64) -> DisplayFrame {
+    DisplayFrame {
+        x: rescale_coordinate(display.x, old_scale, new_scale),
+        y: rescale_coordinate(display.y, old_scale, new_scale),
+        width: rescale_dimension(display.width, old_scale, new_scale),
+        height: rescale_dimension(display.height, old_scale, new_scale),
+        scale_factor: new_scale,
+    }
 }
 
 fn display_containing(frame: PhysicalFrame, displays: &[DisplayFrame]) -> Option<&DisplayFrame> {
@@ -632,7 +747,7 @@ mod tests {
         let bottom = PhysicalFrame { x: 1484, y: 1014, width: 420, height: 50 };
         let saved = PlacementSnapshot { generation: 1, corner: Some(Corner::BottomRight), frame: bottom };
         let mut machine = PlacementMachine::new(bottom, Some(saved));
-        let request = machine.reduce(PlacementInput::ResizeRequested(252), &DISPLAYS);
+        let request = machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &DISPLAYS);
         assert!(request.contains(&PlacementEffect::SetHeight { generation: 2, height: 252 }));
         assert!(!request.iter().any(|effect| matches!(effect, PlacementEffect::SetPosition { .. } | PlacementEffect::Persist(_))));
         let resized = machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &DISPLAYS);
@@ -643,6 +758,43 @@ mod tests {
             generation: 2, corner: Some(Corner::BottomRight),
             frame: PhysicalFrame { x: 1484, y: 812, width: 420, height: 252 },
         })));
+    }
+
+    #[test]
+    fn older_queued_resize_cannot_confirm_a_newer_noop_height() {
+        let bottom = PhysicalFrame { x: 1484, y: 1014, width: 420, height: 50 };
+        let saved = PlacementSnapshot { generation: 1, corner: Some(Corner::BottomRight), frame: bottom };
+        let mut machine = PlacementMachine::new(bottom, Some(saved));
+        assert!(machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 420 }, &DISPLAYS)
+            .contains(&PlacementEffect::SetHeight { generation: 2, height: 420 }));
+        let no_op = machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 50 }, &DISPLAYS);
+        assert!(!confirms(&no_op));
+        assert_eq!(machine.confirmed(), Some(saved));
+
+        let stale = machine.reduce(PlacementInput::Resized { width: 420, height: 420 }, &DISPLAYS);
+        assert!(!confirms(&stale));
+        assert!(stale.contains(&PlacementEffect::SetHeight { generation: 3, height: 50 }));
+        assert_eq!(machine.confirmed(), Some(saved));
+
+        let restored = machine.reduce(PlacementInput::Resized { width: 420, height: 50 }, &DISPLAYS);
+        assert!(confirms(&restored));
+        assert_eq!(machine.confirmed().unwrap().generation, 3);
+        assert_eq!(machine.confirmed().unwrap().frame.height, 50);
+    }
+
+    #[test]
+    fn corner_command_during_queued_resize_preserves_latest_requested_height() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 420 }, &DISPLAYS);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 50 }, &DISPLAYS);
+        assert!(!confirms(&machine.reduce(PlacementInput::Snap(Corner::BottomRight), &DISPLAYS)));
+        let stale = machine.reduce(PlacementInput::Resized { width: 420, height: 420 }, &DISPLAYS);
+        assert!(stale.contains(&PlacementEffect::SetHeight { generation: 3, height: 50 }));
+        assert!(!confirms(&stale));
+        machine.reduce(PlacementInput::Resized { width: 420, height: 50 }, &DISPLAYS);
+        let moved = machine.reduce(PlacementInput::Moved { x: 1484, y: 1014 }, &DISPLAYS);
+        assert!(confirms(&moved));
+        assert_eq!(machine.confirmed().unwrap().frame.height, 50);
     }
 
     // Catches physical/logical coordinate mixing and ignoring negative display origins.
@@ -793,7 +945,7 @@ mod tests {
         let mut machine = PlacementMachine::new(STRIP, None);
         machine.reduce(PlacementInput::BeginDrag, &DISPLAYS);
         machine.reduce(PlacementInput::Moved { x: 600, y: 300 }, &DISPLAYS);
-        machine.reduce(PlacementInput::ResizeRequested(252), &DISPLAYS);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &DISPLAYS);
         let resized = machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &DISPLAYS);
         assert!(!resized.iter().any(|effect| matches!(effect, PlacementEffect::SetPosition { .. })));
         assert!(resized.contains(&PlacementEffect::Persist(PlacementSnapshot {
@@ -878,7 +1030,7 @@ mod tests {
         let displays = [external, DISPLAYS[0]];
         let mut machine = PlacementMachine::new(STRIP, None);
         machine.reduce(PlacementInput::RestorePosition { x: -1904, y: 500, corner: Some(Corner::BottomLeft) }, &displays);
-        machine.reduce(PlacementInput::ResizeRequested(252), &displays);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &displays);
         machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &displays);
         let located = machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &displays);
         assert!(located.contains(&PlacementEffect::SetPosition { generation: 2, x: -1904, y: 812 }));
@@ -896,11 +1048,11 @@ mod tests {
         let displays = [external, DISPLAYS[0]];
         let mut machine = PlacementMachine::new(STRIP, None);
         machine.reduce(PlacementInput::RestorePosition { x: -1904, y: 500, corner: Some(Corner::BottomLeft) }, &displays);
-        machine.reduce(PlacementInput::ResizeRequested(252), &displays);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &displays);
         machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &displays);
         machine.reduce(PlacementInput::Moved { x: -1904, y: 500 }, &displays);
         machine.reduce(PlacementInput::Moved { x: -1904, y: 812 }, &displays);
-        let noop = machine.reduce(PlacementInput::ResizeRequested(252), &displays);
+        let noop = machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &displays);
         assert!(noop.contains(&PlacementEffect::Persist(PlacementSnapshot {
             generation: 3, corner: Some(Corner::BottomLeft),
             frame: PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 },
@@ -953,7 +1105,7 @@ mod tests {
         })));
         assert!(!snap.iter().any(|effect| matches!(effect,
             PlacementEffect::SetPosition { .. } | PlacementEffect::ScheduleWatchdog(_))));
-        let resize = machine.reduce(PlacementInput::ResizeRequested(50), &DISPLAYS);
+        let resize = machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 50 }, &DISPLAYS);
         assert!(resize.contains(&PlacementEffect::Persist(PlacementSnapshot {
             generation: 3, corner: Some(Corner::TopLeft), frame: STRIP,
         })));

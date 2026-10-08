@@ -15,6 +15,7 @@ use super::store::{LoadOutcome, PlacementStore};
 pub const PLACEMENT_CONFIRMED_EVENT: &str = "agent-session-inbox://placement-confirmed";
 pub const PLACEMENT_UNCONFIRMED_EVENT: &str = "agent-session-inbox://placement-unconfirmed";
 pub const PLACEMENT_PERSISTENCE_ERROR_EVENT: &str = "agent-session-inbox://placement-persistence-error";
+const PANEL_WIDTH_LOGICAL: u32 = 420;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LegacyPlacement {
@@ -72,6 +73,7 @@ struct NativeWindow<R: Runtime>(WebviewWindow<R>);
 
 impl<R: Runtime> WindowPort for NativeWindow<R> {
     fn displays(&self, observed: PhysicalFrame) -> Result<Vec<DisplayFrame>, String> {
+        let window_scale = self.scale_factor()?;
         let frame = |monitor: tauri::Monitor| DisplayFrame {
             x: monitor.position().x, y: monitor.position().y,
             width: monitor.size().width, height: monitor.size().height,
@@ -81,7 +83,7 @@ impl<R: Runtime> WindowPort for NativeWindow<R> {
             .into_iter().map(frame).collect();
         let current = self.0.current_monitor().ok().flatten().map(frame);
         let primary = self.0.primary_monitor().ok().flatten().map(frame);
-        Ok(ordered_displays(observed, available, current, primary))
+        Ok(ordered_displays(observed, available, current, primary, window_scale))
     }
 
     fn scale_factor(&self) -> Result<f64, String> {
@@ -121,8 +123,17 @@ impl<R: Runtime> WindowPort for NativeWindow<R> {
 
 fn ordered_displays(
     observed: PhysicalFrame, available: Vec<DisplayFrame>,
-    current: Option<DisplayFrame>, primary: Option<DisplayFrame>,
+    current: Option<DisplayFrame>, primary: Option<DisplayFrame>, window_scale: f64,
 ) -> Vec<DisplayFrame> {
+    if !window_scale.is_finite() || window_scale <= 0.0 {
+        return Vec::new();
+    }
+    // Tao 0.30.8 uses each monitor's backing scale for monitor geometry,
+    // but the window's scale for outer_position, Moved and set_position.
+    let normalize = |display| monitor_in_window_space(display, window_scale);
+    let available: Vec<_> = available.into_iter().filter_map(normalize).collect();
+    let current = current.and_then(normalize);
+    let primary = primary.and_then(normalize);
     let center_x = i64::from(observed.x) * 2 + i64::from(observed.width);
     let center_y = i64::from(observed.y) * 2 + i64::from(observed.height);
     let containing = available.iter().copied().find(|display| {
@@ -132,7 +143,7 @@ fn ordered_displays(
             && center_y < (i64::from(display.y) + i64::from(display.height)) * 2
     });
     let mut ordered = Vec::new();
-    for display in containing.into_iter().chain(current).chain(primary).chain(available.iter().copied()) {
+    for display in current.into_iter().chain(containing).chain(primary).chain(available.iter().copied()) {
         // A current/primary value must still belong to the live inventory.
         if available.contains(&display) && !ordered.contains(&display) {
             ordered.push(display);
@@ -141,6 +152,21 @@ fn ordered_displays(
     ordered
 }
 
+fn monitor_in_window_space(display: DisplayFrame, window_scale: f64) -> Option<DisplayFrame> {
+    if !display.scale_factor.is_finite() || display.scale_factor <= 0.0 {
+        return None;
+    }
+    let position = PhysicalPosition::new(display.x, display.y)
+        .to_logical::<f64>(display.scale_factor)
+        .to_physical::<i32>(window_scale);
+    let size = PhysicalSize::new(display.width, display.height)
+        .to_logical::<f64>(display.scale_factor)
+        .to_physical::<u32>(window_scale);
+    Some(DisplayFrame {
+        x: position.x, y: position.y, width: size.width, height: size.height,
+        scale_factor: window_scale,
+    })
+}
 struct ShutdownGuard(Sender<WorkerMessage>);
 
 impl Drop for ShutdownGuard {
@@ -176,6 +202,7 @@ impl PanelPlacement {
         window: Arc<dyn WindowPort>, observed: PhysicalFrame,
         saved: Option<PlacementSnapshot>, watchdog: Duration, store: Option<Arc<PlacementStore>>,
     ) -> Result<Self, String> {
+        let initial_scale = window.scale_factor()?;
         let (sender, receiver) = mpsc::channel();
         let worker_sender = sender.clone();
         std::thread::Builder::new().name("panel-placement".into()).spawn(move || {
@@ -184,6 +211,7 @@ impl PanelPlacement {
                 store.load().map_err(|error| error.to_string()));
             PlacementWorker {
                 machine: PlacementMachine::new(observed, saved), window,
+                observed_scale: initial_scale,
                 sender: worker_sender, deadlines: BTreeMap::new(), watchdog,
                 reported_failures: BTreeSet::new(),
                 persisted: None, legacy: None, restoration_requested: false,
@@ -241,6 +269,7 @@ struct PlacementWorker {
     // Single worker ownership makes reducer transitions serialized without a lock.
     machine: PlacementMachine,
     window: Arc<dyn WindowPort>,
+    observed_scale: f64,
     sender: Sender<WorkerMessage>,
     deadlines: BTreeMap<u64, Instant>,
     reported_failures: BTreeSet<u64>,
@@ -278,11 +307,17 @@ impl PlacementWorker {
                 }
                 WorkerMessage::ResizeLogical(height, receipt) => {
                     let result = self.window.scale_factor().and_then(|scale| {
-                        let physical = (f64::from(height) * scale).round();
-                        if !scale.is_finite() || scale <= 0.0 || physical > f64::from(u32::MAX) {
-                            return Err("invalid physical panel height".into());
+                        let physical_height = (f64::from(height) * scale).round();
+                        let physical_width = (f64::from(PANEL_WIDTH_LOGICAL) * scale).round();
+                        if !scale.is_finite() || scale <= 0.0
+                            || physical_height > f64::from(u32::MAX)
+                            || physical_width > f64::from(u32::MAX)
+                        {
+                            return Err("invalid physical panel size".into());
                         }
-                        self.transition(PlacementInput::ResizeRequested(physical as u32))
+                        self.transition(PlacementInput::ResizeRequested {
+                            width: physical_width as u32, height: physical_height as u32,
+                        })
                             .map(|generation| AcceptedPlacement { generation })
                             .ok_or_else(|| "resize intent produced no generation".into())
                     });
@@ -301,7 +336,10 @@ impl PlacementWorker {
                         eprintln!("panel drag dispatch failed: {error}");
                     }
                 }
-                WorkerMessage::DispatchFailed { generation, reason } => self.report(generation, reason),
+                WorkerMessage::DispatchFailed { generation, reason } => {
+                    self.machine.size_dispatch_failed(generation);
+                    self.report(generation, reason);
+                }
                 WorkerMessage::Shutdown => break,
                 #[cfg(test)]
                 WorkerMessage::Inspect(sender) => {
@@ -314,6 +352,12 @@ impl PlacementWorker {
     }
 
     fn transition(&mut self, input: PlacementInput) -> Option<u64> {
+        if let Ok(scale) = self.window.scale_factor() {
+            if scale.is_finite() && scale > 0.0 && scale != self.observed_scale {
+                self.machine.rescale(self.observed_scale, scale);
+                self.observed_scale = scale;
+            }
+        }
         let display_frame = match input {
             PlacementInput::RestorePosition { x, y, .. } => PhysicalFrame { x, y, ..self.machine.observed() },
             _ => self.machine.observed(),
@@ -331,7 +375,7 @@ impl PlacementWorker {
                 }
                 PlacementEffect::SetHeight { generation: value, height } => {
                     generation = Some(value);
-                    NativeEffect::SetHeight { generation: value, width: self.machine.observed().width, height }
+                    NativeEffect::SetHeight { generation: value, width: self.machine.requested_width(), height }
                 }
                 PlacementEffect::Confirm(snapshot) => {
                     generation = Some(snapshot.generation);
@@ -369,7 +413,14 @@ impl PlacementWorker {
                 NativeEffect::SetPosition { generation, .. } | NativeEffect::SetHeight { generation, .. } => Some(*generation),
                 _ => None,
             };
+            let size_generation = match &native {
+                NativeEffect::SetHeight { generation, .. } => Some(*generation),
+                _ => None,
+            };
             if let Err(error) = self.window.dispatch(native, self.sender.clone()) {
+                if let Some(value) = size_generation {
+                    self.machine.size_dispatch_failed(value);
+                }
                 if let Some(value) = setter_generation {
                     self.report(value, format!("dispatch-failed: {error}"));
                 } else {
@@ -493,19 +544,21 @@ mod tests {
     struct DeferredWindow {
         calls: Mutex<Calls>,
         displays: Vec<DisplayFrame>,
-        scale: f64,
+        scale: Mutex<f64>,
         reject_position: bool,
-        current: Option<DisplayFrame>,
+        reject_size: Mutex<bool>,
+        current: Mutex<Option<DisplayFrame>>,
         primary: Option<DisplayFrame>,
         consume_confirmation: bool,
     }
 
     impl WindowPort for DeferredWindow {
         fn displays(&self, observed: PhysicalFrame) -> Result<Vec<DisplayFrame>, String> {
-            Ok(ordered_displays(observed, self.displays.clone(), self.current, self.primary))
+            Ok(ordered_displays(observed, self.displays.clone(),
+                *self.current.lock().unwrap(), self.primary, *self.scale.lock().unwrap()))
         }
 
-        fn scale_factor(&self) -> Result<f64, String> { Ok(self.scale) }
+        fn scale_factor(&self) -> Result<f64, String> { Ok(*self.scale.lock().unwrap()) }
 
         // Setters deliberately do not update any observed window frame.
         fn dispatch(&self, effect: NativeEffect, _: Sender<WorkerMessage>) -> Result<(), String> {
@@ -515,7 +568,10 @@ mod tests {
                     if self.reject_position { return Err("setter rejected".into()); }
                     calls.positions.push((x, y));
                 }
-                NativeEffect::SetHeight { width, height, .. } => calls.heights.push((width, height)),
+                NativeEffect::SetHeight { width, height, .. } => {
+                    if *self.reject_size.lock().unwrap() { return Err("size setter rejected".into()); }
+                    calls.heights.push((width, height));
+                }
                 NativeEffect::Confirm(snapshot) => {
                     if self.consume_confirmation { calls.confirmed.push(snapshot); }
                 }
@@ -536,8 +592,9 @@ mod tests {
         scale: f64, reject_position: bool, watchdog: Duration,
     ) -> (PanelPlacement, Arc<DeferredWindow>) {
         let window = Arc::new(DeferredWindow {
-            calls: Mutex::new(Calls::default()), displays, scale, reject_position,
-            current: None, primary: None, consume_confirmation: true,
+            calls: Mutex::new(Calls::default()), displays, scale: Mutex::new(scale), reject_position,
+            reject_size: Mutex::new(false),
+            current: Mutex::new(None), primary: None, consume_confirmation: true,
         });
         let placement = PanelPlacement::with_port(window.clone(), frame, saved, watchdog).unwrap();
         (placement, window)
@@ -608,12 +665,137 @@ mod tests {
     }
 
     #[test]
-    fn logical_height_is_converted_once_but_native_resize_is_already_physical() {
-        let (placement, window) = setup_window(STRIP, None, vec![DisplayFrame { scale_factor: 2.0, ..DISPLAY }], 2.0, false, Duration::from_secs(3));
+    fn deferred_stale_resize_reasserts_latest_height_without_persisting_old_size() {
+        let bottom = PhysicalFrame { x: 1484, y: 1014, ..STRIP };
+        let saved = PlacementSnapshot { generation: 1, corner: Some(Corner::BottomRight), frame: bottom };
+        let (placement, window) = setup(bottom, Some(saved));
+        assert_eq!(placement.resize(420).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap().generation, 2);
+        assert_eq!(placement.resize(50).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap().generation, 3);
+        assert_eq!(inspect(&placement).confirmed, Some(saved));
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 420))).unwrap();
+        assert_eq!(inspect(&placement).confirmed, Some(saved));
+        assert_eq!(window.calls.lock().unwrap().heights.last(), Some(&(420, 50)));
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 50))).unwrap();
+        let snapshot = inspect(&placement).confirmed.unwrap();
+        assert_eq!((snapshot.generation, snapshot.frame.height), (3, 50));
+        assert!(window.calls.lock().unwrap().confirmed.iter().all(|value| value.frame.height != 420));
+    }
+
+    #[test]
+    fn rejected_size_setter_does_not_prevent_a_later_explicit_retry() {
+        let (placement, window) = setup(STRIP, None);
+        *window.reject_size.lock().unwrap() = true;
         placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-        assert_eq!(window.calls.lock().unwrap().heights, vec![(420, 504)]);
-        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 504))).unwrap();
         inspect(&placement);
+        assert!(window.calls.lock().unwrap().heights.is_empty());
+        assert_eq!(window.calls.lock().unwrap().unconfirmed.len(), 1);
+        *window.reject_size.lock().unwrap() = false;
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().heights, vec![(420, 252)]);
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        assert_eq!(inspect(&placement).confirmed.unwrap().frame.height, 252);
+    }
+
+    #[test]
+    fn resize_restores_420_logical_width_and_waits_for_observed_size() {
+        let frame = PhysicalFrame { width: 560, ..STRIP };
+        let (placement, window) = setup(frame, None);
+        let receipt = placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(window.calls.lock().unwrap().heights, vec![(420, 252)]);
+        assert_eq!(inspect(&placement).confirmed, None);
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        assert_eq!(inspect(&placement).confirmed.unwrap().generation, receipt.generation);
+        assert_eq!(inspect(&placement).confirmed.unwrap().frame.width, 420);
+    }
+
+    #[test]
+    fn mixed_scale_current_display_wins_over_overlapping_foreign_physical_rectangle() {
+        // Tao's macOS monitor coordinates use each monitor's own backing
+        // scale; the window event and setter use the window's current scale.
+        let primary_raw = DisplayFrame { x: 0, y: 0, width: 3840, height: 2160, scale_factor: 2.0 };
+        let external_raw = DisplayFrame { x: 1440, y: 0, width: 1920, height: 1080, scale_factor: 1.0 };
+        let current_scale = 1.0;
+        let observed = PhysicalFrame { x: 1500, y: 200, width: 420, height: 50 };
+        let normalized = ordered_displays(observed, vec![primary_raw, external_raw],
+            Some(external_raw), Some(primary_raw), current_scale);
+        assert_eq!(normalized[0], external_raw);
+        assert_eq!(normalized[1], DisplayFrame {
+            x: 0, y: 0, width: 1920, height: 1080, scale_factor: 1.0,
+        });
+        let mut machine = PlacementMachine::new(observed, None);
+        assert!(machine.reduce(PlacementInput::Snap(Corner::BottomRight), &normalized).contains(
+            &PlacementEffect::SetPosition { generation: 1, x: 2924, y: 1014 }));
+    }
+
+    #[test]
+    fn crossing_from_2x_primary_to_1x_external_uses_new_window_scale_and_current_monitor() {
+        let primary_raw = DisplayFrame { x: 0, y: 0, width: 2880, height: 1800, scale_factor: 2.0 };
+        let external_raw = DisplayFrame { x: 1440, y: 0, width: 1920, height: 1080, scale_factor: 1.0 };
+        let window = Arc::new(DeferredWindow {
+            calls: Mutex::new(Calls::default()), displays: vec![primary_raw, external_raw],
+            scale: Mutex::new(2.0), reject_position: false, reject_size: Mutex::new(false),
+            current: Mutex::new(Some(primary_raw)), primary: Some(primary_raw),
+            consume_confirmation: true,
+        });
+        let frame = PhysicalFrame { x: 32, y: 32, width: 840, height: 100 };
+        let placement = PanelPlacement::with_port(window.clone(), frame, None, Duration::from_secs(3)).unwrap();
+        placement.begin_drag().unwrap();
+        inspect(&placement);
+        *window.current.lock().unwrap() = Some(external_raw);
+        *window.scale.lock().unwrap() = 1.0;
+        moved(&placement, 1500, 200);
+        let free = inspect(&placement).confirmed.unwrap();
+        assert_eq!(free.frame, PhysicalFrame { x: 1500, y: 200, width: 420, height: 50 });
+        assert_eq!(free.corner, None);
+        placement.snap(Corner::TopRight).unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().positions.last(), Some(&(2924, 16)));
+        moved(&placement, 2924, 16);
+        let snapped = inspect(&placement).confirmed.unwrap();
+        assert_eq!(snapped.corner, Some(Corner::TopRight));
+        assert_eq!(snapped.frame.width, 420);
+    }
+
+    #[test]
+    fn delayed_setter_after_scale_change_reasserts_original_display_in_current_units() {
+        let primary_raw = DisplayFrame { x: 0, y: 0, width: 2880, height: 1800, scale_factor: 2.0 };
+        let external_raw = DisplayFrame { x: 1440, y: 0, width: 1920, height: 1080, scale_factor: 1.0 };
+        let window = Arc::new(DeferredWindow {
+            calls: Mutex::new(Calls::default()), displays: vec![primary_raw, external_raw],
+            scale: Mutex::new(2.0), reject_position: false, reject_size: Mutex::new(false),
+            current: Mutex::new(Some(primary_raw)), primary: Some(primary_raw),
+            consume_confirmation: true,
+        });
+        let frame = PhysicalFrame { x: 32, y: 32, width: 840, height: 100 };
+        let placement = PanelPlacement::with_port(window.clone(), frame, None, Duration::from_secs(3)).unwrap();
+        placement.snap(Corner::TopRight).unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(2008, 32)]);
+        // A delayed setter executes after the window's scale changed from 2
+        // to 1, so its physical 2008 is interpreted as 2008 logical points.
+        *window.current.lock().unwrap() = Some(external_raw);
+        *window.scale.lock().unwrap() = 1.0;
+        moved(&placement, 2008, 32);
+        assert_eq!(inspect(&placement).confirmed, None);
+        assert_eq!(window.calls.lock().unwrap().positions.last(), Some(&(1004, 16)));
+        *window.current.lock().unwrap() = Some(primary_raw);
+        *window.scale.lock().unwrap() = 2.0;
+        moved(&placement, 2008, 32);
+        assert_eq!(inspect(&placement).confirmed.unwrap().corner, Some(Corner::TopRight));
+    }
+
+    #[test]
+    fn logical_height_is_converted_once_but_native_resize_is_already_physical() {
+        let scaled = PhysicalFrame { x: 32, y: 32, width: 840, height: 100 };
+        let (placement, window) = setup_window(scaled, None,
+            vec![DisplayFrame { width: 3840, height: 2160, scale_factor: 2.0, ..DISPLAY }],
+            2.0, false, Duration::from_secs(3));
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(window.calls.lock().unwrap().heights, vec![(840, 504)]);
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(840, 504))).unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().confirmed[0].frame.width, 840);
         assert_eq!(window.calls.lock().unwrap().confirmed[0].frame.height, 504);
     }
 
@@ -740,12 +922,12 @@ mod tests {
     }
 
     #[test]
-    fn ordered_displays_prefer_observed_then_current_then_primary() {
-        let other = DisplayFrame { x: -1920, scale_factor: 2.0, ..DISPLAY };
+    fn ordered_displays_prefer_current_then_observed_then_primary() {
+        let other = DisplayFrame { x: -1920, ..DISPLAY };
         let far = DisplayFrame { x: 4000, ..DISPLAY };
-        assert_eq!(ordered_displays(STRIP, vec![other, DISPLAY, far], Some(other), Some(far)), vec![DISPLAY, other, far]);
+        assert_eq!(ordered_displays(STRIP, vec![other, DISPLAY, far], Some(other), Some(far), 1.0), vec![other, DISPLAY, far]);
         let offscreen = PhysicalFrame { x: 8000, ..STRIP };
-        assert_eq!(ordered_displays(offscreen, vec![far, DISPLAY, other], Some(other), Some(DISPLAY)), vec![other, DISPLAY, far]);
+        assert_eq!(ordered_displays(offscreen, vec![far, DISPLAY, other], Some(other), Some(DISPLAY), 1.0), vec![other, DISPLAY, far]);
     }
 
     #[test]
@@ -771,8 +953,9 @@ mod tests {
         current: Option<DisplayFrame>, primary: Option<DisplayFrame>, consume_confirmation: bool,
     ) -> (PanelPlacement, Arc<DeferredWindow>) {
         let window = Arc::new(DeferredWindow {
-            calls: Mutex::new(Calls::default()), displays, scale: 1.0, reject_position: false,
-            current, primary, consume_confirmation,
+            calls: Mutex::new(Calls::default()), displays, scale: Mutex::new(1.0), reject_position: false,
+            reject_size: Mutex::new(false),
+            current: Mutex::new(current), primary, consume_confirmation,
         });
         let placement = PanelPlacement::with_port_and_store(
             window.clone(), frame, None, Duration::from_secs(3), Some(store),

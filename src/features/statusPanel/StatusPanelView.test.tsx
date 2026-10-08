@@ -3501,6 +3501,7 @@ describe("StatusPanelView", () => {
 
     expect(tauriConfig.app.windows[0].minHeight).toBe(50);
     expect(tauriConfig.app.windows[0].maxHeight).toBe(420);
+    expect(tauriConfig.app.windows[0].width).toBe(420);
   });
 
   it("keeps the strip toggle from shifting header layout", () => {
