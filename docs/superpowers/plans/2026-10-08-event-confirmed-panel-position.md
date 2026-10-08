@@ -52,7 +52,7 @@
 **Files:**
 - Create: `src-tauri/src/panel_placement/state.rs`
 - Create: `src-tauri/src/panel_placement/mod.rs`
-- Modify: `src-tauri/src/lib.rs` (only the module declaration and the WIP's pure corner/geometry helpers needed to avoid duplicate ownership)
+- Modify: `src-tauri/src/lib.rs` (only the module declaration; retain the old WIP geometry temporarily so Task 1 compiles, and remove it when Task 2 rewires its callers)
 
 **Interfaces:**
 - Produces `Corner::{TopLeft,TopRight,BottomRight,BottomLeft}`, `PhysicalFrame { x:i32, y:i32, width:u32, height:u32 }`, and `DisplayFrame { x:i32, y:i32, width:u32, height:u32, scale_factor:f64 }`.
@@ -104,14 +104,17 @@ let base = self.desired_corner.or(self.confirmed_corner)
 let target = base.next_clockwise();
 self.desired_corner = Some(target);
 self.generation += 1;
-self.pending.push_back(target_for(self.generation, target, self.observed, displays));
+let requested = target_for(self.generation, target, self.observed, displays);
+self.pending.push_back(requested);
 vec![
-    PlacementEffect::SetPosition { generation: self.generation, x: target_x, y: target_y },
+    PlacementEffect::SetPosition {
+        generation: self.generation, x: requested.x, y: requested.y,
+    },
     PlacementEffect::ScheduleWatchdog(self.generation),
 ]
 ```
 
-Define `target_x`/`target_y` from the same `target_for` result and keep past generation targets until their delayed `Moved` is classified. `Moved` confirms only the current desired generation; a superseded target schedules reassertion, not persistence. `Resized` uses its observed height before calculating a bottom target. An already-observed target confirms immediately only when no older movement is pending.
+Make the internal target returned by `target_for` `Copy` so the queued value and request coordinates match. Keep past generation targets until their delayed `Moved` is classified. `Moved` confirms only the current desired generation; a superseded target schedules reassertion, not persistence. `Resized` uses its observed height before calculating a bottom target. An already-observed target confirms immediately only when no older movement is pending.
 
 - [ ] **Step 4: Run GREEN and negative mutation checks**
 
@@ -131,16 +134,16 @@ Use `rtk git diff --check`, stage `state.rs`, `mod.rs`, and only the module-decl
 
 **Interfaces:**
 - Consumes `PlacementMachine::reduce`, `PlacementInput`, `PlacementEffect`, `Corner`, and `PhysicalFrame` from Task 1.
-- Produces `PanelPlacement::cycle()`, `snap(corner)`, `resize(height)`, `restore(legacy)`, `begin_drag()`, and `on_window_event(&tauri::WindowEvent)`. The first four accept intents and never return “arrived” from a setter result.
+- Produces `PanelPlacement::on_position_shortcut(state: ShortcutState)`, `snap(corner)`, `resize(height)`, `restore(legacy)`, `begin_drag()`, and `on_window_event(&tauri::WindowEvent)`. Both Pressed and Released reach the placement module; it owns the sole held-key latch. These methods accept intents and never return “arrived” from a setter result.
 - Produces Tauri commands `resize_panel(height:u32)`, `restore_panel_placement(legacy:Option<LegacyPlacement>)`, and `begin_panel_drag()`. Menu corner IDs and the position shortcut call the same module.
 - Keeps `PanelPlacement` state locked only for reducer transitions. A serialized executor performs returned `SetPosition`/`SetHeight` and `emit_to` effects after the lock **and** native event callback have returned.
 
 - [ ] **Step 1: Write a deferred-adapter RED test**
 
-Build a test adapter whose setters record calls but never mutate its frame; call `placement.cycle()` and assert there is no `placement-confirmed`, `Persist`, or updated confirmed snapshot. Then inject `placement.on_window_event(&WindowEvent::Moved(PhysicalPosition::new(1484, 16)))` and assert exactly one generation-1 confirmation with the event's coordinates. Add a reverse-order test: two presses with a release between, deliver generation 1's move after generation 2 was requested, then deliver generation 2; only generation 2 may confirm. Model `setSize()` returning while the old height remains and inject `Resized` later; a bottom re-anchor must use the new observed height.
+Build a test adapter whose setters record calls but never mutate its frame; call `placement.on_position_shortcut(ShortcutState::Pressed)` and assert there is no `placement-confirmed`, `Persist`, or updated confirmed snapshot. Then inject `placement.on_window_event(&WindowEvent::Moved(PhysicalPosition::new(1484, 16)))` and assert exactly one generation-1 confirmation with the event's coordinates. Add a reverse-order test: two presses with a release between, deliver generation 1's move after generation 2 was requested, then deliver generation 2; only generation 2 may confirm. Model `setSize()` returning while the old height remains and inject `Resized` later; a bottom re-anchor must use the new observed height.
 
 ```rust
-placement.cycle().unwrap();
+placement.on_position_shortcut(ShortcutState::Pressed).unwrap();
 assert_eq!(fake_window.requested_positions(), vec![(1484, 16)]);
 assert!(fake_events.confirmed().is_empty());
 fake_window.deliver_moved(1484, 16);
@@ -156,7 +159,7 @@ Run `rtk cargo test --manifest-path src-tauri/Cargo.toml panel_placement::adapte
 
 - [ ] **Step 3: Wire one native observation stream**
 
-Register `main.on_window_event` once in `lib.rs`, feeding only `WindowEvent::Moved(position)` and `WindowEvent::Resized(size)` to `PanelPlacement`. Route existing menu IDs through `snap(Corner)` and the WIP position hotkey through `cycle()`. Replace direct `window.set_position(...); window.outer_position()` acknowledgements and `anchor_panel_position` with accepted intents. Dispatch effects by FIFO channel on a worker so the event callback does not recursively call a setter; capture generation before dispatch:
+Register `main.on_window_event` once in `lib.rs`, feeding only `WindowEvent::Moved(position)` and `WindowEvent::Resized(size)` to `PanelPlacement`. Route existing menu IDs through `snap(Corner)` and both `Pressed` and `Released` from the WIP position hotkey through `on_position_shortcut`; remove its redundant atomic latch. Replace direct `window.set_position(...); window.outer_position()` acknowledgements and `anchor_panel_position` with accepted intents. Dispatch effects by FIFO channel on a worker so the event callback does not recursively call a setter; capture generation before dispatch:
 
 ```rust
 let effects = {
@@ -188,7 +191,7 @@ Stage exact `adapter.rs`, `mod.rs`, `lib.rs`, and `panel_shortcut.rs` paths/hunk
 
 **Interfaces:**
 - Consumes `PlacementSnapshot` from Task 1 and `PanelPlacement` from Task 2.
-- Produces `PlacementStore::load() -> Result<LoadOutcome, StoreError>` and `save_confirmed(&PlacementSnapshot) -> Result<(), StoreError>`, with `LoadOutcome::{Stored(PlacementSnapshot),Missing,Corrupt(String)}`.
+- Produces `PlacementStore::load() -> Result<LoadOutcome, StoreError>` and `save_confirmed(&PlacementSnapshot) -> Result<(), StoreError>`, with `LoadOutcome::{Stored(PlacementRecord),Missing,Corrupt(String)}`. The durable record does not encode runtime generation or window dimensions; restoration reconstructs them from the current native window and starts a fresh generation.
 - Produces `PlacementRecord { version:1, position:{x:i32,y:i32}, corner:Option<Corner> }` at `app.path().app_config_dir()?.join("placement.json")`. A corrupt/version-unsupported record is preserved, reported, and may fall back to the frontend-supplied legacy position; it is not treated as an empty valid record.
 
 - [ ] **Step 1: Write RED storage and restore tests**
@@ -204,7 +207,9 @@ let snapshot = PlacementSnapshot {
     frame: PhysicalFrame { x: -1904, y: 812, width: 420, height: 252 },
 };
 store.save_confirmed(&snapshot).unwrap();
-assert_eq!(store.load().unwrap(), LoadOutcome::Stored(snapshot));
+assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+    if record.version == 1 && record.position.x == -1904
+        && record.position.y == 812 && record.corner == Some(Corner::BottomLeft)));
 std::fs::write(&path, b"{invalid").unwrap();
 assert!(matches!(store.load().unwrap(), LoadOutcome::Corrupt(_)));
 assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
@@ -245,21 +250,22 @@ Stage exact `store.rs`, `mod.rs`, and affected `adapter.rs` hunks; `rtk git diff
 - Modify: `src/features/statusPanel/panelShortcut.ts`, `statusPanel.ts`, and their tests only if the WIP's default/normalization still diverges
 
 **Interfaces:**
-- Consumes `PanelPlacement::cycle()` from Task 2. Does not use `with_webview` for position movement.
+- Consumes `PanelPlacement::on_position_shortcut(state: ShortcutState)` from Task 2. Does not use `with_webview` for position movement.
 - Produces `configure_position_shortcut(shortcut: Option<String>) -> Result<PanelShortcutUpdate, PanelShortcutError>` alongside the existing `configure_panel_shortcut`; each action has a distinct active state under one registration lock.
 - Keeps `DEFAULT_POSITION_CYCLE_SHORTCUT = "shift+control+super+space"` in TypeScript. Native setup registers only the old expand/collapse default; frontend startup reconciles saved toggle **before** position.
 
 - [ ] **Step 1: Write RED tests for conflicts, held events, and priority**
 
-In `panel_shortcut.rs`, use the existing fake registrar to assert that position cannot claim the toggle's active combination, a failed position registration does not unregister toggle, a position no-op Apply preserves the `held` latch, a changed/cleared position shortcut resets it, and `Pressed, Pressed, Released, Pressed` yields exactly two `cycle()` requests. In a frontend component test, pre-save `panelToggleShortcut: "shift+control+super+space"`; assert startup invokes `configure_panel_shortcut` before `configure_position_shortcut` and reports a position conflict while leaving toggle active.
+In `panel_shortcut.rs`, use the existing fake registrar to assert that position cannot claim the toggle's active combination and a failed position registration does not unregister toggle. The reducer from Task 1 owns the only held latch: a position no-op Apply must not alter it, and `Pressed, Pressed, Released, Pressed` forwarded through Task 2's interface yields exactly two placement requests. In a frontend component test, pre-save `panelToggleShortcut: "shift+control+super+space"`; assert startup invokes `configure_panel_shortcut` before `configure_position_shortcut` and reports a position conflict while leaving toggle active.
 
 ```rust
-let held = AtomicBool::new(true);
-apply_action_shortcut_update_with_latch(
+placement.on_position_shortcut(ShortcutState::Pressed).unwrap();
+apply_action_shortcut_update(
     &mut registrations, ShortcutAction::Position,
-    Some("shift+control+super+space"), &held, &mut fake_registrar,
+    Some("shift+control+super+space"), &mut fake_registrar,
 ).unwrap();
-assert!(held.load(Ordering::Acquire));
+placement.on_position_shortcut(ShortcutState::Pressed).unwrap();
+assert_eq!(fake_window.requested_positions().len(), 1);
 assert!(fake_registrar.operations.is_empty());
 ```
 
@@ -269,7 +275,7 @@ Run `rtk cargo test --manifest-path src-tauri/Cargo.toml position_shortcut_` and
 
 - [ ] **Step 3: Retain the safe WIP and replace its unsafe edge**
 
-Keep the current composite native registrar's register-new-before-unregister-old and uncertain-state rules if the tests confirm them. Remove any native setup pre-registration of the new default. Send position `Pressed` to `PanelPlacement::cycle()`; `Released` clears only its held latch. Call neither `show` nor `set_focus`. Reconcile the two saved preferences in component order through the existing promise queue, and keep per-action requested/active/error presentation; a partial Settings failure commits the successful action but preserves the failed action's prior active value.
+Keep the current composite native registrar's register-new-before-unregister-old and uncertain-state rules if the tests confirm them. Remove any native setup pre-registration of the new default. Forward position `Pressed` and `Released` to `PanelPlacement::on_position_shortcut`; remove all registration-manager state that separately gates a held position key. Call neither `show` nor `set_focus`. Reconcile the two saved preferences in component order through the existing promise queue, and keep per-action requested/active/error presentation; a partial Settings failure commits the successful action but preserves the failed action's prior active value.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -290,7 +296,7 @@ Stage only `panel_shortcut.rs`, the setup hunk of `lib.rs`, and the intended sho
 
 **Interfaces:**
 - Consumes `restore_panel_placement`, `resize_panel`, `begin_panel_drag`, and `placement-confirmed`/failure events from Tasks 2–3.
-- Produces `restorePanelPlacement(legacy: LegacyPlacement | null): Promise<PlacementSnapshot>`, `resizePanel(height: number): Promise<{ generation: number }>`, and `beginPanelDrag(): Promise<void>` in `inboxApi.ts`. These promises report acceptance/current state, never prove that a window setter completed.
+- Produces `restorePanelPlacement(legacy: LegacyPlacement | null): Promise<PlacementSnapshot | null>`, `resizePanel(height: number): Promise<{ generation: number }>`, and `beginPanelDrag(): Promise<void>` in `inboxApi.ts`. The nullable restore result supports a browser-preview no-op; these promises report acceptance/current state, never prove that a window setter completed.
 - Produces `PlacementConfirmed { generation:number, corner:PanelCorner|null, position:{x:number,y:number}, size:{width:number,height:number} }`. Frontend stores shortcut preferences as before; native storage owns placement after migration.
 
 - [ ] **Step 1: Write RED frontend tests at the real caller**
