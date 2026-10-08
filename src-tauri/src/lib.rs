@@ -2,6 +2,7 @@ pub mod codex_source;
 pub mod codex_hooks;
 pub mod domain;
 pub mod inbox_store;
+pub mod panel_placement;
 #[cfg(desktop)]
 pub mod panel_shortcut;
 
