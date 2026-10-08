@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{mpsc, Arc};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -161,6 +161,7 @@ impl PanelPlacement {
             PlacementWorker {
                 machine: PlacementMachine::new(observed, saved), window,
                 sender: worker_sender, deadlines: BTreeMap::new(), watchdog,
+                reported_failures: BTreeSet::new(),
                 persisted: None, legacy: None, restoration_requested: false,
             }.run(receiver);
         }).map_err(|error| format!("placement worker unavailable: {error}"))?;
@@ -217,6 +218,7 @@ struct PlacementWorker {
     window: Arc<dyn WindowPort>,
     sender: Sender<WorkerMessage>,
     deadlines: BTreeMap<u64, Instant>,
+    reported_failures: BTreeSet<u64>,
     watchdog: Duration,
     // In-memory sink only; Task 3 owns durable persistence.
     persisted: Option<PlacementSnapshot>,
@@ -281,7 +283,6 @@ impl PlacementWorker {
         });
         let effects = self.machine.reduce(input, &displays);
         let mut generation = None;
-        let mut rejected = Vec::new();
         for effect in effects {
             let native = match effect {
                 PlacementEffect::SetPosition { generation: value, x, y } => {
@@ -305,7 +306,9 @@ impl PlacementWorker {
                 }
                 PlacementEffect::ScheduleWatchdog(value) => {
                     generation = Some(value);
-                    if !rejected.contains(&value) {
+                    // Late observations still reassert the desired geometry,
+                    // but a failed generation must not arm another failure.
+                    if !self.reported_failures.contains(&value) {
                         self.deadlines.entry(value).or_insert_with(|| Instant::now() + self.watchdog);
                     }
                     continue;
@@ -317,7 +320,6 @@ impl PlacementWorker {
             };
             if let Err(error) = self.window.dispatch(native, self.sender.clone()) {
                 if let Some(value) = setter_generation {
-                    rejected.push(value);
                     self.report(value, format!("dispatch-failed: {error}"));
                 } else {
                     eprintln!("panel placement event dispatch failed: {error}");
@@ -329,6 +331,9 @@ impl PlacementWorker {
 
     fn report(&mut self, generation: u64, reason: String) {
         self.deadlines.remove(&generation);
+        if !self.reported_failures.insert(generation) {
+            return;
+        }
         eprintln!("panel placement generation {generation} unconfirmed: {reason}");
         if let Err(error) = self.window.dispatch(
             NativeEffect::ReportUnconfirmed(UnconfirmedPlacement { generation, reason }), self.sender.clone(),
@@ -560,6 +565,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         inspect(&placement);
         assert_eq!(window.calls.lock().unwrap().unconfirmed.len(), 1);
+    }
+
+    fn wait_for_failures(window: &DeferredWindow, count: usize) {
+        let limit = Instant::now() + Duration::from_secs(2);
+        while window.calls.lock().unwrap().unconfirmed.len() < count {
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn timeout_then_late_native_events_does_not_report_generation_twice() {
+        let (placement, window) = setup_window(STRIP, None, vec![DISPLAY], 1.0, false, Duration::from_millis(10));
+        placement.snap(Corner::TopRight).unwrap();
+        wait_for_failures(&window, 1);
+        assert_eq!(window.calls.lock().unwrap().unconfirmed[0].generation, 1);
+
+        // Both unmatched observations reconcile generation 1 and request another
+        // watchdog. The target must still converge without repeating its failure.
+        moved(&placement, 310, 205);
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 50))).unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().positions.last(), Some(&(1484, 16)));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(inspect(&placement).persisted, None);
+        assert_eq!(window.calls.lock().unwrap().unconfirmed.len(), 1);
+
+        moved(&placement, 1484, 16);
+        assert_eq!(inspect(&placement).persisted.unwrap().generation, 1);
+        assert_eq!(window.calls.lock().unwrap().confirmed.len(), 1);
+    }
+
+    #[test]
+    fn timeout_then_late_dispatch_failure_does_not_report_generation_twice() {
+        let (placement, window) = setup_window(STRIP, None, vec![DISPLAY], 1.0, false, Duration::from_millis(10));
+        placement.snap(Corner::TopRight).unwrap();
+        wait_for_failures(&window, 1);
+        placement.sender.send(WorkerMessage::DispatchFailed {
+            generation: 1, reason: "dispatch-failed: delayed rejection".into(),
+        }).unwrap();
+        assert_eq!(inspect(&placement).persisted, None);
+        assert_eq!(window.calls.lock().unwrap().unconfirmed.len(), 1);
+
+        // A later, distinct generation still gets its own failure report.
+        placement.snap(Corner::BottomRight).unwrap();
+        wait_for_failures(&window, 2);
+        assert_eq!(window.calls.lock().unwrap().unconfirmed.iter()
+            .map(|failure| failure.generation).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]
