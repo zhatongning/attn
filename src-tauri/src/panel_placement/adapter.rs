@@ -860,6 +860,41 @@ mod tests {
     }
 
     #[test]
+    fn second_snap_after_fractional_crossing_preserves_exact_logical_size() {
+        let (placement, window) = queued_size_setup();
+        *window.inner.scale.lock().unwrap() = 1.25;
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        placement.resize(54).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        let latest = window.sizes.lock().unwrap().remove(1).to_physical::<u32>(1.25);
+        placement.on_window_event(&tauri::WindowEvent::Resized(latest)).unwrap();
+        inspect(&placement);
+        placement.snap(Corner::TopLeft).unwrap();
+        inspect(&placement);
+        moved(&placement, 20, 20);
+        let confirmed = inspect(&placement).persisted.unwrap();
+        assert_eq!(confirmed.frame.height, 68);
+
+        // The new Snap precedes any new-scale size observation. Rescaling the
+        // old observed 68 gives 82, but the preserved logical intent gives 81.
+        *window.inner.scale.lock().unwrap() = 1.5;
+        placement.snap(Corner::TopLeft).unwrap();
+        inspect(&placement);
+        let obsolete = window.sizes.lock().unwrap().remove(0).to_physical::<u32>(1.5);
+        placement.on_window_event(&tauri::WindowEvent::Resized(obsolete)).unwrap();
+        assert_eq!(inspect(&placement).persisted, Some(confirmed));
+        let reasserted = window.sizes.lock().unwrap().remove(0).to_physical::<u32>(1.5);
+        assert_eq!(reasserted, PhysicalSize::new(630, 81));
+        placement.on_window_event(&tauri::WindowEvent::Resized(reasserted)).unwrap();
+        inspect(&placement);
+        moved(&placement, 24, 24);
+        let snapshot = inspect(&placement).persisted.unwrap();
+        assert_eq!(snapshot.frame, PhysicalFrame { x: 24, y: 24, width: 630, height: 81 },
+            "the second Snap must preserve exact logical dimensions until native arrival");
+        assert_eq!(snapshot.generation, confirmed.generation + 1);
+        assert!(window.sizes.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn queued_fractional_scale_resize_confirms_exact_logical_intent_after_crossing() {
         let (placement, window) = queued_size_setup();
         *window.inner.scale.lock().unwrap() = 1.25;

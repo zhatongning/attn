@@ -438,9 +438,14 @@ impl PlacementMachine {
             generation: self.generation,
             corner: Some(corner),
             frame: self.observed,
-            required_width: self.desired.and_then(|target| target.required_width)
+            // Rescaling may leave the last observed dimensions rounded
+            // differently from exact logical intent. Preserve that intent
+            // across a corner command until the native size is observed.
+            required_width: self.desired.and_then(|target| target.required_width
+                .or_else(|| target.logical_size.map(|_| target.frame.width)))
                 .filter(|width| *width != self.observed.width || !self.pending_sizes.is_empty()),
-            required_height: self.desired.and_then(|target| target.required_height)
+            required_height: self.desired.and_then(|target| target.required_height
+                .or_else(|| target.logical_size.map(|_| target.frame.height)))
                 .filter(|height| *height != self.observed.height || !self.pending_sizes.is_empty()),
             logical_size: self.desired.and_then(|target| target.logical_size),
             display: self.display(displays).copied(),
