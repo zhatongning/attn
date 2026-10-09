@@ -342,8 +342,50 @@ Run the focused tests, `rtk npm test -- --run`, and `rtk npm run build`. Confirm
 
 Stage exact frontend files and `docs/window-placement.md`; verify `rtk git diff --cached --check`; commit `feat: show only confirmed panel position`. Preserve old source/status work already committed and do not stage `main-BIHCWhv-.js`.
 
+### Task 6: Close the reviewed resize-event and mixed-DPI scale races
+
+This is the user-approved follow-up to the final review at `8c62260`, not a
+change to the feature's interaction design. The two remaining Important
+findings and their original evidence are recorded in this plan's SDD ledger.
+
+**Files:** `src-tauri/src/panel_placement/state.rs` and
+`src-tauri/src/panel_placement/adapter.rs`, including their existing tests.
+Expand ownership only for a directly necessary interface or regression test;
+preserve the unrelated untracked file and existing shortcut/frontend behavior.
+
+- [ ] **Step 1: Reproduce the two failures before changing production code**
+
+Trace the native event and setter path, including Tauri's current-size
+substitution for queued `Resized` callbacks and Tao's conversion at setter
+execution. Add behavior tests through the existing reducer and deferred native
+adapter: request sizes `252` then `420` and deliver only the latest observed
+size; after that confirmation, a late obsolete size must reassert the latest
+intent rather than persist the stale frame. Cover a queued setter that crosses
+from 2× to 1×, as well as scale values changing between the calls made for
+one logical resize request. Record the failing assertions and distinguish an
+unconfirmed timeout from a successful OS observation.
+
+- [ ] **Step 2: Fix intent retirement and coherent scale conversion**
+
+Retire superseded size requests without treating every intermediate native
+observation as mandatory. Keep late-arrival provenance sufficient to reconcile
+an obsolete setter without persisting its frame; a missing/coalesced old event
+cannot permanently block future size or corner confirmation. Preserve logical
+dimensions until one coherent scale snapshot converts an individual request,
+and use that same scale for the reducer and display geometry participating in
+that transition. Reconcile a queued native setter executing after a display
+scale change; setter return alone must never confirm or persist.
+
+- [ ] **Step 3: Verify and commit the scoped repair**
+
+Run focused reducer/adapter tests, the complete Rust and frontend suites,
+`cargo check`, frontend build, and `git diff --check`. Self-review the exact
+diff for stale generations, late observations, repeat dispatch, callback
+reentrancy, and hidden-window focus. Commit only the scoped files and report
+the RED/GREEN evidence. No app launch, install, replacement, or push.
+
 ## Final verification and delivery gate
 
-After Tasks 1–5, run fresh `rtk cargo test --manifest-path src-tauri/Cargo.toml`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, `rtk npm test -- --run`, `rtk npm run build`, `rtk git diff --check`, and an app-only `rtk npm run tauri build -- --bundles app --ci`. If `rustfmt` is unavailable, record that limitation and manually inspect touched Rust formatting; do not claim a formatting check passed.
+After Tasks 1–6, run fresh `rtk cargo test --manifest-path src-tauri/Cargo.toml`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, `rtk npm test -- --run`, `rtk npm run build`, `rtk git diff --check`, and an app-only `rtk npm run tauri build -- --bundles app --ci`. If `rustfmt` is unavailable, record that limitation and manually inspect touched Rust formatting; do not claim a formatting check passed.
 
 Review the complete feature diff against `ef0a95a` and all WIP replacements, with particular attention to event reentrancy, confirmed-vs-requested UI, physical/display coordinate conversion, stale generations, storage failures, and no hidden-window focus theft. A build and mocked tests are not packaged macOS proof. Before a manual run that would conflict with the already installed App's global shortcuts, ask for the separate delivery/temporary-stop decision. Never overwrite `/Applications/Attn.app` as a normal plan step; after separate authorization, retain a timestamped backup and compare build, installed, and running executable hashes.
