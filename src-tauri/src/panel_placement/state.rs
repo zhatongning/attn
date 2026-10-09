@@ -77,6 +77,7 @@ struct Target {
     frame: PhysicalFrame,
     required_width: Option<u32>,
     required_height: Option<u32>,
+    logical_size: Option<(u32, u32)>,
     display: Option<DisplayFrame>,
 }
 
@@ -93,6 +94,7 @@ struct PendingSize {
     generation: u64,
     width: u32,
     height: u32,
+    logical_size: Option<(u32, u32)>,
 }
 
 /// Setters are requests. Only native observations (or a verified no-op) confirm.
@@ -151,6 +153,23 @@ impl PlacementMachine {
         self.desired.and_then(|target| target.required_width).unwrap_or(self.observed.width)
     }
 
+    pub fn requested_logical_size(&self) -> Option<(u32, u32)> {
+        self.desired.and_then(|target| target.logical_size)
+    }
+
+    /// Tag an accepted physical request with its exact IPC dimensions. Keep
+    /// each superseded setter's dimensions too, for late-arrival provenance.
+    pub fn remember_logical_size(&mut self, width: u32, height: u32) {
+        if let Some(target) = self.desired.as_mut() {
+            target.logical_size = Some((width, height));
+            for pending in self.pending_sizes.iter_mut()
+                .filter(|pending| pending.generation == target.generation)
+            {
+                pending.logical_size = target.logical_size;
+            }
+        }
+    }
+
     pub fn size_dispatch_failed(&mut self, generation: u64) {
         // A rejected setter cannot produce a native resize observation. Keep
         // the desired size, but let the next explicit request issue a retry.
@@ -176,6 +195,10 @@ impl PlacementMachine {
                 .map(|width| rescale_dimension(width, old_scale, new_scale));
             target.required_height = target.required_height
                 .map(|height| rescale_dimension(height, old_scale, new_scale));
+            if let Some((width, height)) = target.logical_size {
+                target.required_width = target.required_width.map(|_| logical_dimension(width, new_scale));
+                target.required_height = target.required_height.map(|_| logical_dimension(height, new_scale));
+            }
             if let Some(display) = target.display.as_mut() {
                 *display = rescale_display(*display, old_scale, new_scale);
             }
@@ -185,8 +208,13 @@ impl PlacementMachine {
             pending.y = rescale_coordinate(pending.y, old_scale, new_scale);
         }
         for pending in self.pending_sizes.iter_mut().chain(self.retired_sizes.iter_mut()) {
-            pending.width = rescale_dimension(pending.width, old_scale, new_scale);
-            pending.height = rescale_dimension(pending.height, old_scale, new_scale);
+            if let Some((width, height)) = pending.logical_size {
+                pending.width = logical_dimension(width, new_scale);
+                pending.height = logical_dimension(height, new_scale);
+            } else {
+                pending.width = rescale_dimension(pending.width, old_scale, new_scale);
+                pending.height = rescale_dimension(pending.height, old_scale, new_scale);
+            }
         }
     }
 
@@ -238,6 +266,7 @@ impl PlacementMachine {
                     } else { self.observed },
                     required_width: Some(width),
                     required_height: Some(height),
+                    logical_size: None,
                     display: self.desired.and_then(|target| target.display)
                         .or_else(|| self.display(displays).copied()),
                 });
@@ -319,6 +348,17 @@ impl PlacementMachine {
                 {
                     self.retired_sizes.remove(index)
                 } else { None };
+                if self.desired.is_some_and(|target|
+                    (target.required_width.is_some() || target.required_height.is_some())
+                    && target.required_width.is_none_or(|value| value == width)
+                    && target.required_height.is_none_or(|value| value == height))
+                {
+                    // Tauri substitutes the current size for queued macOS
+                    // callbacks. Observing the latest intent retires all older
+                    // setters even if their intermediate events were coalesced.
+                    // Retain provenance so a late obsolete arrival is corrected.
+                    self.retired_sizes.extend(self.pending_sizes.drain(..));
+                }
                 if self.dragging && !self.drag_moved && self.drag_interrupted
                     && self.desired.is_some_and(|target| target.generation <= self.drag_generation)
                 {
@@ -332,6 +372,7 @@ impl PlacementMachine {
                         frame: self.observed,
                         required_width: None,
                         required_height: None,
+                        logical_size: None,
                         display: self.display(displays).copied(),
                     });
                 } else if !self.waiting && !unchanged && arrival.is_none() {
@@ -340,10 +381,17 @@ impl PlacementMachine {
                         target.generation = self.generation;
                         target.required_width = None;
                         target.required_height = None;
+                        target.logical_size = None;
                     }
                 } else if arrival.is_some_and(|pending| pending.generation < self.generation) && !unchanged {
                     // A delayed native resize is still programmatic after a
-                    // newer no-op confirmation; converge on the latest size.
+                    // newer no-op confirmation. A subsequent corner command
+                    // may have cleared satisfied size requirements; restore
+                    // them from its last intended frame, not the stale arrival.
+                    if let Some(target) = self.desired.as_mut() {
+                        target.required_width.get_or_insert(target.frame.width);
+                        target.required_height.get_or_insert(target.frame.height);
+                    }
                     self.waiting = true;
                 }
                 self.reconcile(displays)
@@ -388,6 +436,7 @@ impl PlacementMachine {
                 .filter(|width| *width != self.observed.width || !self.pending_sizes.is_empty()),
             required_height: self.desired.and_then(|target| target.required_height)
                 .filter(|height| *height != self.observed.height || !self.pending_sizes.is_empty()),
+            logical_size: self.desired.and_then(|target| target.logical_size),
             display: self.display(displays).copied(),
         });
         self.reconcile(displays)
@@ -416,6 +465,7 @@ impl PlacementMachine {
             generation: self.generation, corner: None, frame,
             required_width: None,
             required_height: None, display,
+            logical_size: None,
         });
         self.reconcile(displays)
     }
@@ -433,6 +483,7 @@ impl PlacementMachine {
             }
             self.pending_sizes.push_back(PendingSize {
                 generation: target.generation, width: requested_width, height: requested_height,
+                logical_size: target.logical_size,
             });
             return vec![
                 PlacementEffect::SetHeight { generation: target.generation, height: requested_height },
@@ -533,6 +584,7 @@ impl PlacementMachine {
         self.desired = Some(Target {
             generation: self.generation, corner: None, frame: self.observed, required_height: None,
             required_width: None,
+            logical_size: None,
             display: None,
         });
         self.confirm()
@@ -552,6 +604,10 @@ fn rescale_coordinate(value: i32, old_scale: f64, new_scale: f64) -> i32 {
 fn rescale_dimension(value: u32, old_scale: f64, new_scale: f64) -> u32 {
     ((f64::from(value) / old_scale) * new_scale).round()
         .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn logical_dimension(value: u32, scale: f64) -> u32 {
+    (f64::from(value) * scale).round().clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
 fn rescale_frame(frame: PhysicalFrame, old_scale: f64, new_scale: f64) -> PhysicalFrame {
@@ -758,6 +814,58 @@ mod tests {
             generation: 2, corner: Some(Corner::BottomRight),
             frame: PhysicalFrame { x: 1484, y: 812, width: 420, height: 252 },
         })));
+    }
+
+    #[test]
+    fn coalesced_latest_resize_retires_obsolete_sizes_and_guards_late_arrival() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &DISPLAYS);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 420 }, &DISPLAYS);
+        assert_eq!(machine.reduce(PlacementInput::TimedOut(2), &DISPLAYS),
+            vec![PlacementEffect::ReportUnconfirmed(2)]);
+        assert_eq!(machine.confirmed(), None, "timeout is not a native observation");
+        // macOS Tauri can substitute the current size for both queued callbacks.
+        let latest = machine.reduce(PlacementInput::Resized { width: 420, height: 420 }, &DISPLAYS);
+        assert!(confirms(&latest), "latest native size must not await omitted 252 observation");
+        let confirmed = machine.confirmed().unwrap();
+        assert_eq!((confirmed.generation, confirmed.frame.height), (2, 420));
+        assert!(machine.reduce(PlacementInput::TimedOut(2), &DISPLAYS).is_empty());
+        let late = machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &DISPLAYS);
+        assert!(!confirms(&late));
+        assert_eq!(machine.confirmed(), Some(confirmed));
+        assert!(late.contains(&PlacementEffect::SetHeight { generation: 2, height: 420 }));
+        assert!(confirms(&machine.reduce(PlacementInput::Resized { width: 420, height: 420 }, &DISPLAYS)));
+        assert!(confirms(&machine.reduce(PlacementInput::Snap(Corner::TopLeft), &DISPLAYS)));
+    }
+
+    #[test]
+    fn coalesced_size_observation_unblocks_latest_bottom_corner_and_future_resize() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &DISPLAYS);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 420 }, &DISPLAYS);
+        machine.reduce(PlacementInput::Snap(Corner::BottomRight), &DISPLAYS);
+        let size = machine.reduce(PlacementInput::Resized { width: 420, height: 420 }, &DISPLAYS);
+        assert!(size.contains(&PlacementEffect::SetPosition { generation: 3, x: 1484, y: 644 }));
+        assert!(!confirms(&size));
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 1484, y: 644 }, &DISPLAYS)));
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &DISPLAYS);
+        machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &DISPLAYS);
+        assert!(confirms(&machine.reduce(PlacementInput::Moved { x: 1484, y: 812 }, &DISPLAYS)));
+        assert_eq!(machine.confirmed().unwrap().generation, 4);
+    }
+
+    #[test]
+    fn obsolete_resize_after_confirmed_corner_noop_reasserts_latest_size() {
+        let mut machine = PlacementMachine::new(STRIP, None);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 252 }, &DISPLAYS);
+        machine.reduce(PlacementInput::ResizeRequested { width: 420, height: 420 }, &DISPLAYS);
+        machine.reduce(PlacementInput::Resized { width: 420, height: 420 }, &DISPLAYS);
+        machine.reduce(PlacementInput::Snap(Corner::TopLeft), &DISPLAYS);
+        let latest = machine.confirmed().unwrap();
+        let late = machine.reduce(PlacementInput::Resized { width: 420, height: 252 }, &DISPLAYS);
+        assert!(!confirms(&late), "a later corner no-op must retain obsolete size provenance");
+        assert_eq!(machine.confirmed(), Some(latest));
+        assert!(late.contains(&PlacementEffect::SetHeight { generation: 3, height: 420 }));
     }
 
     #[test]
