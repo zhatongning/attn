@@ -14,15 +14,19 @@ pub struct PlacementPosition {
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PlacementRecord {
     pub version: u32,
     pub position: PlacementPosition,
     #[serde(deserialize_with = "Option::deserialize")]
     pub corner: Option<Corner>,
+    /// Tao's physical desktop coordinates use the window's backing scale.
+    /// Absent only in legacy v1 records, whose source scale is unrecoverable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LoadOutcome {
     Stored(PlacementRecord),
     Missing,
@@ -34,6 +38,7 @@ pub enum StoreError {
     Io(io::Error),
     Serialize(serde_json::Error),
     ConcurrentWrite { generation: u64, latest: u64 },
+    InvalidScale,
 }
 
 impl fmt::Display for StoreError {
@@ -44,6 +49,7 @@ impl fmt::Display for StoreError {
             Self::ConcurrentWrite { generation, latest } => write!(
                 f, "stale placement generation {generation} cannot replace {latest}"
             ),
+            Self::InvalidScale => write!(f, "placement coordinate scale must be finite and positive"),
         }
     }
 }
@@ -77,13 +83,27 @@ impl PlacementStore {
             Err(error) => return Err(error.into()),
         };
         match serde_json::from_slice::<PlacementRecord>(&bytes) {
-            Ok(record) if record.version == 1 => Ok(LoadOutcome::Stored(record)),
+            Ok(record) if record.version == 1 => {
+                if record.scale_factor.is_some_and(|scale| !scale.is_finite() || scale <= 0.0) {
+                    Ok(LoadOutcome::Corrupt("invalid placement coordinate scale".into()))
+                } else {
+                    Ok(LoadOutcome::Stored(record))
+                }
+            }
             Ok(record) => Ok(LoadOutcome::Corrupt(format!("unsupported placement version {}", record.version))),
             Err(error) => Ok(LoadOutcome::Corrupt(error.to_string())),
         }
     }
 
-    pub fn save_confirmed(&self, snapshot: &PlacementSnapshot) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(super) fn save_confirmed(&self, snapshot: &PlacementSnapshot) -> Result<(), StoreError> {
+        self.save_confirmed_at_scale(snapshot, 1.0)
+    }
+
+    pub fn save_confirmed_at_scale(&self, snapshot: &PlacementSnapshot, scale: f64) -> Result<(), StoreError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(StoreError::InvalidScale);
+        }
         let mut latest = self.writes.lock().expect("placement store lock poisoned");
         if let Some(generation) = *latest {
             if snapshot.generation < generation {
@@ -94,6 +114,7 @@ impl PlacementStore {
             version: 1,
             position: PlacementPosition { x: snapshot.frame.x, y: snapshot.frame.y },
             corner: snapshot.corner,
+            scale_factor: Some(scale),
         };
         let parent = self.path.parent().filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
@@ -111,6 +132,60 @@ impl PlacementStore {
 mod tests {
     use super::*;
     use crate::panel_placement::state::{Corner, PhysicalFrame, PlacementSnapshot};
+
+    #[test]
+    fn saved_scale_basis_survives_record_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        std::fs::write(&path,
+            br#"{"version":1,"position":{"x":2912,"y":32},"corner":"top-left","scale_factor":2.0}"#).unwrap();
+        let LoadOutcome::Stored(record) = PlacementStore::new(path).load().unwrap() else {
+            panic!("a supported scale-bearing record must load");
+        };
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value.get("scale_factor"), Some(&serde_json::json!(2.0)),
+            "restart must retain the physical coordinate scale basis");
+    }
+
+    #[test]
+    fn scale_bearing_confirmed_writes_are_atomic_and_keep_generation_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PlacementStore::new(dir.path().join("placement.json"));
+        let frame = PhysicalFrame { x: 2912, y: 32, width: 840, height: 100 };
+        let snapshot = PlacementSnapshot { generation: 2, corner: Some(Corner::TopLeft), frame };
+        store.save_confirmed_at_scale(&snapshot, 2.0).unwrap();
+        let expected = store.load().unwrap();
+        assert!(matches!(expected, LoadOutcome::Stored(record)
+            if record.scale_factor == Some(2.0) && record.position.x == 2912));
+        assert!(matches!(store.save_confirmed_at_scale(&PlacementSnapshot { generation: 1, ..snapshot }, 1.0),
+            Err(StoreError::ConcurrentWrite { .. })));
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(store.save_confirmed_at_scale(&snapshot, invalid), Err(StoreError::InvalidScale)));
+            assert_eq!(store.load().unwrap(), expected);
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn scale_less_v1_still_loads_and_invalid_scale_bytes_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        let store = PlacementStore::new(path.clone());
+        let legacy = br#"{"version":1,"position":{"x":1456,"y":16},"corner":"top-left"}"#;
+        std::fs::write(&path, legacy).unwrap();
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.scale_factor.is_none() && record.position.x == 1456));
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        for bytes in [
+            br#"{"version":1,"position":{"x":1456,"y":16},"corner":null,"scale_factor":0}"#.as_slice(),
+            br#"{"version":1,"position":{"x":1456,"y":16},"corner":null,"scale_factor":-1}"#.as_slice(),
+            br#"{"version":1,"position":{"x":1456,"y":16},"corner":null,"scale_factor":1e999}"#.as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(matches!(store.load().unwrap(), LoadOutcome::Corrupt(_)));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
 
     #[test]
     fn saves_and_loads_only_durable_confirmed_fields() {

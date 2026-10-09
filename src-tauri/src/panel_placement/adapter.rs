@@ -402,7 +402,8 @@ impl PlacementWorker {
                     if !self.placement_active { continue; }
                     // Both transition effects and fsync/rename run on this
                     // worker, so no late background write can race a new drag.
-                    let result = self.store.as_ref().map_or(Ok(()), |store| store.save_confirmed(&snapshot));
+                    let result = self.store.as_ref().map_or(Ok(()), |store|
+                        store.save_confirmed_at_scale(&snapshot, self.observed_scale));
                     match result {
                         Ok(()) => self.persisted = Some(snapshot),
                         Err(error) => self.report_persistence_error(snapshot.generation, error.to_string()),
@@ -450,9 +451,20 @@ impl PlacementWorker {
         match self.loaded.clone() {
             Ok(LoadOutcome::Stored(record)) => {
                 self.placement_active = true;
-                self.transition(PlacementInput::RestorePosition {
-                    x: record.position.x, y: record.position.y, corner: record.corner,
-                });
+                // Convert before monitor selection using the same scale that
+                // will normalize live display geometry and reduce restoration.
+                let scale = self.window.scale_factor().unwrap_or(self.observed_scale);
+                let position = PhysicalPosition::new(record.position.x, record.position.y);
+                let position = if let Some(saved_scale) = record.scale_factor {
+                    position.to_logical::<f64>(saved_scale).to_physical::<i32>(scale)
+                } else {
+                    self.report_persistence_error(0,
+                        "legacy placement coordinate scale unavailable; restoring best-effort, same-display recovery cannot be guaranteed".into());
+                    position
+                };
+                self.transition_at_scale(PlacementInput::RestorePosition {
+                    x: position.x, y: position.y, corner: record.corner,
+                }, scale, None);
             }
             Ok(outcome) => {
                 self.placement_active = true;
@@ -659,6 +671,80 @@ mod tests {
         assert!(window.calls.lock().unwrap().confirmed.is_empty());
         moved(&placement, 1484, 1014);
         assert_eq!(window.calls.lock().unwrap().confirmed.iter().map(|s| s.generation).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn accepted_resize_before_click_only_drag_reanchors_after_native_resize() {
+        let bottom = PhysicalFrame { x: 1484, y: 1014, ..STRIP };
+        let saved = PlacementSnapshot { generation: 1, corner: Some(Corner::BottomRight), frame: bottom };
+        let (placement, window) = setup(bottom, Some(saved));
+        let receipt = placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        placement.begin_drag().unwrap();
+        assert_eq!(inspect(&placement).confirmed, Some(saved));
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        assert_eq!(inspect(&placement).persisted, None);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(1484, 812)],
+            "a header click must not cancel the accepted bottom resize");
+        moved(&placement, 1484, 812);
+        let confirmed = inspect(&placement).persisted.unwrap();
+        assert_eq!((confirmed.generation, confirmed.corner, confirmed.frame.height),
+            (receipt.generation, Some(Corner::BottomRight), 252));
+    }
+
+    #[test]
+    fn accepted_resize_survives_manual_drag_and_delayed_native_size() {
+        let bottom = PhysicalFrame { x: 1484, y: 1014, ..STRIP };
+        let saved = PlacementSnapshot { generation: 1, corner: Some(Corner::BottomRight), frame: bottom };
+        let (placement, window) = setup(bottom, Some(saved));
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        placement.begin_drag().unwrap();
+        moved(&placement, 700, 400);
+        let manual = inspect(&placement).persisted.unwrap();
+        assert_eq!((manual.corner, manual.frame.height), (None, 50));
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        let confirmed = inspect(&placement).persisted.unwrap();
+        assert_eq!(confirmed.frame, PhysicalFrame { x: 700, y: 400, width: 420, height: 252 },
+            "manual position must retain the accepted size after its native arrival");
+        assert_eq!(confirmed.corner, None);
+        assert_eq!(window.calls.lock().unwrap().heights, vec![(420, 252)]);
+        assert!(window.calls.lock().unwrap().positions.is_empty());
+    }
+
+    #[test]
+    fn click_only_drag_keeps_size_intent_through_unmatched_resize_observation() {
+        let bottom = PhysicalFrame { x: 1484, y: 1014, ..STRIP };
+        let saved = PlacementSnapshot { generation: 1, corner: Some(Corner::BottomRight), frame: bottom };
+        let (placement, window) = setup(bottom, Some(saved));
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        placement.begin_drag().unwrap();
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 300))).unwrap();
+        assert_eq!(inspect(&placement).persisted, None);
+        assert!(window.calls.lock().unwrap().positions.is_empty(),
+            "an unrelated size observation cannot replace the accepted size during a header click");
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        inspect(&placement);
+        assert_eq!(window.calls.lock().unwrap().positions.last(), Some(&(1484, 812)));
+        moved(&placement, 1484, 812);
+        assert_eq!(inspect(&placement).persisted.unwrap().frame.height, 252);
+    }
+
+    #[test]
+    fn manual_position_confirmation_keeps_pending_resize_watchdog_and_late_recovery() {
+        let (placement, window) = setup_window(STRIP, None, vec![DISPLAY], 1.0,
+            false, Duration::from_millis(100));
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        placement.begin_drag().unwrap();
+        moved(&placement, 700, 400);
+        let manual = inspect(&placement).persisted.unwrap();
+        wait_for_failures(&window, 1);
+        let failed_generation = window.calls.lock().unwrap().unconfirmed[0].generation;
+        assert!(failed_generation > manual.generation,
+            "pending size failure must remain newer than the confirmed manual position");
+        assert_eq!(inspect(&placement).persisted, Some(manual));
+        placement.on_window_event(&tauri::WindowEvent::Resized(PhysicalSize::new(420, 252))).unwrap();
+        let resized = inspect(&placement).persisted.unwrap();
+        assert_eq!(resized.generation, failed_generation);
+        assert_eq!(resized.frame, PhysicalFrame { x: 700, y: 400, width: 420, height: 252 });
     }
 
     #[test]
@@ -1195,8 +1281,15 @@ mod tests {
         frame: PhysicalFrame, store: Arc<PlacementStore>, displays: Vec<DisplayFrame>,
         current: Option<DisplayFrame>, primary: Option<DisplayFrame>, consume_confirmation: bool,
     ) -> (PanelPlacement, Arc<DeferredWindow>) {
+        setup_store_at_scale(frame, store, displays, current, primary, consume_confirmation, 1.0)
+    }
+
+    fn setup_store_at_scale(
+        frame: PhysicalFrame, store: Arc<PlacementStore>, displays: Vec<DisplayFrame>,
+        current: Option<DisplayFrame>, primary: Option<DisplayFrame>, consume_confirmation: bool, scale: f64,
+    ) -> (PanelPlacement, Arc<DeferredWindow>) {
         let window = Arc::new(DeferredWindow {
-            calls: Mutex::new(Calls::default()), displays, scale: Mutex::new(1.0), reject_position: false,
+            calls: Mutex::new(Calls::default()), displays, scale: Mutex::new(scale), reject_position: false,
             reject_size: Mutex::new(false),
             current: Mutex::new(current), primary, consume_confirmation,
         });
@@ -1204,6 +1297,112 @@ mod tests {
             window.clone(), frame, None, Duration::from_secs(3), Some(store),
         ).unwrap();
         (placement, window)
+    }
+
+    #[test]
+    fn mixed_dpi_restart_restores_saved_display_in_startup_window_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        let primary = DisplayFrame { width: 2880, height: 1800, scale_factor: 2.0, ..DISPLAY };
+        let external = DisplayFrame { x: 1440, ..DISPLAY };
+        let inventory = vec![primary, external];
+        let frame = PhysicalFrame { x: 1456, y: 16, ..STRIP };
+        let store = Arc::new(PlacementStore::new(path.clone()));
+        let (first, _) = setup_store(frame, store.clone(), inventory.clone(), Some(external), Some(primary), true);
+        first.snap(Corner::TopLeft).unwrap();
+        assert_eq!(inspect(&first).persisted.unwrap().frame, frame);
+        drop(first);
+
+        let restarted_store = Arc::new(PlacementStore::new(path));
+        let startup = PhysicalFrame { x: 32, y: 32, width: 840, height: 100 };
+        let (restarted, window) = setup_store_at_scale(startup, restarted_store.clone(), inventory,
+            Some(primary), Some(primary), true, 2.0);
+        restarted.restore(None).unwrap();
+        assert_eq!(inspect(&restarted).persisted, None);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(2912, 32)],
+            "saved 1x external x1456 must restore beyond the 2x primary ending at x2880");
+        // Crossing onto the external changes the observation plane back to 1x.
+        *window.scale.lock().unwrap() = 1.0;
+        *window.current.lock().unwrap() = Some(external);
+        moved(&restarted, 1456, 16);
+        let confirmed = inspect(&restarted).persisted.unwrap();
+        assert_eq!((confirmed.corner, confirmed.frame), (Some(Corner::TopLeft), frame));
+        assert!(matches!(restarted_store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.position.x == 1456 && record.scale_factor == Some(1.0)));
+    }
+
+    #[test]
+    fn mixed_dpi_restart_from_2x_external_to_1x_startup_saves_observed_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        let primary = DisplayFrame { width: 1440, height: 900, ..DISPLAY };
+        let external = DisplayFrame { x: 2880, width: 3840, height: 2160, scale_factor: 2.0, ..DISPLAY };
+        let inventory = vec![primary, external];
+        let frame = PhysicalFrame { x: 2912, y: 32, width: 840, height: 100 };
+        let store = Arc::new(PlacementStore::new(path.clone()));
+        let (first, _) = setup_store_at_scale(frame, store.clone(), inventory.clone(),
+            Some(external), Some(primary), true, 2.0);
+        first.snap(Corner::TopLeft).unwrap();
+        assert_eq!(inspect(&first).persisted.unwrap().frame, frame);
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.scale_factor == Some(2.0) && record.position.x == 2912));
+        drop(first);
+
+        let restarted_store = Arc::new(PlacementStore::new(path));
+        let (restarted, window) = setup_store(STRIP, restarted_store.clone(), inventory,
+            Some(primary), Some(primary), true);
+        restarted.restore(None).unwrap();
+        assert_eq!(inspect(&restarted).persisted, None);
+        assert_eq!(window.calls.lock().unwrap().positions, vec![(1456, 16)]);
+        *window.scale.lock().unwrap() = 2.0;
+        *window.current.lock().unwrap() = Some(external);
+        moved(&restarted, 2912, 32);
+        assert_eq!(inspect(&restarted).persisted.unwrap().frame, frame);
+        assert!(matches!(restarted_store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.scale_factor == Some(2.0) && record.position.x == 2912));
+    }
+
+    #[test]
+    fn scale_less_v1_restores_best_effort_and_reports_unrecoverable_basis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        let bytes = br#"{"version":1,"position":{"x":1456,"y":16},"corner":null}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let store = Arc::new(PlacementStore::new(path.clone()));
+        let primary = DisplayFrame { width: 2880, height: 1800, scale_factor: 2.0, ..DISPLAY };
+        let external = DisplayFrame { x: 1440, ..DISPLAY };
+        let (placement, window) = setup_store_at_scale(
+            PhysicalFrame { x: 32, y: 32, width: 840, height: 100 }, store.clone(),
+            vec![primary, external], Some(primary), Some(primary), true, 2.0);
+        placement.restore(None).unwrap();
+        assert_eq!(inspect(&placement).persisted, None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let calls = window.calls.lock().unwrap();
+        assert_eq!(calls.positions, vec![(1456, 16)]);
+        assert_eq!(calls.persistence_errors.len(), 1);
+        assert!(calls.persistence_errors[0].1.contains("same-display recovery cannot be guaranteed"));
+        drop(calls);
+        moved(&placement, 1456, 16);
+        assert_eq!(inspect(&placement).persisted.unwrap().corner, None);
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.scale_factor == Some(2.0) && record.position.x == 1456));
+    }
+
+    #[test]
+    fn unsupported_native_record_is_preserved_until_explicit_migration_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placement.json");
+        let bytes = br#"{"version":2,"position":{"x":1456,"y":16},"corner":null}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let store = Arc::new(PlacementStore::new(path.clone()));
+        let (placement, window) = setup_store(STRIP, store.clone(), vec![DISPLAY], None, Some(DISPLAY), true);
+        placement.restore(Some(LegacyPlacement { position: PhysicalPosition::new(310, 205), corner: None })).unwrap();
+        assert_eq!(inspect(&placement).persisted, None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(window.calls.lock().unwrap().persistence_errors[0].1.contains("unsupported placement version 2"));
+        moved(&placement, 310, 205);
+        assert!(matches!(store.load().unwrap(), LoadOutcome::Stored(record)
+            if record.position.x == 310 && record.scale_factor == Some(1.0)));
     }
 
     #[test]

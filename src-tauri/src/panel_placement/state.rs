@@ -251,9 +251,14 @@ impl PlacementMachine {
                 self.dragging = true;
                 self.drag_moved = false;
                 self.drag_generation = self.generation;
-                self.drag_interrupted = self.waiting;
+                // Drag interrupts position work, not an independently
+                // accepted size setter. A click-only drag must still allow
+                // the observed resize to reanchor the confirmed corner.
+                self.drag_interrupted = self.waiting && !self.pending.is_empty();
                 // A click alone must not erase the confirmed anchor.
-                self.waiting = false;
+                self.waiting = !self.pending_sizes.is_empty()
+                    || self.desired.is_some_and(|target|
+                        target.required_width.is_some() || target.required_height.is_some());
                 Vec::new()
             }
             PlacementInput::ResizeRequested { width, height } => {
@@ -367,6 +372,8 @@ impl PlacementMachine {
                 }
                 if self.dragging && !self.drag_moved && self.drag_interrupted
                     && self.desired.is_some_and(|target| target.generation <= self.drag_generation)
+                    && self.desired.is_none_or(|target|
+                        target.required_width.is_none() && target.required_height.is_none())
                 {
                     return Vec::new();
                 }
@@ -593,12 +600,35 @@ impl PlacementMachine {
         self.restoring = None;
         self.generation += 1;
         self.desired = Some(Target {
-            generation: self.generation, corner: None, frame: self.observed, required_height: None,
-            required_width: None,
-            logical_size: None,
+            generation: self.generation, corner: None, frame: self.observed,
+            // Manual movement supersedes position only. Outstanding native
+            // size setters and exact logical dimensions keep their intent.
+            required_height: self.desired.and_then(|target| target.required_height),
+            required_width: self.desired.and_then(|target| target.required_width),
+            logical_size: self.desired.and_then(|target| target.logical_size),
             display: None,
         });
-        self.confirm()
+        let snapshot = PlacementSnapshot {
+            generation: self.generation, corner: None, frame: self.observed,
+        };
+        self.confirmed = Some(snapshot);
+        self.retired.extend(self.pending.drain(..));
+        let target = self.desired.expect("manual movement supplies a target");
+        self.waiting = !self.pending_sizes.is_empty()
+            || target.required_width.is_some_and(|width| width != self.observed.width)
+            || target.required_height.is_some_and(|height| height != self.observed.height);
+        // Persist this observed free position immediately, while retaining
+        // the independent size intent until its own native observation.
+        let mut effects = vec![PlacementEffect::Confirm(snapshot), PlacementEffect::Persist(snapshot)];
+        if self.waiting {
+            // Manual position confirmation must not complete the pending
+            // resize. Give size reconciliation a newer generation so the
+            // adapter/UI can retain and report its watchdog independently.
+            self.generation += 1;
+            self.desired.as_mut().expect("manual movement supplies a target").generation = self.generation;
+            effects.push(PlacementEffect::ScheduleWatchdog(self.generation));
+        }
+        effects
     }
 }
 
