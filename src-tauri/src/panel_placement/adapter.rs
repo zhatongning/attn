@@ -823,6 +823,43 @@ mod tests {
     }
 
     #[test]
+    fn fractional_crossing_after_corner_noop_reconciles_late_obsolete_size() {
+        let (placement, window) = queued_size_setup();
+        *window.inner.scale.lock().unwrap() = 1.25;
+        placement.resize(252).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        placement.resize(54).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        let latest = window.sizes.lock().unwrap().remove(1).to_physical::<u32>(1.25);
+        assert_eq!(latest, PhysicalSize::new(525, 68));
+        placement.on_window_event(&tauri::WindowEvent::Resized(latest)).unwrap();
+        inspect(&placement);
+        placement.snap(Corner::TopLeft).unwrap();
+        inspect(&placement);
+        moved(&placement, 20, 20);
+        let confirmed = inspect(&placement).persisted.unwrap();
+        assert_eq!(confirmed.corner, Some(Corner::TopLeft));
+        assert_eq!(confirmed.frame.height, 68);
+
+        // No latest-size observation at the new scale: the old setter executes
+        // first after crossing, then native observation must confirm the exact
+        // reasserted logical 54 rather than rescaling rounded physical 68.
+        *window.inner.scale.lock().unwrap() = 1.5;
+        let obsolete = window.sizes.lock().unwrap().remove(0).to_physical::<u32>(1.5);
+        assert_eq!(obsolete, PhysicalSize::new(630, 378));
+        placement.on_window_event(&tauri::WindowEvent::Resized(obsolete)).unwrap();
+        assert_eq!(inspect(&placement).persisted, Some(confirmed));
+        let reasserted = window.sizes.lock().unwrap().remove(0).to_physical::<u32>(1.5);
+        assert_eq!(reasserted, PhysicalSize::new(630, 81));
+        placement.on_window_event(&tauri::WindowEvent::Resized(reasserted)).unwrap();
+        inspect(&placement);
+        moved(&placement, 24, 24);
+        let snapshot = inspect(&placement).persisted.unwrap();
+        assert_eq!(snapshot.frame, PhysicalFrame { x: 24, y: 24, width: 630, height: 81 },
+            "exact logical size observation must retire the pending size and confirm the corner");
+        assert_eq!(snapshot.generation, confirmed.generation);
+        assert!(window.sizes.lock().unwrap().is_empty(), "no duplicate size retry after arrival");
+    }
+
+    #[test]
     fn queued_fractional_scale_resize_confirms_exact_logical_intent_after_crossing() {
         let (placement, window) = queued_size_setup();
         *window.inner.scale.lock().unwrap() = 1.25;

@@ -196,6 +196,12 @@ impl PlacementMachine {
             target.required_height = target.required_height
                 .map(|height| rescale_dimension(height, old_scale, new_scale));
             if let Some((width, height)) = target.logical_size {
+                // A satisfied corner no-op clears required dimensions but
+                // keeps logical intent for late resize reconciliation. Its
+                // frame must share that exact conversion, rather than scaling
+                // an already-rounded observed dimension a second time.
+                target.frame.width = logical_dimension(width, new_scale);
+                target.frame.height = logical_dimension(height, new_scale);
                 target.required_width = target.required_width.map(|_| logical_dimension(width, new_scale));
                 target.required_height = target.required_height.map(|_| logical_dimension(height, new_scale));
             }
