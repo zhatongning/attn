@@ -69,6 +69,7 @@ struct CodexHookSignal {
     timestamp: String,
     timestamp_time: SystemTime,
     session_id: Option<String>,
+    latest_user_prompt_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -706,8 +707,32 @@ fn parse_session_content(
                     last_activity_kind = ObservationKind::Stopped;
                     terminal_turn_closed = true;
                 } else if matches!(event_type, Some("user_message" | "task_started" | "turn_started")) {
-                    latest_timestamp = timestamp.map(ToString::to_string);
                     terminal_turn_closed = false;
+                    if event_type == Some("user_message") {
+                        // A genuinely later user turn supersedes an unanswered
+                        // request; file append order and task_started do not.
+                        let message_is_later = |pending_at: Option<&str>| {
+                            timestamp
+                                .and_then(parse_utc_timestamp)
+                                .zip(pending_at.and_then(parse_utc_timestamp))
+                                .is_some_and(|(message, pending)| message > pending)
+                        };
+                        if pending_tool_approval.as_ref().is_some_and(|approval: &PendingToolApproval| {
+                            message_is_later(approval.timestamp.as_deref())
+                        }) {
+                            pending_tool_approval = None;
+                        }
+                        if pending_structured_user_input.as_ref().is_some_and(|request: &PendingStructuredUserInput| {
+                            message_is_later(request.timestamp.as_deref())
+                        }) {
+                            pending_structured_user_input = None;
+                        }
+                    }
+                    if event_type != Some("user_message")
+                        || (pending_tool_approval.is_none() && pending_structured_user_input.is_none())
+                    {
+                        latest_timestamp = timestamp.map(ToString::to_string);
+                    }
                     last_activity_kind = ObservationKind::Running;
                 } else if !terminal_turn_closed {
                     latest_timestamp = timestamp.map(ToString::to_string);
@@ -1403,19 +1428,36 @@ fn observation_from_thread(
                 .duration_since(last_activity)
                 .is_ok_and(|age| age > Duration::ZERO)
         });
-    let hook_activity_can_override_terminal = !matches!(
-        jsonl_kind,
+    let user_prompt_supersedes_pending = matches!(jsonl_kind, Some(ObservationKind::WaitingForInput))
+        && hook_signal
+            .and_then(|signal| signal.latest_user_prompt_at)
+            .zip(last_activity_at.as_deref().and_then(parse_utc_timestamp))
+            .is_some_and(|(user_prompt, last_activity)| user_prompt > last_activity);
+    let hook_activity_can_override_terminal = match jsonl_kind {
+        Some(ObservationKind::WaitingForInput) => user_prompt_supersedes_pending,
         Some(
             ObservationKind::Completed
                 | ObservationKind::CompletedImmediate
                 | ObservationKind::CompletedStale
                 | ObservationKind::Failed
-                | ObservationKind::Stopped
-                | ObservationKind::WaitingForInput
-        )
-    ) || hook_activity_is_newer_than_jsonl;
-    let kind = if has_recent_hook_activity && hook_activity_can_override_terminal {
-        ObservationKind::Running
+                | ObservationKind::Stopped,
+        ) => hook_activity_is_newer_than_jsonl,
+        _ => true,
+    };
+    let use_hook_activity = (has_recent_hook_activity && hook_activity_can_override_terminal)
+        || user_prompt_supersedes_pending;
+    let kind = if use_hook_activity {
+        if user_prompt_supersedes_pending
+            && !has_recent_hook_activity
+            && hook_signal.is_some_and(|signal| {
+                now.duration_since(signal.timestamp_time)
+                    .is_ok_and(|age| age > Duration::from_secs(2 * 60 * 60))
+            })
+        {
+            ObservationKind::Idle
+        } else {
+            ObservationKind::Running
+        }
     } else if matches!(
         jsonl_kind,
         Some(
@@ -1452,7 +1494,7 @@ fn observation_from_thread(
     } else {
         format!("Codex session {}", thread.id)
     };
-    let evidence_summary = if has_recent_hook_activity {
+    let evidence_summary = if use_hook_activity {
         hook_signal.map(|signal| format!("Codex hook {} observed.", signal.event_name))
     } else {
         None
@@ -1464,7 +1506,7 @@ fn observation_from_thread(
     })
     .or_else(|| thread.preview.clone());
 
-    let effective_last_activity_at = if has_recent_hook_activity {
+    let effective_last_activity_at = if use_hook_activity {
         hook_signal.map(|signal| signal.timestamp.clone())
     } else {
         None
@@ -1586,6 +1628,7 @@ fn parse_hook_signal_line(line: &str) -> Option<CodexHookSignal> {
         .and_then(Value::as_str)
         .map(ToString::to_string);
     Some(CodexHookSignal {
+        latest_user_prompt_at: (event_name == "UserPromptSubmit").then_some(timestamp_time),
         event_name,
         timestamp,
         timestamp_time,
@@ -1596,14 +1639,20 @@ fn parse_hook_signal_line(line: &str) -> Option<CodexHookSignal> {
 fn upsert_latest_hook_signal(
     signals: &mut HashMap<String, CodexHookSignal>,
     key: String,
-    signal: CodexHookSignal,
+    mut signal: CodexHookSignal,
 ) {
-    let should_replace = signals
-        .get(&key)
-        .map(|existing| signal.timestamp_time.duration_since(existing.timestamp_time).is_ok())
-        .unwrap_or(true);
-
-    if should_replace {
+    if let Some(existing) = signals.get_mut(&key) {
+        let latest_user_prompt_at = existing.latest_user_prompt_at
+            .into_iter()
+            .chain(signal.latest_user_prompt_at)
+            .max();
+        if signal.timestamp_time >= existing.timestamp_time {
+            signal.latest_user_prompt_at = latest_user_prompt_at;
+            *existing = signal;
+        } else {
+            existing.latest_user_prompt_at = latest_user_prompt_at;
+        }
+    } else {
         signals.insert(key, signal);
     }
 }
@@ -3653,6 +3702,228 @@ mod tests {
         assert_eq!(
             rows[0].last_activity_at.as_deref(),
             Some("2026-06-05T08:29:30.000Z")
+        );
+    }
+
+    #[test]
+    fn newer_tool_hooks_do_not_hide_unresolved_desktop_approval() {
+        for event_name in ["PreToolUse", "PostToolUse", "SessionStart"] {
+            let temp = tempdir().expect("temp dir");
+            let state_db = temp.path().join("state_5.sqlite");
+            let hook_events = temp.path().join("hook-events.jsonl");
+            let session_dir = temp.path().join("2026/06/05");
+            fs::create_dir_all(&session_dir).expect("session dir");
+            let rollout_path = session_dir.join("rollout-2026-06-05T08-00-00-019approval-hook.jsonl");
+            fs::write(
+                &rollout_path,
+                r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019approval-hook","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_approval"}}"#,
+            )
+            .expect("session file");
+            create_threads_table(&state_db);
+            insert_thread(
+                &state_db,
+                "019approval-hook",
+                rollout_path.to_string_lossy().as_ref(),
+                "/Users/edy/hook-project",
+                "Approval thread",
+                1_780_648_000_000,
+            );
+            fs::write(
+                &hook_events,
+                format!(
+                    r#"{{"timestamp":"2026-06-05T08:20:00.050Z","source":"codex-hook","eventType":"{event_name}","sessionId":"019approval-hook","workspacePath":"/Users/edy/hook-project"}}"#,
+                ),
+            )
+            .expect("hook events");
+
+            let rows = discover_codex_observations_with_state_db_and_hooks(
+                &state_db,
+                temp.path(),
+                &hook_events,
+                20,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_200),
+            );
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].kind, ObservationKind::WaitingForInput, "{event_name}");
+            assert_eq!(
+                rows[0].evidence_summary.as_deref(),
+                Some("Codex is waiting for tool approval: npm run build"),
+                "{event_name}",
+            );
+            assert_eq!(
+                rows[0].last_activity_at.as_deref(),
+                Some("2026-06-05T08:20:00.000Z"),
+                "{event_name}",
+            );
+        }
+    }
+
+    #[test]
+    fn newer_jsonl_user_message_clears_pending_desktop_approval() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-05T08-00-00-019approval-new-message.jsonl"),
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019approval-new-message","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_approval"}}
+{"timestamp":"2026-06-05T08:21:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Continue with another task"}}"#,
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_200),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:21:00.000Z")
+        );
+    }
+
+    #[test]
+    fn older_jsonl_user_message_does_not_clear_pending_desktop_approval() {
+        let temp = tempdir().expect("temp dir");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        fs::write(
+            session_dir.join("rollout-2026-06-05T08-00-00-019approval-older-message.jsonl"),
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019approval-older-message","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_approval"}}
+{"timestamp":"2026-06-05T08:19:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Delayed older message"}}"#,
+        )
+        .expect("session file");
+
+        let rows = discover_codex_observations_with_now(
+            temp.path(),
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_200),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::WaitingForInput);
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("Codex is waiting for tool approval: npm run build")
+        );
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:20:00.000Z")
+        );
+    }
+
+    #[test]
+    fn newer_user_prompt_hook_can_reopen_pending_desktop_approval() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T08-00-00-019approval-new-turn.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019approval-new-turn","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_approval"}}"#,
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019approval-new-turn",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "New user turn",
+            1_780_648_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:21:00.000Z","source":"codex-hook","eventType":"UserPromptSubmit","sessionId":"019approval-new-turn","workspacePath":"/Users/edy/hook-project"}
+{"timestamp":"2026-06-05T08:21:00.050Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019approval-new-turn","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_200),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:21:00.050Z")
+        );
+        assert_eq!(
+            rows[0].evidence_summary.as_deref(),
+            Some("Codex hook PreToolUse observed.")
+        );
+    }
+
+    #[test]
+    fn newer_user_prompt_does_not_resurrect_old_approval_after_hook_freshness() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let rollout_path = session_dir.join("rollout-2026-06-05T08-00-00-019approval-expired-hook.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019approval-expired-hook","cwd":"/Users/edy/hook-project","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:20:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm run build\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need approval\"}","call_id":"call_approval"}}"#,
+        )
+        .expect("session file");
+        create_threads_table(&state_db);
+        insert_thread(
+            &state_db,
+            "019approval-expired-hook",
+            rollout_path.to_string_lossy().as_ref(),
+            "/Users/edy/hook-project",
+            "Expired prompt hook",
+            1_780_648_000_000,
+        );
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:21:00.000Z","source":"codex-hook","eventType":"UserPromptSubmit","sessionId":"019approval-expired-hook","workspacePath":"/Users/edy/hook-project"}"#,
+        )
+        .expect("hook events");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ObservationKind::Running);
+        assert_eq!(
+            rows[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:21:00.000Z")
+        );
+
+        let stale = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800 + 3 * 60 * 60),
+        );
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].kind, ObservationKind::Idle);
+        assert_eq!(
+            stale[0].last_activity_at.as_deref(),
+            Some("2026-06-05T08:21:00.000Z")
         );
     }
 

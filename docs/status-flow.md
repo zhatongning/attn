@@ -104,6 +104,7 @@ Unread-completion retention is 12 hours. After this window, a terminal unread co
 
 Generic non-terminal activity is still considered recent for 2 hours.
 When a session starts a new turn after `task_complete`, `task_started` and activity response items such as `custom_tool_call`, `custom_tool_call_output`, `reasoning`, and `message` reopen it as `Running`. An unresolved approval or structured user-input response remains `WaitingForInput` instead.
+For an unresolved input request, a later `PreToolUse`, `PostToolUse`, or `SessionStart` hook does not establish that the user answered it; the JSONL waiting state and its evidence remain authoritative. A matching tool result, an aborted turn, a strictly newer JSONL `user_message`, or a strictly newer `UserPromptSubmit` hook for the same session can move it out of waiting. The latest user-prompt hook remains evidence even when followed by tool hooks; after two hours without newer hook activity, the row becomes idle rather than resurrecting the old approval. Other completed or stopped states may still be reopened by newer hook activity under the usual rules.
 The native tail reader preserves the complete status context before an oversized JSONL line. A delayed `item_completed` payload with very large command output must not evict an earlier `task_complete` and fall through to SQLite's recent-activity `Running` inference.
 
 ### SQLite Thread Rules

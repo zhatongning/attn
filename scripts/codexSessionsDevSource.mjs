@@ -838,10 +838,18 @@ function parseSessionFile(filePath, {
         || eventType === "task_started"
         || eventType === "turn_started"
       ) {
-        if (typeof value.timestamp === "string") {
+        terminalTurnClosed = false;
+        if (
+          eventType === "user_message"
+          && pendingToolApproval
+          && typeof value.timestamp === "string"
+          && Date.parse(value.timestamp) > Date.parse(pendingToolApproval.timestamp ?? "")
+        ) {
+          pendingToolApproval = undefined;
+        }
+        if (typeof value.timestamp === "string" && (eventType !== "user_message" || !pendingToolApproval)) {
           lastActivityAt = value.timestamp;
         }
-        terminalTurnClosed = false;
         lastActivityKind = "running";
       } else if (!terminalTurnClosed) {
         if (typeof value.timestamp === "string") {

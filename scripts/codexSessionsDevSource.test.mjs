@@ -1995,6 +1995,69 @@ describe("codexSessionsDevSource", () => {
     });
   });
 
+  it("supersedes an unresolved Desktop approval when a newer user message starts a turn", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019approval-new-turn.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019approval-new-turn","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need approval\\"}","call_id":"call_desktop"}}',
+        '{"timestamp":"2026-06-06T04:06:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Continue with another task"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019approval-new-turn",
+      state: "running",
+      jumpTarget: "desktop",
+      lastActivityAt: "2026-06-06T04:06:00.000Z",
+    });
+  });
+
+  it("does not supersede a Desktop approval with a delayed older user message", () => {
+    const temp = tempDir();
+    const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-2026-06-06T12-00-00-019approval-older-turn.jsonl"),
+      [
+        '{"timestamp":"2026-06-06T04:00:00.000Z","type":"session_meta","payload":{"id":"019approval-older-turn","cwd":"/Users/edy/project-desktop","originator":"Codex Desktop","source":"vscode"}}',
+        '{"timestamp":"2026-06-06T04:05:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"npm run build\\",\\"sandbox_permissions\\":\\"require_escalated\\",\\"justification\\":\\"Need approval\\"}","call_id":"call_desktop"}}',
+        '{"timestamp":"2026-06-06T04:04:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Delayed older message"}}',
+        "",
+      ].join("\n"),
+    );
+
+    const rows = discoverCodexSessions({
+      stateDbPath: path.join(temp, "missing.sqlite"),
+      sessionsRoot: path.join(temp, "sessions"),
+      nowMs: Date.parse("2026-06-06T04:10:00.000Z"),
+      limit: 20,
+      liveCliTtyForWorkspace: () => undefined,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sessionId: "019approval-older-turn",
+      state: "waitingForInput",
+      jumpTarget: "desktop",
+      lastActivityAt: "2026-06-06T04:05:00.000Z",
+      evidenceSummary: "Codex is waiting for tool approval: npm run build",
+    });
+  });
+
   it("clears command approval attention after matching function output arrives", () => {
     const temp = tempDir();
     const sessionDir = path.join(temp, "sessions", "2026", "06", "06");
