@@ -1,13 +1,15 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-const HOOK_EVENTS: [&str; 5] = [
+const HOOK_EVENTS: [&str; 6] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
+    "PermissionRequest",
     "PostToolUse",
     "Stop",
 ];
@@ -66,8 +68,16 @@ fn install_codex_hooks_at(
 
     let serialized = serde_json::to_string_pretty(&root)
         .map_err(|error| format!("serialize hooks.json failed: {error}"))?;
-    fs::write(hooks_path, format!("{serialized}\n"))
-        .map_err(|error| format!("write hooks.json failed: {error}"))?;
+    let parent = hooks_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("create temporary hooks.json failed: {error}"))?;
+    temporary
+        .write_all(format!("{serialized}\n").as_bytes())
+        .and_then(|()| temporary.flush())
+        .map_err(|error| format!("write temporary hooks.json failed: {error}"))?;
+    temporary
+        .persist(hooks_path)
+        .map_err(|error| format!("replace hooks.json failed: {error}"))?;
 
     Ok(codex_hook_integration_status_at(hooks_path, script_path))
 }
@@ -87,11 +97,14 @@ fn read_hooks_json(path: &Path) -> Result<Value, String> {
 
 fn ensure_hooks_object(root: &mut Value) -> Result<&mut Map<String, Value>, String> {
     if !root.is_object() {
-        *root = json!({});
+        return Err("hooks.json root must be an object".to_string());
     }
 
     let object = root.as_object_mut().expect("root normalized to object");
-    if !object.get("hooks").is_some_and(Value::is_object) {
+    if object.get("hooks").is_some_and(|hooks| !hooks.is_object()) {
+        return Err("hooks.json hooks field must be an object".to_string());
+    }
+    if !object.contains_key("hooks") {
         object.insert("hooks".to_string(), json!({}));
     }
 
@@ -112,7 +125,7 @@ fn ensure_attn_hook_for_event(
         .or_insert_with(|| Value::Array(Vec::new()));
 
     if !event_entries.is_array() {
-        *event_entries = Value::Array(Vec::new());
+        return Err(format!("{event_name} hook entries must be an array"));
     }
 
     let entries = event_entries
@@ -120,7 +133,10 @@ fn ensure_attn_hook_for_event(
         .ok_or_else(|| format!("{event_name} hook entries unavailable"))?;
     let command = attn_hook_command(script_path, event_name);
 
-    if entries.iter().any(|entry| entry_contains_command(entry, &command)) {
+    if entries
+        .iter()
+        .any(|entry| entry_contains_command_for_event(entry, &command, event_name))
+    {
         return Ok(());
     }
 
@@ -137,6 +153,8 @@ fn ensure_attn_hook_for_event(
 
     if matches!(event_name, "SessionStart") {
         entry["matcher"] = Value::String("startup|resume".to_string());
+    } else if matches!(event_name, "PermissionRequest") {
+        entry["matcher"] = Value::String("Bash".to_string());
     }
 
     entries.push(entry);
@@ -153,7 +171,11 @@ fn hooks_file_has_attn_hooks(hooks_path: &Path, script_path: &Path) -> bool {
         root.get("hooks")
             .and_then(|hooks| hooks.get(event_name))
             .and_then(Value::as_array)
-            .is_some_and(|entries| entries.iter().any(|entry| entry_contains_command(entry, &command)))
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry_contains_command_for_event(entry, &command, event_name))
+            })
     })
 }
 
@@ -166,6 +188,16 @@ fn entry_contains_command(entry: &Value, command: &str) -> bool {
                 .iter()
                 .any(|hook| hook.get("command").and_then(Value::as_str) == Some(command))
         })
+}
+
+fn entry_contains_command_for_event(entry: &Value, command: &str, event_name: &str) -> bool {
+    if !entry_contains_command(entry, command) {
+        return false;
+    }
+    if event_name == "PermissionRequest" {
+        return entry.get("matcher").and_then(Value::as_str) == Some("Bash");
+    }
+    true
 }
 
 fn attn_hook_command(script_path: &Path, event_name: &str) -> String {
@@ -263,8 +295,47 @@ mod tests {
         assert!(hooks_json.contains("UserPromptSubmit"));
         assert!(hooks_json.contains("SessionStart"));
         assert!(hooks_json.contains("Stop"));
+        let permission = value["hooks"]["PermissionRequest"].as_array().expect("permission request");
+        assert_eq!(permission.len(), 1);
+        assert_eq!(permission[0]["matcher"], "Bash");
+        assert!(permission[0]["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.ends_with("attn-codex-hook.cjs' PermissionRequest")));
         assert!(!hooks_json.contains("\"matcher\": \"*\""));
         assert!(pre_tool.len() >= 2);
+    }
+
+    #[test]
+    fn wrong_permission_matcher_is_not_reported_installed_or_reused() {
+        let temp = tempdir().expect("temp dir");
+        let hooks_path = temp.path().join("hooks.json");
+        let script_path = temp.path().join("attn-codex-hook.cjs");
+        super::install_codex_hooks_at(&hooks_path, &script_path).expect("initial install");
+        let mut root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        root["hooks"]["PermissionRequest"][0]["matcher"] = serde_json::json!("Write");
+        fs::write(&hooks_path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+
+        assert!(!super::codex_hook_integration_status_at(&hooks_path, &script_path).installed);
+        super::install_codex_hooks_at(&hooks_path, &script_path).expect("repair install");
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let permission = root["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(permission.len(), 2);
+        assert_eq!(permission[0]["matcher"], "Write");
+        assert_eq!(permission[1]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn malformed_existing_hooks_are_preserved_when_install_fails() {
+        let temp = tempdir().expect("temp dir");
+        let hooks_path = temp.path().join("hooks.json");
+        let script_path = temp.path().join("attn-codex-hook.cjs");
+        for content in [r#"{"hooks":"invalid"}"#, r#"{"hooks":{"PermissionRequest":"invalid"}}"#] {
+            fs::write(&hooks_path, content).expect("existing hooks");
+            assert!(super::install_codex_hooks_at(&hooks_path, &script_path).is_err());
+            assert_eq!(fs::read_to_string(&hooks_path).unwrap(), content);
+        }
     }
 
     #[test]

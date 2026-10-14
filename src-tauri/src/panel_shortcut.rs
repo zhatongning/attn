@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, EventTarget, Manager, Runtime};
 
 pub use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
-pub const DEFAULT_PANEL_SHORTCUT: &str = "shift+alt+super+space";
+pub const DEFAULT_PANEL_SHORTCUT: &str = "control+super+9";
 pub const TOGGLE_PANEL_EVENT: &str = "agent-session-inbox://toggle-panel";
 
 #[derive(Default)]
@@ -516,6 +516,22 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn registers_the_three_key_toggle_default_and_accepts_the_position_binding() {
+        let mut active = ShortcutRegistrationState::Known(None);
+        let mut registrar = FakeRegistrar::default();
+        let next = apply_shortcut_update(
+            &mut active,
+            Some(super::DEFAULT_PANEL_SHORTCUT),
+            &mut registrar,
+        )
+        .unwrap();
+
+        assert_eq!(next.as_deref(), Some("control+super+9"));
+        assert_eq!(registrar.operations, vec!["register:control+super+9".to_string()]);
+        assert_eq!(canonicalize_shortcut("CONTROL+SUPER+P").unwrap(), "control+super+p");
     }
 
     #[test]

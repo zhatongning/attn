@@ -50,7 +50,7 @@ const PANEL_MESSAGE_HEIGHT = 32;
 const PANEL_MAX_HEIGHT = 420;
 const PANEL_STRIP_HEIGHT = 50;
 const COMMAND_MESSAGE_DISMISS_DELAY_MS = 3000;
-const PANEL_REFRESH_INTERVAL_MS = 5000;
+const PANEL_REFRESH_INTERVAL_MS = 30000;
 const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "working"];
 const AUTO_COLLAPSE_STATUS_SET = new Set<InterventionStatus>(AUTO_COLLAPSE_STATUS_OPTIONS);
 
@@ -344,6 +344,19 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     document.addEventListener("visibilitychange", dismissShortcutUiOnHide);
     let unlistenToggle: (() => void) | undefined;
     let unlistenMenu: (() => void) | undefined;
+    let unlistenSources: (() => void) | undefined;
+
+    void listen("agent-session-inbox://sources-changed", () => {
+      if (!cancelled) {
+        void refreshPanel(configRef.current.followUpToIdleMinutes, { invalidateActiveRefresh: true });
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSources = unlisten;
+    }).catch(() => undefined);
 
     void listen<boolean>("agent-session-inbox://toggle-panel", (event) => {
       if (cancelled) {
@@ -392,6 +405,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       document.removeEventListener("visibilitychange", dismissShortcutUiOnHide);
       unlistenToggle?.();
       unlistenMenu?.();
+      unlistenSources?.();
     };
   }, []);
 

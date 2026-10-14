@@ -29,6 +29,15 @@ Codex 有用的会话历史，但没有提供一个本地、可操作的关注�
 - 每五秒刷新一次，并在 macOS 的所有空间中保持面板可见。
 - 支持拖动面板，或通过 macOS 应用菜单定位唯一的面板窗口。
 
+## 快捷键
+
+| 操作 | macOS 默认快捷键 |
+| --- | --- |
+| 展开或收起面板 | **Control-Command-9**（`⌃⌘9`） |
+| 按顺时针顺序轮换面板的四个角落位置 | **Control-Command-P**（`⌃⌘P`） |
+
+两个快捷键都可在其他应用获得焦点时使用，并可在 **Attn -> 设置** 中自定义或禁用。升级会保留已保存的快捷键；要采用新默认值，请分别恢复面板快捷键和位置快捷键的默认值，再应用设置。
+
 ## 工作原理
 
 Attn 组合多个本地证据源，而不会把单个时间戳当作确定结论：
@@ -77,7 +86,7 @@ Hook 安装需要用户显式操作。在 **Attn -> Settings** 中选择 **Insta
 - Rust 工具链，以及 Tauri 所需的平台依赖。
 - 本地 Codex Desktop 或 Codex CLI 会话数据。
 
-仓库尚未发布经过验证的 Node.js、Rust 或 macOS 版本矩阵。对于此 MVP，请将源码构建视为受支持的安装方式。
+自动构建使用 Node.js 24.20.0 和 Rust 1.96.0，并分别在 Apple Silicon 和 Intel 的 macOS 15 runner 上运行。可下载版本见 [GitHub 构建](#github-构建)；开发时仍可从源码构建。
 
 ## 本地运行
 
@@ -109,6 +118,19 @@ npm run build
 ```bash
 npm run tauri build -- --debug
 ```
+
+## GitHub 构建
+
+每次向 `master` 推送都会运行 **Build Attn** GitHub Actions 工作流，也可从仓库的 **Actions** 页面手动启动。两个架构分别通过 `npm ci` 安装依赖、运行前端和 Rust 测试，再使用已提交的锁文件构建 release 版 `.app` 和 `.dmg`。
+
+| 版本 | Runner | Rust target |
+| --- | --- | --- |
+| Apple Silicon | `macos-15` | `aarch64-apple-darwin` |
+| Intel | `macos-15-intel` | `x86_64-apple-darwin` |
+
+构建完成后，从 **Actions -> Build Attn -> 构建记录 -> Artifacts** 下载。产物名称包含架构、提交 SHA 和重跑次数，保留 30 天。每份产物包含 `.dmg`、保留应用包权限的 `.app.zip`，以及 `SHA256SUMS.txt`。
+
+构建采用 ad-hoc 签名，无需 Apple 开发者凭证。这些产物未经 Apple 公证，首次打开下载的应用时，macOS 可能要求在 **系统设置 -> 隐私与安全性** 中允许打开。面向外部用户进行可信分发时，需要另行配置 Developer ID 签名和 Apple 公证。
 
 ## 项目结构
 

@@ -40,7 +40,7 @@ describe("buildStatusPanelModel", () => {
     ]);
   });
 
-  it("shows one visible item by default and keeps the rest hidden", () => {
+  it("shows three visible items by default and keeps the rest hidden", () => {
     const model = buildStatusPanelModel([
       row("s1", "running", "running signal observed"),
       row("s2", "running", "running signal observed"),
@@ -48,10 +48,10 @@ describe("buildStatusPanelModel", () => {
       row("s4", "running", "running signal observed"),
     ]);
 
-    expect(defaultStatusPanelConfig.visibleItemCount).toBe(1);
-    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["s1"]);
-    expect(model.hiddenCount).toBe(3);
-    expect(model.quietHiddenCount).toBe(3);
+    expect(defaultStatusPanelConfig.visibleItemCount).toBe(3);
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["s1", "s2", "s3"]);
+    expect(model.hiddenCount).toBe(1);
+    expect(model.quietHiddenCount).toBe(1);
   });
 
   it("defaults to an auto-collapsing panel that does not stay open for any status", () => {
@@ -62,8 +62,8 @@ describe("buildStatusPanelModel", () => {
   });
 
   it("defaults and localizes the panel shortcut settings contract", () => {
-    expect(defaultStatusPanelConfig.panelToggleShortcut).toBe("shift+alt+super+space");
-    expect(defaultStatusPanelConfig.positionCycleShortcut).toBe("shift+control+super+space");
+    expect(defaultStatusPanelConfig.panelToggleShortcut).toBe("control+super+9");
+    expect(defaultStatusPanelConfig.positionCycleShortcut).toBe("control+super+p");
 
     const english = buildStatusPanelModel([]).copy;
     expect(english.panelToggleShortcutLabel).toBe("Panel shortcut");

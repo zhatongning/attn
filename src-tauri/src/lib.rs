@@ -1,10 +1,88 @@
 pub mod codex_source;
 pub mod codex_hooks;
+pub mod codex_file_events;
 pub mod domain;
 pub mod inbox_store;
 pub mod panel_placement;
 #[cfg(desktop)]
 pub mod panel_shortcut;
+
+#[cfg(test)]
+mod file_watcher_contract_tests {
+    use std::fs;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn watcher_ignores_unrelated_files_and_delivers_hook_changes() {
+        let root = tempdir().expect("codex root");
+        let hook_dir = root.path().join("agent-session-inbox");
+        fs::create_dir_all(&hook_dir).expect("hook directory");
+        let (tx, rx) = mpsc::channel();
+        let _watcher = crate::codex_file_events::poll_watch_codex_sources(root.path(), move || {
+            tx.send(()).expect("watcher callback");
+        })
+        .expect("start watcher");
+
+        fs::write(root.path().join("unrelated.txt"), "unrelated").expect("unrelated file");
+        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+
+        fs::write(hook_dir.join("hook-events.jsonl"), "{\"eventType\":\"PermissionRequest\"}\n")
+            .expect("hook event");
+        rx.recv_timeout(Duration::from_secs(4)).expect("hook change notification");
+        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    }
+
+    #[test]
+    fn watcher_path_filter_includes_rollouts_and_state_wal() {
+        let root = std::path::Path::new("/tmp/codex-source-root");
+        assert!(crate::codex_file_events::is_relevant_source_path(
+            root,
+            &root.join("sessions/2026/10/12/rollout.jsonl"),
+        ));
+        assert!(crate::codex_file_events::is_relevant_source_path(
+            root,
+            &root.join("sessions/2026/10/12"),
+        ));
+        assert!(crate::codex_file_events::is_relevant_source_path(
+            root,
+            &root.join("sqlite/state_5.sqlite-wal"),
+        ));
+        assert!(crate::codex_file_events::is_relevant_source_path(
+            root,
+            &root.join("state_5.sqlite"),
+        ));
+        assert!(!crate::codex_file_events::is_relevant_source_path(
+            root,
+            &root.join("config.toml"),
+        ));
+        assert!(!crate::codex_file_events::is_relevant_source_path(
+            root,
+            &root.join("sqlite/state_5.sqlite-shm"),
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual macOS filesystem event smoke test"]
+    fn native_watcher_receives_hook_file_append() {
+        let root = tempdir().expect("codex root");
+        let hook_dir = root.path().join("agent-session-inbox");
+        fs::create_dir_all(&hook_dir).expect("hook directory");
+        let event_path = hook_dir.join("hook-events.jsonl");
+        fs::write(&event_path, "").expect("seed hook store");
+        let (tx, rx) = mpsc::channel();
+        let _watcher = crate::codex_file_events::watch_codex_sources(root.path(), move || {
+            tx.send(()).expect("watcher callback");
+        })
+        .expect("start native watcher");
+
+        std::thread::sleep(Duration::from_millis(250));
+        fs::write(event_path, "{\"eventType\":\"PermissionRequest\"}\n").expect("hook append");
+        rx.recv_timeout(Duration::from_secs(5)).expect("native change notification");
+    }
+}
 
 use std::sync::Arc;
 
@@ -212,6 +290,21 @@ pub fn run() {
             Menu::with_items(handle, &[&app_menu])
         })
         .setup(|app| {
+            let codex_root = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".codex");
+            let store = Arc::clone(app.state::<Arc<inbox_store::InboxStore>>().inner());
+            let app_handle = app.handle().clone();
+            match codex_file_events::watch_codex_sources(&codex_root, move || {
+                store.invalidate_session_rows_cache();
+                let _ = app_handle.emit("agent-session-inbox://sources-changed", ());
+            }) {
+                Ok(watcher) => {
+                    app.manage(watcher);
+                }
+                Err(error) => eprintln!("{error}"),
+            }
             if let Some(window) = app.get_webview_window("main") {
                 apply_panel_window_behavior(&window);
                 let placement = PanelPlacement::new(window.clone())?;

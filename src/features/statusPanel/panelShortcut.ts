@@ -1,5 +1,5 @@
-export const DEFAULT_PANEL_TOGGLE_SHORTCUT = "shift+alt+super+space" as const;
-export const DEFAULT_POSITION_CYCLE_SHORTCUT = "shift+control+super+space" as const;
+export const DEFAULT_PANEL_TOGGLE_SHORTCUT = "control+super+9" as const;
+export const DEFAULT_POSITION_CYCLE_SHORTCUT = "control+super+p" as const;
 
 export interface PanelShortcutKeyboardEvent {
   code: string;

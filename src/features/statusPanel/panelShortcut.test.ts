@@ -10,14 +10,14 @@ import {
 
 describe("panel shortcut contract", () => {
   it("normalizes missing and disabled position-cycle shortcuts independently", () => {
-    expect(DEFAULT_POSITION_CYCLE_SHORTCUT).toBe("shift+control+super+space");
-    expect(normalizePositionCycleShortcut(undefined)).toBe("shift+control+super+space");
+    expect(DEFAULT_POSITION_CYCLE_SHORTCUT).toBe("control+super+p");
+    expect(normalizePositionCycleShortcut(undefined)).toBe("control+super+p");
     expect(normalizePositionCycleShortcut(null)).toBeNull();
     expect(normalizePositionCycleShortcut("CONTROL+SUPER+SHIFT+SPACE")).toBe("shift+control+super+space");
-    expect(normalizePositionCycleShortcut("shift+p")).toBe("shift+control+super+space");
+    expect(normalizePositionCycleShortcut("shift+p")).toBe("control+super+p");
   });
   it("uses the stable default and canonical modifier order", () => {
-    expect(DEFAULT_PANEL_TOGGLE_SHORTCUT).toBe("shift+alt+super+space");
+    expect(DEFAULT_PANEL_TOGGLE_SHORTCUT).toBe("control+super+9");
     expect(capturePanelShortcut({
       code: "Space",
       altKey: true,
@@ -71,9 +71,23 @@ describe("panel shortcut contract", () => {
   });
 
   it("formats canonical accelerators for display", () => {
-    expect(formatPanelShortcut(DEFAULT_PANEL_TOGGLE_SHORTCUT)).toBe("Option-Shift-Command-Space");
+    expect(formatPanelShortcut(DEFAULT_PANEL_TOGGLE_SHORTCUT)).toBe("Control-Command-9");
+    expect(formatPanelShortcut(DEFAULT_POSITION_CYCLE_SHORTCUT)).toBe("Control-Command-P");
     expect(formatPanelShortcut("control+alt+super+left")).toBe("Option-Control-Command-Left");
     expect(formatPanelShortcut(null)).toBe("Disabled");
+  });
+
+  it("records the new defaults and preserves valid four-key saved shortcuts", () => {
+    expect(capturePanelShortcut(event("Digit9", { ctrlKey: true, metaKey: true }))).toEqual({
+      status: "captured",
+      value: "control+super+9",
+    });
+    expect(capturePanelShortcut(event("KeyP", { ctrlKey: true, metaKey: true }))).toEqual({
+      status: "captured",
+      value: "control+super+p",
+    });
+    expect(normalizePanelToggleShortcut("shift+alt+super+space")).toBe("shift+alt+super+space");
+    expect(normalizePositionCycleShortcut("shift+control+super+space")).toBe("shift+control+super+space");
   });
 });
 

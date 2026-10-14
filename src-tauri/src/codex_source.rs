@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -51,6 +52,7 @@ struct SessionFileSummary {
 #[derive(Debug, Clone)]
 struct ParsedSessionObservation {
     observation: SourceObservation,
+    latest_input_resolution_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +72,24 @@ struct CodexHookSignal {
     timestamp_time: SystemTime,
     session_id: Option<String>,
     latest_user_prompt_at: Option<SystemTime>,
+    pending_permission_at: Option<SystemTime>,
+    latest_permission_clear_at: Option<SystemTime>,
 }
+
+#[derive(Default)]
+struct HookSignalCache {
+    file_len: u64,
+    modified_at: Option<SystemTime>,
+    file_identity: Option<(u64, u64)>,
+    incomplete_line: Vec<u8>,
+    signals: HashMap<String, CodexHookSignal>,
+    #[cfg(test)]
+    bytes_read: u64,
+    #[cfg(test)]
+    last_read_bytes: u64,
+}
+
+static HOOK_SIGNAL_CACHES: OnceLock<Mutex<HashMap<PathBuf, HookSignalCache>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct PendingToolApproval {
@@ -628,6 +647,7 @@ fn parse_session_content(
     let mut last_agent_message = None;
     let mut pending_tool_approval = None;
     let mut pending_structured_user_input = None;
+    let mut latest_input_resolution_at = None;
     let mut external_import_session = false;
 
     for line in content
@@ -695,12 +715,14 @@ fn parse_session_content(
                 }
 
                 if event_type == Some("task_complete") {
+                    latest_input_resolution_at = timestamp.and_then(parse_utc_timestamp);
                     latest_timestamp = timestamp.map(ToString::to_string);
                     last_activity_kind = ObservationKind::Completed;
                     terminal_turn_closed = true;
                     pending_tool_approval = None;
                     pending_structured_user_input = None;
                 } else if event_type == Some("turn_aborted") {
+                    latest_input_resolution_at = timestamp.and_then(parse_utc_timestamp);
                     latest_timestamp = timestamp.map(ToString::to_string);
                     pending_tool_approval = None;
                     pending_structured_user_input = None;
@@ -709,6 +731,7 @@ fn parse_session_content(
                 } else if matches!(event_type, Some("user_message" | "task_started" | "turn_started")) {
                     terminal_turn_closed = false;
                     if event_type == Some("user_message") {
+                        latest_input_resolution_at = timestamp.and_then(parse_utc_timestamp);
                         // A genuinely later user turn supersedes an unanswered
                         // request; file append order and task_started do not.
                         let message_is_later = |pending_at: Option<&str>| {
@@ -787,6 +810,10 @@ fn parse_session_content(
                             .is_some_and(|pending_call_id| pending_call_id == call_id);
                         if resolves_pending_approval {
                             pending_tool_approval = None;
+                            latest_input_resolution_at = value
+                                .get("timestamp")
+                                .and_then(Value::as_str)
+                                .and_then(parse_utc_timestamp);
                         }
                         if resolves_pending_structured_user_input {
                             pending_structured_user_input = None;
@@ -891,7 +918,10 @@ fn parse_session_content(
 
     observation.evidence_summary = evidence_summary;
 
-    Ok(Some(ParsedSessionObservation { observation }))
+    Ok(Some(ParsedSessionObservation {
+        observation,
+        latest_input_resolution_at,
+    }))
 }
 
 fn should_parse_session_status_line(line: &str) -> bool {
@@ -1420,6 +1450,20 @@ fn observation_from_thread(
         .filter(|signal| is_hook_activity_event(&signal.event_name))
         .and_then(|signal| now.duration_since(signal.timestamp_time).ok())
         .is_some_and(|age| age <= HOOK_ACTIVITY_FRESHNESS);
+    let pending_hook_approval = hook_signal
+        .and_then(|signal| signal.pending_permission_at)
+        .and_then(|permission_at| {
+            now.duration_since(permission_at)
+                .ok()
+                .filter(|age| *age <= Duration::from_secs(2 * 60 * 60))
+                .map(|_| permission_at)
+        })
+        .is_some_and(|permission_at| {
+            parsed_jsonl
+                .as_ref()
+                .and_then(|parsed| parsed.latest_input_resolution_at)
+                .is_none_or(|resolution_at| permission_at > resolution_at)
+        });
     let hook_activity_is_newer_than_jsonl = hook_signal
         .zip(last_activity_at.as_deref().and_then(parse_utc_timestamp))
         .is_some_and(|(signal, last_activity)| {
@@ -1446,7 +1490,9 @@ fn observation_from_thread(
     };
     let use_hook_activity = (has_recent_hook_activity && hook_activity_can_override_terminal)
         || user_prompt_supersedes_pending;
-    let kind = if use_hook_activity {
+    let kind = if pending_hook_approval {
+        ObservationKind::WaitingForInput
+    } else if use_hook_activity {
         if user_prompt_supersedes_pending
             && !has_recent_hook_activity
             && hook_signal.is_some_and(|signal| {
@@ -1494,7 +1540,9 @@ fn observation_from_thread(
     } else {
         format!("Codex session {}", thread.id)
     };
-    let evidence_summary = if use_hook_activity {
+    let evidence_summary = if pending_hook_approval {
+        Some("Codex is waiting for tool approval.".to_string())
+    } else if use_hook_activity {
         hook_signal.map(|signal| format!("Codex hook {} observed.", signal.event_name))
     } else {
         None
@@ -1506,7 +1554,7 @@ fn observation_from_thread(
     })
     .or_else(|| thread.preview.clone());
 
-    let effective_last_activity_at = if use_hook_activity {
+    let effective_last_activity_at = if pending_hook_approval || use_hook_activity {
         hook_signal.map(|signal| signal.timestamp.clone())
     } else {
         None
@@ -1588,27 +1636,105 @@ fn hook_signal_for_thread<'a>(
 }
 
 fn load_latest_hook_signals(path: &Path) -> HashMap<String, CodexHookSignal> {
-    let Ok(content) = fs::read_to_string(path) else {
+    let caches = HOOK_SIGNAL_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(metadata) = fs::metadata(path) else {
+        caches.lock().expect("hook cache lock poisoned").remove(path);
         return HashMap::new();
     };
-
-    let mut signals = HashMap::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Some(signal) = parse_hook_signal_line(line) else {
-            continue;
-        };
-
-        if let Some(session_id) = signal.session_id.as_deref().filter(|value| !value.is_empty()) {
-            upsert_latest_hook_signal(&mut signals, hook_session_key(session_id), signal.clone());
-        }
-
+    let mut caches = caches.lock().expect("hook cache lock poisoned");
+    let cache = caches.entry(path.to_path_buf()).or_default();
+    let modified_at = metadata.modified().ok();
+    let identity = hook_file_identity(&metadata);
+    if metadata.len() < cache.file_len
+        || (metadata.len() == cache.file_len && modified_at != cache.modified_at)
+        || (cache.file_len > 0 && cache.file_identity != identity)
+    {
+        *cache = HookSignalCache::default();
     }
+    if metadata.len() == cache.file_len {
+        #[cfg(test)]
+        {
+            cache.last_read_bytes = 0;
+        }
+        return cache.signals.clone();
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return cache.signals.clone();
+    };
+    if file.seek(SeekFrom::Start(cache.file_len)).is_err() {
+        return cache.signals.clone();
+    }
+    let mut newly_read = Vec::new();
+    if file.read_to_end(&mut newly_read).is_err() {
+        return cache.signals.clone();
+    }
+    cache.file_len += newly_read.len() as u64;
+    cache.modified_at = fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+    cache.file_identity = identity;
+    #[cfg(test)]
+    {
+        cache.bytes_read += newly_read.len() as u64;
+        cache.last_read_bytes = newly_read.len() as u64;
+    }
+    cache.incomplete_line.extend(newly_read);
+    if let Some(last_newline) = cache.incomplete_line.iter().rposition(|byte| *byte == b'\n') {
+        let complete_lines = cache.incomplete_line.drain(..=last_newline).collect::<Vec<_>>();
+        let content = String::from_utf8_lossy(&complete_lines);
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let Some(signal) = parse_hook_signal_line(line) else {
+                continue;
+            };
+            if let Some(session_id) = signal.session_id.as_deref().filter(|value| !value.is_empty()) {
+                upsert_latest_hook_signal(&mut cache.signals, hook_session_key(session_id), signal);
+            }
+        }
+    }
+    if let Ok(trailing_line) = std::str::from_utf8(&cache.incomplete_line) {
+        if let Some(signal) = parse_hook_signal_line(trailing_line) {
+            if let Some(session_id) = signal.session_id.as_deref().filter(|value| !value.is_empty()) {
+                upsert_latest_hook_signal(&mut cache.signals, hook_session_key(session_id), signal);
+            }
+            cache.incomplete_line.clear();
+        }
+    }
+    cache.signals.clone()
+}
 
-    signals
+#[cfg(unix)]
+fn hook_file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn hook_file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(test)]
+fn hook_signal_cache_bytes_read(path: &Path) -> u64 {
+    HOOK_SIGNAL_CACHES
+        .get()
+        .and_then(|caches| caches.lock().ok())
+        .and_then(|caches| caches.get(path).map(|cache| cache.bytes_read))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn hook_signal_cache_last_read_bytes(path: &Path) -> u64 {
+    HOOK_SIGNAL_CACHES
+        .get()
+        .and_then(|caches| caches.lock().ok())
+        .and_then(|caches| caches.get(path).map(|cache| cache.last_read_bytes))
+        .unwrap_or(0)
 }
 
 fn parse_hook_signal_line(line: &str) -> Option<CodexHookSignal> {
     let value = serde_json::from_str::<Value>(line).ok()?;
+    parse_hook_signal_value(&value)
+}
+
+fn parse_hook_signal_value(value: &Value) -> Option<CodexHookSignal> {
     let event_name = value
         .get("eventType")
         .or_else(|| value.get("hookEventName"))
@@ -1629,6 +1755,9 @@ fn parse_hook_signal_line(line: &str) -> Option<CodexHookSignal> {
         .map(ToString::to_string);
     Some(CodexHookSignal {
         latest_user_prompt_at: (event_name == "UserPromptSubmit").then_some(timestamp_time),
+        pending_permission_at: (event_name == "PermissionRequest").then_some(timestamp_time),
+        latest_permission_clear_at: matches!(event_name.as_str(), "UserPromptSubmit" | "Stop")
+            .then_some(timestamp_time),
         event_name,
         timestamp,
         timestamp_time,
@@ -1646,11 +1775,36 @@ fn upsert_latest_hook_signal(
             .into_iter()
             .chain(signal.latest_user_prompt_at)
             .max();
+        let latest_permission_clear_at = existing.latest_permission_clear_at
+            .into_iter()
+            .chain(signal.latest_permission_clear_at)
+            .max();
         if signal.timestamp_time >= existing.timestamp_time {
             signal.latest_user_prompt_at = latest_user_prompt_at;
+            signal.pending_permission_at = match signal.event_name.as_str() {
+                "PermissionRequest" => Some(signal.timestamp_time),
+                "UserPromptSubmit" | "Stop" => None,
+                _ => existing.pending_permission_at,
+            }
+            .filter(|permission_at| {
+                latest_permission_clear_at.is_none_or(|cleared_at| *permission_at > cleared_at)
+            });
+            signal.latest_permission_clear_at = latest_permission_clear_at;
             *existing = signal;
         } else {
             existing.latest_user_prompt_at = latest_user_prompt_at;
+            existing.latest_permission_clear_at = latest_permission_clear_at;
+            existing.pending_permission_at = existing.pending_permission_at.filter(|permission_at| {
+                latest_permission_clear_at.is_none_or(|cleared_at| *permission_at > cleared_at)
+            });
+            if signal.event_name == "PermissionRequest" &&
+                latest_permission_clear_at.is_none_or(|cleared_at| signal.timestamp_time > cleared_at)
+            {
+                existing.pending_permission_at = existing.pending_permission_at
+                    .into_iter()
+                    .chain(Some(signal.timestamp_time))
+                    .max();
+            }
         }
     } else {
         signals.insert(key, signal);
@@ -3511,6 +3665,221 @@ mod tests {
             rows[0].evidence_summary.as_deref(),
             Some("Codex hook PreToolUse observed.")
         );
+    }
+
+    #[test]
+    fn hook_signal_index_retains_pending_approval_beyond_eight_megabytes() {
+        let temp = tempdir().expect("temp dir");
+        let events = temp.path().join("hook-events.jsonl");
+        let pending = r#"{"timestamp":"2026-06-05T08:29:30.000Z","eventType":"PermissionRequest","sessionId":"019pending"}"#;
+        let filler = r#"{"timestamp":"2026-06-05T08:29:31.000Z","eventType":"PreToolUse","sessionId":"019other"}"#;
+        fs::write(&events, format!("{pending}\n{}", format!("{filler}\n").repeat(100_000)))
+            .expect("hook event history");
+
+        let signals = super::load_latest_hook_signals(&events);
+        assert_eq!(
+            signals["session:019pending"].pending_permission_at,
+            super::parse_utc_timestamp("2026-06-05T08:29:30.000Z"),
+        );
+        let _again = super::load_latest_hook_signals(&events);
+        assert_eq!(super::hook_signal_cache_bytes_read(&events), fs::metadata(&events).unwrap().len());
+        assert_eq!(super::hook_signal_cache_last_read_bytes(&events), 0);
+
+        use std::io::Write;
+        let appended = format!("{filler}\n");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&events)
+            .expect("open hook store")
+            .write_all(appended.as_bytes())
+            .expect("append hook");
+        let updated = super::load_latest_hook_signals(&events);
+        assert!(updated.contains_key("session:019pending"));
+        assert_eq!(super::hook_signal_cache_bytes_read(&events), fs::metadata(&events).unwrap().len());
+        assert_eq!(super::hook_signal_cache_last_read_bytes(&events), appended.len() as u64);
+    }
+
+    #[test]
+    fn delayed_stop_clears_an_earlier_permission_request() {
+        let temp = tempdir().expect("temp dir");
+        let events = temp.path().join("hook-events.jsonl");
+        fs::write(
+            &events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","eventType":"PermissionRequest","sessionId":"019pending"}
+{"timestamp":"2026-06-05T08:29:40.000Z","eventType":"PreToolUse","sessionId":"019pending"}
+{"timestamp":"2026-06-05T08:29:35.000Z","eventType":"Stop","sessionId":"019pending"}"#,
+        )
+        .expect("out of order events");
+
+        let signals = super::load_latest_hook_signals(&events);
+        assert_eq!(signals["session:019pending"].pending_permission_at, None);
+    }
+
+    #[test]
+    fn larger_rotated_hook_log_drops_signals_from_the_old_file() {
+        let temp = tempdir().expect("temp dir");
+        let events = temp.path().join("hook-events.jsonl");
+        fs::write(
+            &events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","eventType":"PermissionRequest","sessionId":"019old"}"#,
+        )
+        .expect("old event");
+        assert!(super::load_latest_hook_signals(&events).contains_key("session:019old"));
+
+        let replacement = temp.path().join("replacement.jsonl");
+        fs::write(
+            &replacement,
+            r#"{"timestamp":"2026-06-05T08:29:31.000Z","eventType":"PreToolUse","sessionId":"019new"}
+{"timestamp":"2026-06-05T08:29:32.000Z","eventType":"PostToolUse","sessionId":"019new"}"#,
+        )
+        .expect("replacement events");
+        fs::rename(replacement, &events).expect("replace event store");
+        let signals = super::load_latest_hook_signals(&events);
+        assert!(!signals.contains_key("session:019old"));
+        assert_eq!(signals["session:019new"].event_name, "PostToolUse");
+    }
+
+    #[test]
+    fn permission_request_hook_marks_only_its_thread_waiting_before_rollout_catches_up() {
+        let temp = tempdir().expect("temp dir");
+        let state_db = temp.path().join("state_5.sqlite");
+        let hook_events = temp.path().join("hook-events.jsonl");
+        let session_dir = temp.path().join("2026/06/05");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let waiting_rollout = session_dir.join("rollout-2026-06-05T08-00-00-019permission-target.jsonl");
+        let other_rollout = session_dir.join("rollout-2026-06-05T08-00-00-019permission-other.jsonl");
+        for (path, id) in [
+            (&waiting_rollout, "019permission-target"),
+            (&other_rollout, "019permission-other"),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    r#"{{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","cwd":"/Users/edy/shared","originator":"Codex Desktop","source":"vscode"}}}}"#
+                ),
+            )
+            .expect("session file");
+        }
+        create_threads_table(&state_db);
+        for (path, id) in [
+            (&waiting_rollout, "019permission-target"),
+            (&other_rollout, "019permission-other"),
+        ] {
+            insert_thread(
+                &state_db,
+                id,
+                path.to_string_lossy().as_ref(),
+                "/Users/edy/shared",
+                id,
+                1_780_648_000_000,
+            );
+        }
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"PermissionRequest","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}"#,
+        )
+        .expect("hook event");
+
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let rows_by_id = rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(rows_by_id["019permission-target"].kind, ObservationKind::WaitingForInput);
+        assert_eq!(rows_by_id["019permission-other"].kind, ObservationKind::Running);
+        assert_eq!(
+            rows_by_id["019permission-target"].last_activity_at.as_deref(),
+            Some("2026-06-05T08:29:30.000Z")
+        );
+
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"PermissionRequest","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}
+{"timestamp":"2026-06-05T08:29:31.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}"#,
+        )
+        .expect("concurrent hook event");
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let waiting = rows.iter().find(|row| row.session_id == "019permission-target").expect("target");
+        assert_eq!(waiting.kind, ObservationKind::WaitingForInput);
+
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:29:31.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}
+{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"PermissionRequest","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}"#,
+        )
+        .expect("out of order hook events");
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let waiting = rows.iter().find(|row| row.session_id == "019permission-target").expect("target");
+        assert_eq!(waiting.kind, ObservationKind::WaitingForInput);
+
+        fs::write(
+            &hook_events,
+            r#"{"timestamp":"2026-06-05T08:29:30.000Z","source":"codex-hook","eventType":"PermissionRequest","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}
+{"timestamp":"2026-06-05T08:29:31.000Z","source":"codex-hook","eventType":"PreToolUse","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}
+{"timestamp":"2026-06-05T08:29:32.000Z","source":"codex-hook","eventType":"PostToolUse","sessionId":"019permission-target","workspacePath":"/Users/edy/shared","toolName":"Bash"}"#,
+        )
+        .expect("tool completion hook");
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let waiting = rows.iter().find(|row| row.session_id == "019permission-target").expect("target");
+        assert_eq!(waiting.kind, ObservationKind::WaitingForInput);
+
+        fs::write(
+            &waiting_rollout,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019permission-target","cwd":"/Users/edy/shared","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:29:33.000Z","type":"event_msg","payload":{"type":"item_started"}}"#,
+        )
+        .expect("unrelated activity");
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let waiting = rows.iter().find(|row| row.session_id == "019permission-target").expect("target");
+        assert_eq!(waiting.kind, ObservationKind::WaitingForInput);
+
+        fs::write(
+            &waiting_rollout,
+            r#"{"timestamp":"2026-06-05T08:00:00.000Z","type":"session_meta","payload":{"id":"019permission-target","cwd":"/Users/edy/shared","originator":"Codex Desktop","source":"vscode"}}
+{"timestamp":"2026-06-05T08:29:29.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"touch probe.txt\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call_probe"}}
+{"timestamp":"2026-06-05T08:29:33.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_probe","output":"command finished"}}"#,
+        )
+        .expect("tool result");
+        let rows = discover_codex_observations_with_state_db_and_hooks(
+            &state_db,
+            temp.path(),
+            &hook_events,
+            20,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_648_800),
+        );
+        let running = rows.iter().find(|row| row.session_id == "019permission-target").expect("target");
+        assert_eq!(running.kind, ObservationKind::Running);
     }
 
     #[test]

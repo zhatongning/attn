@@ -143,7 +143,7 @@ export const defaultStatusPanelConfig: StatusPanelConfig = {
   styleFamily: "atom",
   palette: "oneDark",
   language: "en",
-  visibleItemCount: 1,
+  visibleItemCount: 3,
   panelMode: "auto",
   autoCollapseDelayMs: 30000,
   followUpToIdleMinutes: 30,

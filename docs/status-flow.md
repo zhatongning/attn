@@ -104,7 +104,7 @@ Unread-completion retention is 12 hours. After this window, a terminal unread co
 
 Generic non-terminal activity is still considered recent for 2 hours.
 When a session starts a new turn after `task_complete`, `task_started` and activity response items such as `custom_tool_call`, `custom_tool_call_output`, `reasoning`, and `message` reopen it as `Running`. An unresolved approval or structured user-input response remains `WaitingForInput` instead.
-For an unresolved input request, a later `PreToolUse`, `PostToolUse`, or `SessionStart` hook does not establish that the user answered it; the JSONL waiting state and its evidence remain authoritative. A matching tool result, an aborted turn, a strictly newer JSONL `user_message`, or a strictly newer `UserPromptSubmit` hook for the same session can move it out of waiting. The latest user-prompt hook remains evidence even when followed by tool hooks; after two hours without newer hook activity, the row becomes idle rather than resurrecting the old approval. Other completed or stopped states may still be reopened by newer hook activity under the usual rules.
+For an unresolved input request, a later `PreToolUse`, `PostToolUse`, or `SessionStart` hook does not establish that the user answered it; the JSONL waiting state and its evidence remain authoritative. A matching tool result, an aborted turn, a strictly newer JSONL `user_message`, or a strictly newer `UserPromptSubmit` hook for the same session can move it out of waiting. A `PermissionRequest` hook can mark the matching session as waiting before the rollout records the request; ordinary later tool hooks do not clear that marker. It clears on matching JSONL tool output, a new user message, or a completed/aborted turn. The latest user-prompt hook remains evidence even when followed by tool hooks; after two hours without newer hook activity, the row becomes idle rather than resurrecting the old approval. Other completed or stopped states may still be reopened by newer hook activity under the usual rules.
 The native tail reader preserves the complete status context before an oversized JSONL line. A delayed `item_completed` payload with very large command output must not evict an earlier `task_complete` and fall through to SQLite's recent-activity `Running` inference.
 
 ### SQLite Thread Rules
@@ -132,7 +132,7 @@ Terminal and intervention states such as `inspect`, `stopped`, `waitingForInput`
 
 ## Codex Hook Rules
 
-Codex supports lifecycle hooks such as `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
+Codex supports lifecycle hooks such as `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop`.
 These hooks are the preferred source for live status transitions when the app-owned hook writer is installed.
 
 ### Hook Event Semantics
@@ -142,6 +142,7 @@ These hooks are the preferred source for live status transitions when the app-ow
 | `SessionStart` with `startup` or `resume` | `Running` | A session has become active. |
 | `UserPromptSubmit` | `Running` | A new user request starts active work. |
 | `PreToolUse` | `Running` | The agent is about to execute a tool. |
+| `PermissionRequest` for `Bash` | `WaitingForInput` | Runs just before approval; it never decides the request. |
 | `PostToolUse` | `Running` | The agent just executed a tool; update last activity. |
 | `Stop` | pending terminal check | A turn ended. Do not classify as `Completed` by itself. |
 
@@ -152,6 +153,7 @@ After `Stop`, the app should consult JSONL and any hook payload to decide whethe
 
 The hook writer appends compact events to an app-owned local store.
 It does not require the UI process to be running.
+The desktop app watches the hook store, session JSONL, and Codex state database for changes and coalesces nearby notifications before refreshing the panel. A 30-second calibration refresh covers missed file events and untrusted or missing hooks.
 
 Current storage:
 

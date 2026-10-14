@@ -29,6 +29,15 @@ Codex has useful session history, but it does not provide a single local, action
 - Refreshes the panel every five seconds and keeps the panel visible across macOS Spaces.
 - Lets the user position the single panel by dragging it or through the macOS app menu.
 
+## Keyboard Shortcuts
+
+| Action | Default macOS shortcut |
+| --- | --- |
+| Expand or collapse the panel | **Control-Command-9** (`⌃⌘9`) |
+| Cycle the panel clockwise through its four corner positions | **Control-Command-P** (`⌃⌘P`) |
+
+Both shortcuts work while another app has focus and can be customized or disabled in **Attn -> Settings**. Saved shortcuts are preserved on upgrade. To adopt the new defaults, use **Restore default** for the panel shortcut and **Restore position default** for the position shortcut, then **Apply settings**.
+
 ## How It Works
 
 Attn combines several local evidence sources instead of treating one timestamp as definitive:
@@ -64,9 +73,10 @@ Attn operates on local Codex data. It reads:
 
 - Codex thread metadata from the local SQLite state database.
 - Session JSONL files under `~/.codex/sessions` for status evidence.
-- Optional hook events from `~/.codex/agent-session-inbox/hook-events.jsonl`.
+- Optional hook events from `~/.codex/agent-session-inbox/hook-events.jsonl`, including a `PermissionRequest` signal before a shell approval prompt.
 
 The hook writer records only the metadata needed for state transitions: event type, timestamp, session ID when supplied, workspace path, and tool name. It does not write raw prompts or model output. The panel displays status metadata and evidence confidence rather than conversation content.
+The desktop panel refreshes when Codex session, state database, or hook files change, with a 30-second calibration refresh if an event is missed. An approval event is scoped to its session and never automatically approves or denies the request.
 
 Hook installation is explicit. From **Attn -> Settings**, choose **Install Codex hooks** to merge Attn commands into the existing user-level Codex hook configuration. Existing hook commands are preserved and duplicate Attn commands are avoided.
 
@@ -77,7 +87,7 @@ Hook installation is explicit. From **Attn -> Settings**, choose **Install Codex
 - A Rust toolchain and the platform dependencies required by Tauri.
 - Local Codex Desktop or Codex CLI session data.
 
-The repository does not yet publish a tested Node.js, Rust, or macOS version matrix. Treat source builds as the supported installation path for this MVP.
+Automated builds use Node.js 24.20.0 and Rust 1.96.0 on macOS 15 runners for Apple Silicon and Intel. See [GitHub Builds](#github-builds) for downloadable builds; source builds remain available for development.
 
 ## Run Locally
 
@@ -109,6 +119,19 @@ To build a debug macOS app bundle:
 ```bash
 npm run tauri build -- --debug
 ```
+
+## GitHub Builds
+
+Every push to `master` runs the **Build Attn** GitHub Actions workflow. It can also be started manually from the repository's **Actions** tab. Each architecture installs dependencies with `npm ci`, runs the frontend and Rust tests, and builds a release `.app` and `.dmg` using the committed lockfiles.
+
+| Version | Runner | Rust target |
+| --- | --- | --- |
+| Apple Silicon | `macos-15` | `aarch64-apple-darwin` |
+| Intel | `macos-15-intel` | `x86_64-apple-darwin` |
+
+Download a completed run's packages from **Actions -> Build Attn -> run -> Artifacts**. Artifact names include the architecture, commit SHA, and run attempt, and packages are retained for 30 days. Each artifact contains a `.dmg`, an `.app.zip` archive that preserves the application bundle's permissions, and `SHA256SUMS.txt`.
+
+These builds use ad-hoc signing and do not require Apple developer credentials. They are not notarized; macOS may require approval in **System Settings -> Privacy & Security** when opening a downloaded build. Developer ID signing and Apple notarization are needed for trusted public distribution.
 
 ## Project Map
 

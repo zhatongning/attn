@@ -661,7 +661,7 @@ impl InboxStore {
         let _ = save_acknowledged_signals(&acknowledged_signals_path(), &acknowledged_signals);
     }
 
-    fn invalidate_session_rows_cache(&self) {
+    pub(crate) fn invalidate_session_rows_cache(&self) {
         *self
             .session_rows_cache
             .lock()
