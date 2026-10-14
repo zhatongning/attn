@@ -74,18 +74,67 @@ jobs:
           mkdir -p artifacts
           ditto -c -k --sequesterRsrc --keepParent \
             "$bundle_dir/macos/Attn.app" \
-            "artifacts/Attn-$BUILD_ARCH.app.zip"
-          cp "$bundle_dir/dmg/"*.dmg artifacts/
+            "artifacts/Attn-macOS-$BUILD_ARCH.app.zip"
+          installers=("$bundle_dir/dmg/"*.dmg)
+          if [[ ${#installers[@]} != 1 || ! -f "${installers[0]}" ]]; then
+            echo "Expected exactly one DMG installer"
+            exit 1
+          fi
+          cp "${installers[0]}" "artifacts/Attn-macOS-$BUILD_ARCH.dmg"
           (
             cd artifacts
-            shasum -a 256 *.dmg *.zip > SHA256SUMS.txt
+            shasum -a 256 *.dmg *.zip > "Attn-macOS-$BUILD_ARCH.SHA256SUMS.txt"
           )
 
       - name: Upload application and installer
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: Attn-macOS-${{ matrix.arch }}-${{ github.sha }}-${{ github.run_attempt }}
+          name: Attn-macOS-${{ matrix.arch }}-${{ github.sha }}
           path: artifacts/
           if-no-files-found: error
+          overwrite: true
           compression-level: 0
           retention-days: 30
+
+  publish:
+    name: Publish latest download
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: attn-release-publishing
+      cancel-in-progress: false
+    steps:
+      - name: Check out release publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download both application packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: Attn-macOS-*-${{ github.sha }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { publishGithubRelease } = await import(
+              `${process.env.GITHUB_WORKSPACE}/scripts/publishGithubRelease.mjs`
+            );
+            const result = await publishGithubRelease({
+              github,
+              context,
+              assetDirectory: `${process.env.GITHUB_WORKSPACE}/release-assets`,
+            });
+            if (result.skipped) core.notice(result.reason);
+            const summary = core.summary
+              .addHeading("Download Attn")
+              .addLink("Latest download page", result.latestUrl);
+            if (result.url) summary.addLink("This build", result.url);
+            await summary.write();

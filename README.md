@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+[Download latest build](https://github.com/zhatongning/attn/releases/latest) | [All builds](https://github.com/zhatongning/attn/releases)
+
 > A local macOS attention panel for Codex sessions that need a human decision, review, or recovery.
 
 Attn is a small, always-available status panel for people who work across several Codex sessions. It turns local session evidence into a short answer to one question: **do I need to do anything with this session now?**
@@ -122,14 +124,23 @@ npm run tauri build -- --debug
 
 ## GitHub Builds
 
-Every push to `master` runs the **Build Attn** GitHub Actions workflow. It can also be started manually from the repository's **Actions** tab. Each architecture installs dependencies with `npm ci`, runs the frontend and Rust tests, and builds a release `.app` and `.dmg` using the committed lockfiles.
+Every push to `master` automatically runs the **Build Attn** GitHub Actions workflow. Each architecture installs dependencies with `npm ci`, runs the frontend and Rust tests, and builds a release `.app` and `.dmg` using the committed lockfiles. After both architectures succeed, the workflow publishes a GitHub Release. Manual runs are optional; choose `master` to publish a release, or another branch for build artifacts only.
 
 | Version | Runner | Rust target |
 | --- | --- | --- |
 | Apple Silicon | `macos-15` | `aarch64-apple-darwin` |
 | Intel | `macos-15-intel` | `x86_64-apple-darwin` |
 
-Download a completed run's packages from **Actions -> Build Attn -> run -> Artifacts**. Artifact names include the architecture, commit SHA, and run attempt, and packages are retained for 30 days. Each artifact contains a `.dmg`, an `.app.zip` archive that preserves the application bundle's permissions, and `SHA256SUMS.txt`.
+Use the fixed [latest download page](https://github.com/zhatongning/attn/releases/latest) or the direct package links below. Public Release downloads do not require visiting Actions or signing into GitHub.
+
+| Mac | Installer | App archive | Checksums |
+| --- | --- | --- | --- |
+| Apple Silicon | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.SHA256SUMS.txt) |
+| Intel | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.SHA256SUMS.txt) |
+
+Each published build has an independent `build-<commit-sha>` tag. Release assets are kept beyond the 30-day Actions artifact retention window, and older builds remain available on the Releases page. The publisher uploads and verifies both architectures before making a draft public. Late older builds do not replace a newer latest download, and reruns preserve already published packages.
+
+Actions also retains packages for 30 days under **Actions -> Build Attn -> run -> Artifacts**. Each architecture's artifact includes its `.dmg`, permission-preserving `.app.zip`, and checksum file. Reruns replace that architecture's artifact for the same run so failed-job retries can reuse the other successful architecture.
 
 These builds use ad-hoc signing and do not require Apple developer credentials. They are not notarized; macOS may require approval in **System Settings -> Privacy & Security** when opening a downloaded build. Developer ID signing and Apple notarization are needed for trusted public distribution.
 
@@ -153,7 +164,7 @@ These are current product and technical boundaries, not guarantees that the pane
 3. **Some lifecycle windows are technical defaults.** Recent activity is currently two hours, unread completed work remains `inspect` for up to 12 hours, and the post-acknowledgement `follow-up` window defaults to 30 minutes with a 20-minute minimum. These values need continued product validation.
 4. **Some quiet and review states are intentionally broad.** `inspect` can represent either a successful completion or a reviewable failure, while `idle` can mean either old inactivity or a result that has already been acknowledged.
 5. **The product scope is narrow.** v1 does not support other agent providers, mobile workflows, scheduled cleanup, real activity summaries, or Warp terminal targeting.
-6. **Public contribution and release policies are still incomplete.** A dedicated contribution policy, compatibility matrix, and documented release process are still needed.
+6. **Public contribution and compatibility coverage are still incomplete.** A dedicated contribution policy and broader compatibility matrix are still needed.
 
 ## Contributing
 

@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+[下载最新构建](https://github.com/zhatongning/attn/releases/latest) | [全部构建版本](https://github.com/zhatongning/attn/releases)
+
 > 面向需要人工决策、检查或恢复的 Codex 会话的本地 macOS 关注面板。
 
 Attn 是一个面向同时处理多个 Codex 会话的用户的轻量常驻状态面板。它将本地会话证据归纳为一个问题的答案：**我现在是否需要处理这个会话？**
@@ -121,14 +123,23 @@ npm run tauri build -- --debug
 
 ## GitHub 构建
 
-每次向 `master` 推送都会运行 **Build Attn** GitHub Actions 工作流，也可从仓库的 **Actions** 页面手动启动。两个架构分别通过 `npm ci` 安装依赖、运行前端和 Rust 测试，再使用已提交的锁文件构建 release 版 `.app` 和 `.dmg`。
+每次向 `master` 推送都会自动运行 **Build Attn** GitHub Actions 工作流。两个架构分别通过 `npm ci` 安装依赖、运行前端和 Rust 测试，再使用已提交的锁文件构建 release 版 `.app` 和 `.dmg`。两个架构都成功后，工作流自动发布 GitHub Release。手动运行仅用于重跑；选择 `master` 会发布 Release，选择其他分支则只保留构建产物。
 
 | 版本 | Runner | Rust target |
 | --- | --- | --- |
 | Apple Silicon | `macos-15` | `aarch64-apple-darwin` |
 | Intel | `macos-15-intel` | `x86_64-apple-darwin` |
 
-构建完成后，从 **Actions -> Build Attn -> 构建记录 -> Artifacts** 下载。产物名称包含架构、提交 SHA 和重跑次数，保留 30 天。每份产物包含 `.dmg`、保留应用包权限的 `.app.zip`，以及 `SHA256SUMS.txt`。
+从固定的[最新版下载页](https://github.com/zhatongning/attn/releases/latest)下载，也可直接使用下面的安装包链接。公开 Release 可匿名下载，无需进入 Actions 或登录 GitHub。
+
+| Mac | 安装程序 | 应用压缩包 | 校验文件 |
+| --- | --- | --- | --- |
+| Apple Silicon | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.SHA256SUMS.txt) |
+| Intel | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.SHA256SUMS.txt) |
+
+每个已发布构建使用独立的 `build-<commit-sha>` 标签。Release 文件不受 Actions 产物 30 天保留期限制，历史构建可从 Releases 页面下载。发布任务校验两个架构的全部文件、上传完成后才公开草稿；较旧构建晚完成时不会覆盖较新的下载版本，重跑也不会改写已发布的文件。
+
+Actions 同时保留 30 天产物，入口为 **Actions -> Build Attn -> 构建记录 -> Artifacts**。每个架构的产物包含 `.dmg`、保留应用包权限的 `.app.zip` 和校验文件。同一次运行重跑时会替换该架构的产物，因此仅重试失败任务时可以复用另一架构已成功的产物。
 
 构建采用 ad-hoc 签名，无需 Apple 开发者凭证。这些产物未经 Apple 公证，首次打开下载的应用时，macOS 可能要求在 **系统设置 -> 隐私与安全性** 中允许打开。面向外部用户进行可信分发时，需要另行配置 Developer ID 签名和 Apple 公证。
 
@@ -152,7 +163,7 @@ npm run tauri build -- --debug
 3. **部分生命周期窗口仍是技术默认值。** 当前活动时间为两小时；未读完成任务最多保持 `inspect` 12 小时；确认后的 `follow-up` 默认持续 30 分钟，最小 20 分钟。这些数值仍需持续进行产品验证。
 4. **部分安静和检查状态刻意保持宽泛。** `inspect` 可以表示成功完成，也可以表示可检查的失败；`idle` 则可能表示旧会话不活跃，或结果已经被确认。
 5. **产品范围较窄。** v1 不支持其他 Agent 提供商、移动端工作流、定时清理、真实活动摘要或 Warp 终端跳转。
-6. **公开协作与发布规范仍需完善。** 还需要独立的贡献政策、兼容性矩阵和文档化的发布流程。
+6. **公开协作与兼容性覆盖仍需完善。** 还需要独立的贡献政策和更完整的兼容性矩阵。
 
 ## 参与贡献
 
