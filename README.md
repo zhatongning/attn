@@ -130,7 +130,7 @@ These are current product and technical boundaries, not guarantees that the pane
 3. **Some lifecycle windows are technical defaults.** Recent activity is currently two hours, unread completed work remains `inspect` for up to 12 hours, and the post-acknowledgement `follow-up` window defaults to 30 minutes with a 20-minute minimum. These values need continued product validation.
 4. **Some quiet and review states are intentionally broad.** `inspect` can represent either a successful completion or a reviewable failure, while `idle` can mean either old inactivity or a result that has already been acknowledged.
 5. **The product scope is narrow.** v1 does not support other agent providers, mobile workflows, scheduled cleanup, real activity summaries, or Warp terminal targeting.
-6. **The repository is not yet ready for public open-source distribution.** It has no declared license and `package.json` is marked `private`. A license, contribution policy, compatibility matrix, and release process are needed before treating it as a reusable public project.
+6. **Public contribution and release policies are still incomplete.** A dedicated contribution policy, compatibility matrix, and documented release process are still needed.
 
 ## Contributing
 
@@ -141,8 +141,8 @@ Contributions should preserve the distinction between evidence and inference. Wh
 3. Update [Status Flow](docs/status-flow.md) when transition or acknowledgement semantics change.
 4. Do not add raw prompts, model output, or private session data to tests, issues, or examples.
 
-Before accepting external contributions, maintainers should add a `LICENSE` file and a dedicated contribution policy.
+Before accepting external contributions, maintainers should add a dedicated contribution policy.
 
 ## License
 
-No license is currently declared. Until a license is added, the repository does not grant rights to use, modify, or redistribute its code, and contribution terms are unspecified. Choose and add an appropriate license before publishing Attn as an open-source project.
+Attn is licensed under the [MIT License](LICENSE).
