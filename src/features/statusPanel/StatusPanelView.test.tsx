@@ -301,6 +301,60 @@ describe("StatusPanelView", () => {
     expect(listRequestCount).toBe(2);
   });
 
+  it("keeps same-status rows in place across source refreshes and activity updates", async () => {
+    const first: SessionRow = {
+      ...initialSessions[1],
+      sessionId: "stable-first",
+      label: "First running task",
+      state: "running",
+      statusReason: "running signal observed",
+      lastActivityAt: "2026-10-15T03:03:00.000Z",
+    };
+    const second = { ...first, sessionId: "stable-second", label: "Second running task", lastActivityAt: "2026-10-15T03:02:00.000Z" };
+    const third = { ...first, sessionId: "stable-third", label: "Third running task", lastActivityAt: "2026-10-15T03:01:00.000Z" };
+    const newcomer = { ...first, sessionId: "stable-new", label: "New running task", lastActivityAt: "2026-10-15T04:00:00.000Z" };
+    let sourceRows = [first, second, third];
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({
+      panelMode: "persistent",
+      visibleItemCount: 2,
+    }));
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    let onSourcesChanged: (() => void) | undefined;
+    tauriEventMock.listen.mockImplementation(async (event, handler) => {
+      if (event === "agent-session-inbox://sources-changed") onSourcesChanged = handler as () => void;
+      return vi.fn<() => void>();
+    });
+    tauriCoreMock.invoke.mockImplementation(async (command: string) =>
+      command === "list_sessions" ? sourceRows : null,
+    );
+    const displayedIds = () => screen.getAllByRole("article").map((element) => element.getAttribute("data-testid"));
+
+    render(<StatusPanelView initialRows={sourceRows} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => expect(onSourcesChanged).toBeTruthy());
+    expect(displayedIds()).toEqual(["status-row-stable-first", "status-row-stable-second"]);
+
+    sourceRows = [
+      newcomer,
+      { ...third, lastActivityAt: "2026-10-15T03:59:00.000Z" },
+      { ...second, label: "Second task updated", lastActivityAt: "2026-10-15T03:58:00.000Z", activeSubagentCount: 2 },
+      first,
+    ];
+    await act(async () => onSourcesChanged?.());
+
+    expect(displayedIds()).toEqual(["status-row-stable-first", "status-row-stable-second"]);
+    expect(screen.getByText("Second task updated")).toBeTruthy();
+    expect(screen.getByTestId("status-subagent-stable-second").textContent).toContain("2");
+
+    sourceRows = [newcomer, third, first, { ...second, state: "waitingForInput" }];
+    await act(async () => onSourcesChanged?.());
+    expect(displayedIds()).toEqual(["status-row-stable-second", "status-row-stable-first"]);
+    expect(screen.getByTestId("status-row-stable-second").className).toContain("status-row--input");
+
+    sourceRows = [newcomer, third, first];
+    await act(async () => onSourcesChanged?.());
+    expect(displayedIds()).toEqual(["status-row-stable-first", "status-row-stable-third"]);
+  });
+
   it("keeps a source change queued behind a slow refresh without showing stale rows", async () => {
     const workingRow: SessionRow = {
       ...initialSessions[1],
@@ -3296,7 +3350,7 @@ describe("StatusPanelView", () => {
     });
   });
 
-  it("pins and unpins a row from the status panel", async () => {
+  it("keeps peer order through pin, unpin, and dismiss snapshots", async () => {
     const row: SessionRow = {
       ...initialSessions[0],
       sessionId: "pin-row",
@@ -3305,37 +3359,59 @@ describe("StatusPanelView", () => {
       pinned: false,
       statusReason: "completed task ready to inspect; open it to mark read",
     };
+    const before = { ...row, sessionId: "before-pin-row", label: "Before pin row" };
+    const after = { ...row, sessionId: "after-pin-row", label: "After pin row" };
+    const rows = [before, row, after];
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
       value: {},
     });
     let pinned = false;
+    let dismissed = false;
+    const snapshot = () => [...rows].reverse()
+      .filter((item) => !dismissed || item.sessionId !== row.sessionId)
+      .map((item) => item.sessionId === row.sessionId ? { ...item, pinned } : item);
     tauriCoreMock.invoke.mockImplementation(async (command: string) => {
-      if (command === "list_sessions") return [{ ...row, pinned }];
+      if (command === "list_sessions") return snapshot();
       if (command === "source_health") return fakeSourceHealth;
       if (command === "pin_session") {
         pinned = true;
-        return [{ ...row, pinned }];
+        return snapshot();
       }
       if (command === "unpin_session") {
         pinned = false;
-        return [{ ...row, pinned }];
+        return snapshot();
+      }
+      if (command === "dismiss_sessions") {
+        dismissed = true;
+        return snapshot();
       }
       return null;
     });
 
-    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
     expandPanel();
+    const displayedIds = () => screen.getAllByRole("article").map((element) => element.getAttribute("data-testid"));
+    const target = () => within(screen.getByTestId("status-row-pin-row"));
+    await waitFor(() => expect(tauriCoreMock.invoke).toHaveBeenCalledWith("list_sessions", expect.anything()));
+    expect(displayedIds()).toEqual(["status-row-before-pin-row", "status-row-pin-row", "status-row-after-pin-row"]);
 
-    fireEvent.click(await screen.findByTitle("Pin session"));
+    fireEvent.click(target().getByTitle("Pin session"));
 
     expect(tauriCoreMock.invoke).toHaveBeenCalledWith("pin_session", { sessionId: "pin-row" });
-    expect(await screen.findByTitle("Unpin session")).toBeTruthy();
+    expect(await target().findByTitle("Unpin session")).toBeTruthy();
+    expect(displayedIds()).toEqual(["status-row-pin-row", "status-row-before-pin-row", "status-row-after-pin-row"]);
 
-    fireEvent.click(screen.getByTitle("Unpin session"));
+    fireEvent.click(target().getByTitle("Unpin session"));
 
     expect(tauriCoreMock.invoke).toHaveBeenCalledWith("unpin_session", { sessionId: "pin-row" });
-    expect(await screen.findByTitle("Pin session")).toBeTruthy();
+    expect(await target().findByTitle("Pin session")).toBeTruthy();
+    expect(displayedIds()).toEqual(["status-row-before-pin-row", "status-row-pin-row", "status-row-after-pin-row"]);
+
+    fireEvent.click(target().getByTitle("Dismiss"));
+    await waitFor(() => expect(screen.queryByTestId("status-row-pin-row")).toBeNull());
+    expect(tauriCoreMock.invoke).toHaveBeenCalledWith("dismiss_sessions", { sessionIds: ["pin-row"] });
+    expect(displayedIds()).toEqual(["status-row-before-pin-row", "status-row-after-pin-row"]);
   });
 
   it("refreshes mutation results with the configured follow-up idle duration", async () => {

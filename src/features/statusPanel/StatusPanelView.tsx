@@ -23,6 +23,7 @@ import {
 import {
   buildStatusPanelModel,
   defaultStatusPanelConfig,
+  reconcileStatusPanelRows,
   type InterventionStatus,
   type StatusPanelConfig,
   type StatusPanelCopy,
@@ -232,7 +233,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (refreshId !== latestRefreshIdRef.current) {
         return;
       }
-      setRows(loadedRows);
+      setRows((currentRows) => reconcileStatusPanelRows(currentRows, loadedRows));
       setSessionSourceUnavailable(false);
       setErrorMessage(null);
     } catch (error: unknown) {
@@ -597,7 +598,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (!mountedRef.current) {
         return;
       }
-      setRows(updatedRows);
+      setRows((currentRows) => reconcileStatusPanelRows(currentRows, updatedRows));
       void refreshPanel(configRef.current.followUpToIdleMinutes, { invalidateActiveRefresh: true });
       if (!mountedRef.current) {
         return;
@@ -609,7 +610,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (!mountedRef.current) {
         return;
       }
-      setRows(previousRows);
+      setRows((currentRows) => reconcileStatusPanelRows(currentRows, previousRows));
       if (isLatestActionFeedback(actionFeedbackSequence)) {
         setErrorMessage(messageFromUnknownError(error, model.copy.dismissFailedLabel));
       }
@@ -635,7 +636,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (!mountedRef.current) {
         return;
       }
-      setRows(updatedRows);
+      setRows((currentRows) => reconcileStatusPanelRows(currentRows, updatedRows));
       void refreshPanel(configRef.current.followUpToIdleMinutes, { invalidateActiveRefresh: true });
       if (!mountedRef.current) {
         return;
@@ -647,7 +648,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       if (!mountedRef.current) {
         return;
       }
-      setRows(previousRows);
+      setRows((currentRows) => reconcileStatusPanelRows(currentRows, previousRows));
       if (isLatestActionFeedback(actionFeedbackSequence)) {
         setErrorMessage(messageFromUnknownError(error, model.copy.pinFailedLabel));
       }

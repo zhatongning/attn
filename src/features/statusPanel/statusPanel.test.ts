@@ -20,6 +20,25 @@ const baseRow: SessionRow = {
 };
 
 describe("buildStatusPanelModel", () => {
+  it.each<SessionRow["state"]>([
+    "running", "waitingForInput", "inspect", "dismissable", "stopped", "needsAttention", "idle", "unknown",
+  ])("preserves row order within %s regardless of last activity", (state) => {
+    const model = buildStatusPanelModel([
+      {
+        ...row("first", state, "source status unavailable"),
+        pinned: true,
+        lastActivityAt: "2026-10-15T03:00:00.000Z",
+      },
+      {
+        ...row("second", state, "source status unavailable"),
+        pinned: true,
+        lastActivityAt: "2026-10-15T04:00:00.000Z",
+      },
+    ]);
+
+    expect(model.visibleRows.map((item) => item.sessionId)).toEqual(["first", "second"]);
+  });
+
   it("maps source states to intervention display statuses", () => {
     const model = buildStatusPanelModel([
       row("needs-input", "waitingForInput", "waiting for user input"),
@@ -250,11 +269,11 @@ describe("buildStatusPanelModel", () => {
     ], { ...defaultStatusPanelConfig, visibleItemCount: 3 });
 
     expect(model.visibleRows.map((item) => item.sessionId)).toEqual([
-      "inspect-new",
-      "inspect-mid",
       "inspect-old",
+      "inspect-mid",
+      "inspect-new",
     ]);
-    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["working-mos", "working-wmhcar"]);
+    expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["working-wmhcar", "working-mos"]);
   });
 
   it("keeps pinned inspect rows visible ahead of working sessions and inspect backlog", () => {
@@ -271,8 +290,8 @@ describe("buildStatusPanelModel", () => {
 
     expect(model.visibleRows.map((item) => [item.sessionId, item.pinned])).toEqual([
       ["pinned-inspect", true],
-      ["inspect-new", false],
       ["inspect-old", false],
+      ["inspect-new", false],
     ]);
     expect(model.hiddenRows.map((item) => item.sessionId)).toEqual(["working-new"]);
   });
