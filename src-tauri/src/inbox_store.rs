@@ -86,6 +86,7 @@ pub struct InboxStore {
     desktop_observation_history: Mutex<HashMap<String, DesktopObservationHistory>>,
     latest_observation_snapshot_source: Mutex<Option<ObservationSnapshotSource>>,
     dismissed_sessions_path: PathBuf,
+    pinned_sessions_path: PathBuf,
 }
 
 impl Default for InboxStore {
@@ -98,6 +99,7 @@ impl Default for InboxStore {
             desktop_observation_history: Mutex::new(HashMap::new()),
             latest_observation_snapshot_source: Mutex::new(None),
             dismissed_sessions_path: dismissed_sessions_path(),
+            pinned_sessions_path: pinned_session_ids_path(),
         }
     }
 }
@@ -113,6 +115,7 @@ impl InboxStore {
             desktop_observation_history: Mutex::new(HashMap::new()),
             latest_observation_snapshot_source: Mutex::new(None),
             dismissed_sessions_path,
+            pinned_sessions_path: pinned_session_ids_path(),
         }
     }
 }
@@ -479,6 +482,7 @@ impl InboxStore {
         let _ = save_dismissed_session_ids(&self.dismissed_sessions_path, &dismissed_session_ids);
         drop(dismissed_session_ids);
 
+        self.refresh_persisted_pinned_session_ids();
         let mut pinned_session_ids = self
             .pinned_session_ids
             .lock()
@@ -486,7 +490,7 @@ impl InboxStore {
         for session_id in session_ids {
             pinned_session_ids.remove(session_id);
         }
-        let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
+        let _ = save_pinned_session_ids(&self.pinned_sessions_path, &pinned_session_ids);
         drop(pinned_session_ids);
         self.invalidate_session_rows_cache();
 
@@ -507,12 +511,13 @@ impl InboxStore {
     }
 
     pub fn pin_session(&self, session_id: &str) -> Vec<SessionRow> {
+        self.refresh_persisted_pinned_session_ids();
         let mut pinned_session_ids = self
             .pinned_session_ids
             .lock()
             .expect("pinned session store lock poisoned");
         pinned_session_ids.insert(session_id.to_string());
-        let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
+        let _ = save_pinned_session_ids(&self.pinned_sessions_path, &pinned_session_ids);
         drop(pinned_session_ids);
         self.invalidate_session_rows_cache();
 
@@ -520,12 +525,13 @@ impl InboxStore {
     }
 
     pub fn unpin_session(&self, session_id: &str) -> Vec<SessionRow> {
+        self.refresh_persisted_pinned_session_ids();
         let mut pinned_session_ids = self
             .pinned_session_ids
             .lock()
             .expect("pinned session store lock poisoned");
         pinned_session_ids.remove(session_id);
-        let _ = save_pinned_session_ids(&pinned_session_ids_path(), &pinned_session_ids);
+        let _ = save_pinned_session_ids(&self.pinned_sessions_path, &pinned_session_ids);
         drop(pinned_session_ids);
         self.invalidate_session_rows_cache();
 
@@ -735,7 +741,7 @@ impl InboxStore {
     }
 
     fn refresh_persisted_pinned_session_ids(&self) {
-        let loaded = load_pinned_session_ids(&pinned_session_ids_path());
+        let loaded = load_pinned_session_ids(&self.pinned_sessions_path);
         if loaded.is_empty() {
             return;
         }
@@ -3229,6 +3235,7 @@ mod tests {
             desktop_observation_history: std::sync::Mutex::new(std::collections::HashMap::new()),
             latest_observation_snapshot_source: std::sync::Mutex::new(None),
             dismissed_sessions_path: temp.path().join("dismissed-sessions.json"),
+            pinned_sessions_path: temp.path().join("pinned-sessions.json"),
         };
 
         let rows = store.list_sessions();
@@ -3717,6 +3724,54 @@ mod tests {
 
         assert_eq!(loaded, session_ids);
         assert!(fs::read_to_string(path).expect("pinned file").contains("s11"));
+    }
+
+    #[test]
+    fn pin_session_preserves_existing_pins_before_first_mutation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("pinned-sessions.json");
+        let existing = HashSet::from(["existing".to_string()]);
+        super::save_pinned_session_ids(&path, &existing).expect("seed pinned sessions");
+
+        let mut store = super::InboxStore::default();
+        store.pinned_sessions_path = path.clone();
+        let _ = store.pin_session("new");
+
+        let loaded = super::load_pinned_session_ids(&path);
+        assert_eq!(
+            loaded,
+            HashSet::from(["existing".to_string(), "new".to_string()])
+        );
+    }
+
+    #[test]
+    fn unpin_session_preserves_other_pins_before_first_mutation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("pinned-sessions.json");
+        let existing = HashSet::from(["keep".to_string(), "remove".to_string()]);
+        super::save_pinned_session_ids(&path, &existing).expect("seed pinned sessions");
+
+        let mut store = super::InboxStore::default();
+        store.pinned_sessions_path = path.clone();
+        let _ = store.unpin_session("remove");
+
+        let loaded = super::load_pinned_session_ids(&path);
+        assert_eq!(loaded, HashSet::from(["keep".to_string()]));
+    }
+
+    #[test]
+    fn dismiss_session_preserves_unrelated_pins_before_first_mutation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("pinned-sessions.json");
+        let existing = HashSet::from(["keep".to_string(), "dismissed".to_string()]);
+        super::save_pinned_session_ids(&path, &existing).expect("seed pinned sessions");
+
+        let mut store = super::InboxStore::default();
+        store.pinned_sessions_path = path.clone();
+        let _ = store.dismiss_session("dismissed");
+
+        let loaded = super::load_pinned_session_ids(&path);
+        assert_eq!(loaded, HashSet::from(["keep".to_string()]));
     }
 
     #[test]
