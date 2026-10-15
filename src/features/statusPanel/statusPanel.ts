@@ -433,6 +433,22 @@ const panelCopy: Record<StatusPanelConfig["language"], StatusPanelCopy> = {
   },
 };
 
+export function reconcileStatusPanelRows(previousRows: SessionRow[], nextRows: SessionRow[]): SessionRow[] {
+  const remainingRows = new Map(nextRows.map((row) => [row.sessionId, row]));
+  const orderedRows: SessionRow[] = [];
+
+  // Source snapshots are sorted by activity; keep known sessions in their existing order.
+  for (const previousRow of previousRows) {
+    const nextRow = remainingRows.get(previousRow.sessionId);
+    if (nextRow) {
+      orderedRows.push(nextRow);
+      remainingRows.delete(previousRow.sessionId);
+    }
+  }
+
+  return [...orderedRows, ...remainingRows.values()];
+}
+
 export function buildStatusPanelModel(
   rows: SessionRow[],
   config = defaultStatusPanelConfig,
@@ -538,16 +554,7 @@ function comparePanelRows(left: StatusPanelRow, right: StatusPanelRow) {
   const pinnedDelta = Number(right.pinned) - Number(left.pinned);
   if (pinnedDelta !== 0) return pinnedDelta;
 
-  const priorityDelta = statusPriority[left.displayStatus] - statusPriority[right.displayStatus];
-  if (priorityDelta !== 0) return priorityDelta;
-
-  return timestampValue(right.lastActivityAt) - timestampValue(left.lastActivityAt);
-}
-
-function timestampValue(value?: string) {
-  if (!value) return 0;
-  const timestamp = Date.parse(value);
-  return Number.isNaN(timestamp) ? 0 : timestamp;
+  return statusPriority[left.displayStatus] - statusPriority[right.displayStatus];
 }
 
 function toPanelRow(row: SessionRow, theme: AtomInterventionTheme, copy: StatusPanelCopy): StatusPanelRow {

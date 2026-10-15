@@ -78,6 +78,15 @@ Chinese labels, if the UI becomes localized:
 The UI language is a display configuration, not a state-model change.
 Internal states and persisted records should keep stable English identifiers; only user-facing labels and counters switch between English and Chinese.
 
+## Panel Row Order
+
+The panel keeps the existing PIN and display-status priorities. Within the same priority, sessions retain their first-seen order for the lifetime of the panel.
+
+- Activity timestamps, updated labels, evidence, subagent counts, and a different source snapshot order do not move existing sessions.
+- Newly discovered sessions follow existing sessions at the same priority, including sessions outside the visible card limit.
+- Display-status changes and explicit pin/unpin actions can move a session according to the normal priorities.
+- Sessions missing from a snapshot are removed; if they return later, they are treated as newly discovered sessions.
+
 ## Current Source Rules
 
 These are the rules implemented today.
