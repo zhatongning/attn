@@ -37,8 +37,9 @@ Codex has useful session history, but it does not provide a single local, action
 | --- | --- |
 | Expand or collapse the panel | **Control-Command-9** (`⌃⌘9`) |
 | Cycle the panel clockwise through its four corner positions | **Control-Command-P** (`⌃⌘P`) |
+| Jump to the first through fifth session in panel order | **Control-Command-1** through **Control-Command-5** (`⌃⌘1` through `⌃⌘5`) |
 
-Both shortcuts work while another app has focus and can be customized or disabled in **Attn -> Settings**. Saved shortcuts are preserved on upgrade. To adopt the new defaults, use **Restore default** for the panel shortcut and **Restore position default** for the position shortcut, then **Apply settings**.
+The panel and position shortcuts work while another app has focus and can be customized or disabled in **Attn -> Settings**. Session Jump shortcuts are fixed and follow the current panel ordering. Saved shortcuts are preserved on upgrade. To adopt the new defaults, use **Restore default** for the panel shortcut and **Restore position default** for the position shortcut, then **Apply settings**.
 
 ## How It Works
 

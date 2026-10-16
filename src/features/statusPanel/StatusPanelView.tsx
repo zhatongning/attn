@@ -52,6 +52,7 @@ const PANEL_MAX_HEIGHT = 420;
 const PANEL_STRIP_HEIGHT = 50;
 const COMMAND_MESSAGE_DISMISS_DELAY_MS = 3000;
 const PANEL_REFRESH_INTERVAL_MS = 30000;
+const SESSION_JUMP_SHORTCUT_COUNT = 5;
 const AUTO_COLLAPSE_STATUS_OPTIONS: InterventionStatus[] = ["blocked", "input", "inspect", "stopped", "working"];
 const AUTO_COLLAPSE_STATUS_SET = new Set<InterventionStatus>(AUTO_COLLAPSE_STATUS_OPTIONS);
 
@@ -124,6 +125,8 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
+  const sessionShortcutRowsRef = useRef<StatusPanelRow[]>([]);
+  const jumpToSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   const [legacyPlacement] = useState(loadLegacyPlacement);
   const initialPlacementRestoreRef = useRef<Promise<boolean>>(Promise.resolve(true));
   const latestRequestedGenerationRef = useRef(0);
@@ -135,6 +138,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const [placementUnconfirmed, setPlacementUnconfirmed] = useState<PlacementFailure | null>(null);
   const [placementPersistenceError, setPlacementPersistenceError] = useState<PlacementFailure | null>(null);
   const model = useMemo(() => buildStatusPanelModel(rows, config), [config, rows]);
+  const sessionShortcutRows = useMemo(() => {
+    return buildStatusPanelModel(rows, { ...config, visibleItemCount: SESSION_JUMP_SHORTCUT_COUNT }).visibleRows;
+  }, [config, rows]);
+  sessionShortcutRowsRef.current = sessionShortcutRows;
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
   const hasPendingJump = Object.values(pendingActions).includes("jump");
   const hasPanelMessage = commandMessage !== null || errorMessage !== null;
@@ -346,6 +353,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
     let unlistenToggle: (() => void) | undefined;
     let unlistenMenu: (() => void) | undefined;
     let unlistenSources: (() => void) | undefined;
+    let unlistenSessionJump: (() => void) | undefined;
 
     void listen("agent-session-inbox://sources-changed", () => {
       if (!cancelled) {
@@ -370,6 +378,28 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
         return;
       }
       unlistenToggle = unlisten;
+    }).catch(() => undefined);
+
+    void listen<number>("agent-session-inbox://jump-session", (event) => {
+      if (
+        cancelled
+        || !Number.isInteger(event.payload)
+        || event.payload < 1
+        || event.payload > SESSION_JUMP_SHORTCUT_COUNT
+      ) {
+        return;
+      }
+
+      const row = sessionShortcutRowsRef.current[event.payload - 1];
+      if (row) {
+        jumpToSessionRef.current(row.sessionId);
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSessionJump = unlisten;
     }).catch(() => undefined);
 
     void listen<string>("agent-session-inbox://open-management", (event) => {
@@ -407,6 +437,7 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       unlistenToggle?.();
       unlistenMenu?.();
       unlistenSources?.();
+      unlistenSessionJump?.();
     };
   }, []);
 
@@ -691,6 +722,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       clearPendingAction(sessionId);
     }
   }
+  jumpToSessionRef.current = (sessionId) => {
+    void jumpToSession(sessionId);
+  };
 
   if (view === "management") {
     return (

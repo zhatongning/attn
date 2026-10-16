@@ -321,7 +321,7 @@ pub fn run() {
 
             #[cfg(desktop)]
             if let Err(error) = panel_shortcut::register_default(app.handle()) {
-                eprintln!("failed to register default panel shortcut: {error}");
+                eprintln!("failed to register default panel/session shortcuts: {error}");
             }
             app.handle().on_menu_event(|app, event| {
                 let menu_id = event.id().as_ref();

@@ -13,6 +13,15 @@ pub use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEven
 
 pub const DEFAULT_PANEL_SHORTCUT: &str = "control+super+9";
 pub const TOGGLE_PANEL_EVENT: &str = "agent-session-inbox://toggle-panel";
+pub const SESSION_JUMP_EVENT: &str = "agent-session-inbox://jump-session";
+
+const SESSION_JUMP_SHORTCUTS: [(&str, u8); 5] = [
+    ("control+super+1", 1),
+    ("control+super+2", 2),
+    ("control+super+3", 3),
+    ("control+super+4", 4),
+    ("control+super+5", 5),
+];
 
 #[derive(Default)]
 pub struct PanelShortcutState {
@@ -23,6 +32,7 @@ pub struct PanelShortcutState {
 struct PanelShortcutRegistrations {
     toggle: ShortcutRegistrationState,
     position: ShortcutRegistrationState,
+    session_jumps: SessionJumpRegistrationState,
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +50,18 @@ enum ShortcutRegistrationState {
 impl Default for ShortcutRegistrationState {
     fn default() -> Self {
         Self::Known(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionJumpRegistrationState {
+    Known(bool),
+    Uncertain,
+}
+
+impl Default for SessionJumpRegistrationState {
+    fn default() -> Self {
+        Self::Known(false)
     }
 }
 
@@ -188,13 +210,83 @@ pub fn configure_position_shortcut(
 
 pub fn register_default<R: Runtime>(app: &AppHandle<R>) -> Result<(), PanelShortcutError> {
     let state = app.state::<PanelShortcutState>();
-    update_native_shortcut(
+    let toggle_result = update_native_shortcut(
         app,
         state.inner(),
         ShortcutAction::Toggle,
         Some(DEFAULT_PANEL_SHORTCUT),
     )
-    .map(|_| ())
+    .map(|_| ());
+    if let Err(error) = &toggle_result {
+        eprintln!("failed to register panel toggle shortcut: {error}");
+    }
+
+    let mut registrar = NativeShortcutRegistrar {
+        app,
+        handler: handle_session_jump_shortcut_event::<R>,
+    };
+    let jump_result = {
+        let mut registrations = state.active.lock().unwrap();
+        register_session_jump_shortcuts(&mut registrations, &mut registrar)
+    };
+    if let Err(error) = &jump_result {
+        eprintln!("failed to register session Jump shortcuts: {error}");
+    }
+
+    toggle_result.and(jump_result)
+}
+
+fn register_session_jump_shortcuts(
+    registrations: &mut PanelShortcutRegistrations,
+    registrar: &mut impl ShortcutRegistrar,
+) -> Result<(), PanelShortcutError> {
+    match registrations.session_jumps {
+        SessionJumpRegistrationState::Known(true) => return Ok(()),
+        SessionJumpRegistrationState::Uncertain => {
+            return Err(session_jump_registration_error(
+                PanelShortcutErrorCode::RegistrationUncertain,
+                registrations.session_jumps,
+            ));
+        }
+        SessionJumpRegistrationState::Known(false) => {}
+    }
+
+    let mut registered: Vec<&str> = Vec::new();
+    for (binding, _) in SESSION_JUMP_SHORTCUTS {
+        if registrar.register(binding).is_err() {
+            let mut rollback_failed = false;
+            for previous in registered.iter().rev() {
+                if registrar.unregister(previous).is_err() {
+                    rollback_failed = true;
+                }
+            }
+            if rollback_failed {
+                registrations.session_jumps = SessionJumpRegistrationState::Uncertain;
+                return Err(session_jump_registration_error(
+                    PanelShortcutErrorCode::RollbackFailed,
+                    registrations.session_jumps,
+                ));
+            }
+            return Err(session_jump_registration_error(
+                PanelShortcutErrorCode::RegistrationFailed,
+                registrations.session_jumps,
+            ));
+        }
+        registered.push(binding);
+    }
+    registrations.session_jumps = SessionJumpRegistrationState::Known(true);
+    Ok(())
+}
+
+fn session_jump_registration_error(
+    code: PanelShortcutErrorCode,
+    state: SessionJumpRegistrationState,
+) -> PanelShortcutError {
+    PanelShortcutError {
+        code,
+        active_shortcut: None,
+        state_uncertain: matches!(state, SessionJumpRegistrationState::Uncertain),
+    }
 }
 
 pub fn canonicalize_shortcut(value: &str) -> Result<String, PanelShortcutErrorCode> {
@@ -338,6 +430,15 @@ fn apply_action_shortcut_update(
         .map(canonicalize_shortcut)
         .transpose()
         .map_err(|code| PanelShortcutError::from_state(code, active))?;
+    if canonical
+        .as_deref()
+        .is_some_and(|binding| session_jump_index_from_binding(binding).is_some())
+    {
+        return Err(PanelShortcutError::from_state(
+            PanelShortcutErrorCode::RegistrationFailed,
+            active,
+        ));
+    }
     if matches!(other, ShortcutRegistrationState::Known(Some(existing)) if canonical.as_ref() == Some(existing)) {
         return Err(PanelShortcutError::from_state(
             PanelShortcutErrorCode::RegistrationFailed,
@@ -355,6 +456,28 @@ fn handle_shortcut_event(state: ShortcutState, on_pressed: impl FnOnce()) {
     if is_pressed(state) {
         on_pressed();
     }
+}
+
+fn session_jump_index_from_binding(binding: &str) -> Option<u8> {
+    SESSION_JUMP_SHORTCUTS
+        .iter()
+        .find_map(|(shortcut, index)| (*shortcut == binding).then_some(*index))
+}
+
+fn session_jump_index(shortcut: &Shortcut) -> Option<u8> {
+    session_jump_index_from_binding(&canonicalize_native_shortcut((*shortcut).into_string()))
+}
+
+fn dispatch_session_jump_shortcut(
+    shortcut: &Shortcut,
+    state: ShortcutState,
+    emit: impl FnOnce(&'static str, u8),
+) {
+    handle_shortcut_event(state, || {
+        if let Some(index) = session_jump_index(shortcut) {
+            emit(SESSION_JUMP_EVENT, index);
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -399,6 +522,16 @@ fn emit_panel_toggle<R: Runtime>(app: &AppHandle<R>, was_hidden: bool) {
         was_hidden,
     ) {
         eprintln!("failed to emit global panel shortcut event: {error}");
+    }
+}
+
+fn emit_session_jump<R: Runtime>(app: &AppHandle<R>, index: u8) {
+    if let Err(error) = app.emit_to(
+        EventTarget::webview_window("main"),
+        SESSION_JUMP_EVENT,
+        index,
+    ) {
+        eprintln!("failed to emit global session jump shortcut event: {error}");
     }
 }
 
@@ -466,6 +599,16 @@ fn handle_panel_shortcut_event<R: Runtime>(
     });
 }
 
+fn handle_session_jump_shortcut_event<R: Runtime>(
+    app: &AppHandle<R>,
+    shortcut: &Shortcut,
+    event: ShortcutEvent,
+) {
+    dispatch_session_jump_shortcut(shortcut, event.state, |_, index| {
+        emit_session_jump(app, index);
+    });
+}
+
 fn handle_position_shortcut_event<R: Runtime>(
     app: &AppHandle<R>,
     _shortcut: &Shortcut,
@@ -487,6 +630,7 @@ mod tests {
         PanelShortcutError, PanelShortcutErrorCode, PanelShortcutUpdate, ShortcutRegistrar,
         ShortcutRegistrationState,
     };
+    use std::str::FromStr;
     use tauri_plugin_global_shortcut::ShortcutState;
     #[cfg(target_os = "macos")]
     use std::sync::Mutex;
@@ -495,13 +639,14 @@ mod tests {
     struct FakeRegistrar {
         operations: Vec<String>,
         fail_register: bool,
+        fail_register_for: Vec<String>,
         fail_unregister_for: Vec<String>,
     }
 
     impl ShortcutRegistrar for FakeRegistrar {
         fn register(&mut self, shortcut: &str) -> Result<(), ()> {
             self.operations.push(format!("register:{shortcut}"));
-            if self.fail_register {
+            if self.fail_register || self.fail_register_for.iter().any(|value| value == shortcut) {
                 Err(())
             } else {
                 Ok(())
@@ -805,10 +950,230 @@ mod tests {
     }
 
     #[test]
+    fn numbered_session_jump_shortcuts_emit_one_based_indexes_only_when_pressed() {
+        for (binding, expected_index) in [
+            ("control+super+1", 1),
+            ("control+super+2", 2),
+            ("control+super+3", 3),
+            ("control+super+4", 4),
+            ("control+super+5", 5),
+        ] {
+            let shortcut = super::Shortcut::from_str(binding).expect("parse jump shortcut");
+            let mut emitted = None;
+
+            super::dispatch_session_jump_shortcut(
+                &shortcut,
+                ShortcutState::Pressed,
+                |event, index| emitted = Some((event, index)),
+            );
+
+            assert_eq!(
+                emitted,
+                Some((super::SESSION_JUMP_EVENT, expected_index))
+            );
+
+            let mut released = None;
+            super::dispatch_session_jump_shortcut(
+                &shortcut,
+                ShortcutState::Released,
+                |event, index| released = Some((event, index)),
+            );
+
+            assert_eq!(released, None);
+        }
+    }
+
+    #[test]
+    fn panel_toggle_shortcut_does_not_emit_a_session_jump() {
+        let shortcut = super::Shortcut::from_str(super::DEFAULT_PANEL_SHORTCUT)
+            .expect("parse panel toggle shortcut");
+        let mut emitted = false;
+
+        super::dispatch_session_jump_shortcut(
+            &shortcut,
+            ShortcutState::Pressed,
+            |_, _| emitted = true,
+        );
+
+        assert!(!emitted);
+    }
+
+    #[test]
+    fn numbered_session_jump_bindings_are_reserved_from_configurable_shortcuts() {
+        let mut registrations = super::PanelShortcutRegistrations {
+            toggle: ShortcutRegistrationState::Known(Some("control+super+9".into())),
+            position: ShortcutRegistrationState::Known(Some("control+super+p".into())),
+            session_jumps: Default::default(),
+        };
+        let mut registrar = FakeRegistrar::default();
+
+        let toggle_error = super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Toggle,
+            Some("control+super+1"),
+            &mut registrar,
+        )
+        .unwrap_err();
+        let position_error = super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Position,
+            Some("control+super+5"),
+            &mut registrar,
+        )
+        .unwrap_err();
+
+        assert_eq!(toggle_error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(toggle_error.active_shortcut.as_deref(), Some("control+super+9"));
+        assert_eq!(position_error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(position_error.active_shortcut.as_deref(), Some("control+super+p"));
+        assert!(registrar.operations.is_empty());
+    }
+
+    #[test]
+    fn registers_all_fixed_session_jump_bindings() {
+        let mut registrar = FakeRegistrar::default();
+
+        let mut registrations = super::PanelShortcutRegistrations::default();
+        super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect("register jump shortcuts");
+
+        assert_eq!(
+            registrar.operations,
+            vec![
+                "register:control+super+1".to_owned(),
+                "register:control+super+2".to_owned(),
+                "register:control+super+3".to_owned(),
+                "register:control+super+4".to_owned(),
+                "register:control+super+5".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_session_jump_registration_continues_when_toggle_registration_fails() {
+        let mut registrations = super::PanelShortcutRegistrations::default();
+        let mut registrar = FakeRegistrar {
+            fail_register_for: vec!["control+super+9".to_owned()],
+            ..Default::default()
+        };
+
+        let toggle_error = super::apply_action_shortcut_update(
+            &mut registrations,
+            super::ShortcutAction::Toggle,
+            Some("control+super+9"),
+            &mut registrar,
+        )
+        .expect_err("toggle registration failure must be surfaced");
+        assert_eq!(toggle_error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(
+            registrations.toggle,
+            ShortcutRegistrationState::Known(None)
+        );
+
+        super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect("fixed session jumps should still register");
+
+        assert_eq!(
+            registrations.session_jumps,
+            super::SessionJumpRegistrationState::Known(true)
+        );
+        assert_eq!(
+            registrar.operations,
+            vec![
+                "register:control+super+9".to_owned(),
+                "register:control+super+1".to_owned(),
+                "register:control+super+2".to_owned(),
+                "register:control+super+3".to_owned(),
+                "register:control+super+4".to_owned(),
+                "register:control+super+5".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rolls_back_fixed_session_jump_registration_after_a_mid_batch_failure() {
+        let mut registrar = FakeRegistrar {
+            fail_register_for: vec!["control+super+3".to_owned()],
+            ..Default::default()
+        };
+        let mut registrations = super::PanelShortcutRegistrations::default();
+
+        let error = super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect_err("registration must roll back after a failed binding");
+
+        assert_eq!(error.code, PanelShortcutErrorCode::RegistrationFailed);
+        assert_eq!(
+            registrar.operations,
+            vec![
+                "register:control+super+1".to_owned(),
+                "register:control+super+2".to_owned(),
+                "register:control+super+3".to_owned(),
+                "unregister:control+super+2".to_owned(),
+                "unregister:control+super+1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_session_jump_registration_is_idempotent_after_success() {
+        let mut registrations = super::PanelShortcutRegistrations::default();
+        let mut registrar = FakeRegistrar::default();
+
+        super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect("first registration");
+        super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect("second registration is a no-op");
+
+        assert_eq!(registrar.operations.len(), 5);
+        assert_eq!(
+            registrations.session_jumps,
+            super::SessionJumpRegistrationState::Known(true)
+        );
+    }
+
+    #[test]
+    fn fixed_session_jump_registration_blocks_retry_after_rollback_failure() {
+        let mut registrations = super::PanelShortcutRegistrations::default();
+        let mut registrar = FakeRegistrar {
+            fail_register_for: vec!["control+super+3".to_owned()],
+            fail_unregister_for: vec!["control+super+2".to_owned()],
+            ..Default::default()
+        };
+
+        let error = super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect_err("rollback failure must be surfaced");
+
+        assert_eq!(error.code, PanelShortcutErrorCode::RollbackFailed);
+        assert!(error.state_uncertain);
+        assert_eq!(
+            registrations.session_jumps,
+            super::SessionJumpRegistrationState::Uncertain
+        );
+        assert_eq!(
+            &registrar.operations,
+            &vec![
+                "register:control+super+1".to_owned(),
+                "register:control+super+2".to_owned(),
+                "register:control+super+3".to_owned(),
+                "unregister:control+super+2".to_owned(),
+                "unregister:control+super+1".to_owned(),
+            ]
+        );
+        let operations = registrar.operations.clone();
+
+        let retry = super::register_session_jump_shortcuts(&mut registrations, &mut registrar)
+            .expect_err("uncertain state must block blind retry");
+
+        assert_eq!(retry.code, PanelShortcutErrorCode::RegistrationUncertain);
+        assert_eq!(registrar.operations, operations);
+    }
+
+    #[test]
     fn position_shortcut_cannot_replace_the_existing_panel_toggle_binding() {
         let mut registrations = super::PanelShortcutRegistrations {
             toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
             position: ShortcutRegistrationState::Known(Some("shift+control+super+space".into())),
+            session_jumps: Default::default(),
         };
         let mut registrar = FakeRegistrar::default();
 
@@ -838,6 +1203,7 @@ mod tests {
             active: std::sync::Mutex::new(super::PanelShortcutRegistrations {
                 toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
                 position: ShortcutRegistrationState::Known(Some("shift+control+super+space".into())),
+                session_jumps: Default::default(),
             }),
         };
         let displays = [DisplayFrame { x: 0, y: 0, width: 1920, height: 1080, scale_factor: 1.0 }];
@@ -910,6 +1276,7 @@ mod tests {
         let mut registrations = super::PanelShortcutRegistrations {
             toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
             position: ShortcutRegistrationState::Known(Some("shift+control+super+space".into())),
+            session_jumps: Default::default(),
         };
         let mut registrar = FakeRegistrar::default();
 
@@ -940,6 +1307,7 @@ mod tests {
         let mut registrations = super::PanelShortcutRegistrations {
             toggle: ShortcutRegistrationState::Known(Some("shift+alt+super+space".into())),
             position: ShortcutRegistrationState::Known(None),
+            session_jumps: Default::default(),
         };
         let mut registrar = FakeRegistrar::default();
 

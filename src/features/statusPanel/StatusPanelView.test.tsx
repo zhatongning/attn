@@ -2179,17 +2179,18 @@ describe("StatusPanelView", () => {
     const { listen } = await import("@tauri-apps/api/event");
     const registrations: Array<{
       event: string;
-      callback: (event: { payload: boolean | string }) => void;
+      callback: (event: { payload: boolean | string | number }) => void;
       resolve: (unlisten: () => void) => void;
     }> = [];
     const unlistenToggle = vi.fn();
     const unlistenMenu = vi.fn();
     const unlistenSources = vi.fn();
+    const unlistenSessionJump = vi.fn();
     vi.mocked(listen).mockImplementation((event, callback) => {
       return new Promise((resolve) => {
         registrations.push({
           event,
-          callback: callback as (event: { payload: boolean | string }) => void,
+          callback: callback as (event: { payload: boolean | string | number }) => void,
           resolve,
         });
       });
@@ -2205,6 +2206,7 @@ describe("StatusPanelView", () => {
       expect(registrations.filter(({ event }) => event === "agent-session-inbox://toggle-panel")).toHaveLength(2);
       expect(registrations.filter(({ event }) => event === "agent-session-inbox://open-management")).toHaveLength(2);
       expect(registrations.filter(({ event }) => event === "agent-session-inbox://sources-changed")).toHaveLength(2);
+      expect(registrations.filter(({ event }) => event === "agent-session-inbox://jump-session")).toHaveLength(2);
     });
 
     const staleToggle = registrations.find(({ event }) => event === "agent-session-inbox://toggle-panel");
@@ -2223,7 +2225,7 @@ describe("StatusPanelView", () => {
 
     await act(async () => {
       registrations.forEach(({ callback, event }) => {
-        callback({ payload: event === "agent-session-inbox://toggle-panel" ? false : "management" });
+        callback({ payload: event === "agent-session-inbox://toggle-panel" ? false : event === "agent-session-inbox://jump-session" ? 1 : "management" });
       });
       registrations.forEach(({ event, resolve }) => {
         resolve(
@@ -2231,6 +2233,8 @@ describe("StatusPanelView", () => {
             ? unlistenToggle
             : event === "agent-session-inbox://open-management"
               ? unlistenMenu
+              : event === "agent-session-inbox://jump-session"
+                ? unlistenSessionJump
               : unlistenSources,
         );
       });
@@ -2239,6 +2243,7 @@ describe("StatusPanelView", () => {
     expect(unlistenToggle).toHaveBeenCalledTimes(2);
     expect(unlistenMenu).toHaveBeenCalledTimes(2);
     expect(unlistenSources).toHaveBeenCalledTimes(2);
+    expect(unlistenSessionJump).toHaveBeenCalledTimes(2);
   });
 
   it("applies management settings only after confirmation", async () => {
@@ -3308,6 +3313,216 @@ describe("StatusPanelView", () => {
     expect(screen.getByLabelText("Show status evidence for AMap geolocation preload investigation")).toBeTruthy();
     expect(screen.getByText("follow-up")).toBeTruthy();
     expect(screen.queryByText("+1 quiet")).toBeNull();
+  });
+
+  it("runs Jump for the second current panel shortcut target", async () => {
+    const firstRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "shortcut-first-row",
+      label: "First shortcut row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const secondRow: SessionRow = {
+      ...firstRow,
+      sessionId: "shortcut-second-row",
+      label: "Second shortcut row",
+    };
+    let triggerSessionJump: ((event: { payload: unknown }) => void) | undefined;
+    const jumpedSessionIds: string[] = [];
+    const { listen } = await import("@tauri-apps/api/event");
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://jump-session") {
+        triggerSessionJump = callback as typeof triggerSessionJump;
+      }
+      return vi.fn<() => void>();
+    });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/sessions") return jsonResponse([firstRow, secondRow]);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      if (pathname === "/api/jump") {
+        const { sessionId } = JSON.parse(String(init?.body)) as { sessionId: string };
+        jumpedSessionIds.push(sessionId);
+        return jsonResponse({
+          sessionId,
+          availability: "exact",
+          target: "desktop",
+          succeeded: true,
+          message: "Opened Codex Desktop session.",
+        });
+      }
+      return jsonResponse({}, 404);
+    }));
+
+    render(<StatusPanelView initialRows={[firstRow, secondRow]} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => expect(triggerSessionJump).toBeTypeOf("function"));
+    await act(async () => {
+      triggerSessionJump?.({ payload: 2 });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(jumpedSessionIds).toEqual(["shortcut-second-row"]));
+  });
+
+  it("runs Jump for the fifth target even when the panel shows three rows", async () => {
+    const rows: SessionRow[] = ["first", "second", "third", "fourth", "fifth"].map((ordinal) => ({
+      ...initialSessions[0],
+      sessionId: `shortcut-${ordinal}-target`,
+      label: `Shortcut ${ordinal} target`,
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    }));
+    let triggerSessionJump: ((event: { payload: unknown }) => void) | undefined;
+    const jumpedSessionIds: string[] = [];
+    const { listen } = await import("@tauri-apps/api/event");
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://jump-session") {
+        triggerSessionJump = callback as typeof triggerSessionJump;
+      }
+      return vi.fn<() => void>();
+    });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/sessions") return jsonResponse(rows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      if (pathname === "/api/jump") {
+        const { sessionId } = JSON.parse(String(init?.body)) as { sessionId: string };
+        jumpedSessionIds.push(sessionId);
+        return jsonResponse({
+          sessionId,
+          availability: "exact",
+          target: "desktop",
+          succeeded: true,
+          message: "Opened Codex Desktop session.",
+        });
+      }
+      return jsonResponse({}, 404);
+    }));
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
+
+    render(<StatusPanelView initialRows={rows} sourceHealth={fakeSourceHealth} />);
+
+    expect(await screen.findAllByRole("article")).toHaveLength(3);
+    await waitFor(() => expect(triggerSessionJump).toBeTypeOf("function"));
+    await act(async () => {
+      triggerSessionJump?.({ payload: 5 });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(jumpedSessionIds).toEqual(["shortcut-fifth-target"]));
+  });
+
+  it("uses the refreshed panel order for a session shortcut", async () => {
+    const initialFirstRow: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "initial-shortcut-first-row",
+      label: "Initial shortcut first row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    const initialSecondRow: SessionRow = {
+      ...initialFirstRow,
+      sessionId: "initial-shortcut-second-row",
+      label: "Initial shortcut second row",
+    };
+    const refreshedFirstRow: SessionRow = {
+      ...initialFirstRow,
+      sessionId: "refreshed-shortcut-first-row",
+      label: "Refreshed shortcut first row",
+    };
+    const refreshedSecondRow: SessionRow = {
+      ...initialSecondRow,
+      sessionId: "refreshed-shortcut-second-row",
+      label: "Refreshed shortcut second row",
+    };
+    let sourceRows = [initialFirstRow, initialSecondRow];
+    let triggerSourcesChanged: ((event: { payload: unknown }) => void) | undefined;
+    let triggerSessionJump: ((event: { payload: unknown }) => void) | undefined;
+    const jumpedSessionIds: string[] = [];
+    const { listen } = await import("@tauri-apps/api/event");
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://sources-changed") {
+        triggerSourcesChanged = callback as typeof triggerSourcesChanged;
+      }
+      if (event === "agent-session-inbox://jump-session") {
+        triggerSessionJump = callback as typeof triggerSessionJump;
+      }
+      return vi.fn<() => void>();
+    });
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/sessions") return jsonResponse(sourceRows);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      if (pathname === "/api/jump") {
+        const { sessionId } = JSON.parse(String(init?.body)) as { sessionId: string };
+        jumpedSessionIds.push(sessionId);
+        return jsonResponse({
+          sessionId,
+          availability: "exact",
+          target: "desktop",
+          succeeded: true,
+          message: "Opened Codex Desktop session.",
+        });
+      }
+      return jsonResponse({}, 404);
+    }));
+
+    window.localStorage.setItem("attn.statusPanelConfig", JSON.stringify({ panelMode: "persistent" }));
+
+    render(<StatusPanelView initialRows={sourceRows} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => {
+      expect(triggerSourcesChanged).toBeTypeOf("function");
+      expect(triggerSessionJump).toBeTypeOf("function");
+    });
+    sourceRows = [refreshedFirstRow, refreshedSecondRow];
+    await act(async () => {
+      triggerSourcesChanged?.({ payload: undefined });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByText("Refreshed shortcut first row")).toBeTruthy());
+    await act(async () => {
+      triggerSessionJump?.({ payload: 1 });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(jumpedSessionIds).toEqual(["refreshed-shortcut-first-row"]));
+  });
+
+  it("ignores a session shortcut outside the first five targets", async () => {
+    const row: SessionRow = {
+      ...initialSessions[0],
+      sessionId: "shortcut-boundary-row",
+      state: "inspect",
+      statusReason: "completed task ready to inspect; open it to mark read",
+    };
+    let triggerSessionJump: ((event: { payload: unknown }) => void) | undefined;
+    const { listen } = await import("@tauri-apps/api/event");
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "agent-session-inbox://jump-session") {
+        triggerSessionJump = callback as typeof triggerSessionJump;
+      }
+      return vi.fn<() => void>();
+    });
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const pathname = requestPath(url);
+      if (pathname === "/api/sessions") return jsonResponse([row]);
+      if (pathname === "/api/source-health") return jsonResponse(fakeSourceHealth);
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<StatusPanelView initialRows={[row]} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => expect(triggerSessionJump).toBeTypeOf("function"));
+    await act(async () => {
+      triggerSessionJump?.({ payload: 6 });
+      await Promise.resolve();
+    });
+
+    expect(fetchMock.mock.calls.filter(([url]) => requestPath(url) === "/api/jump")).toHaveLength(0);
   });
 
   it("sends the configured follow-up idle duration to preview list and jump requests", async () => {
