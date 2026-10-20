@@ -586,6 +586,38 @@ p {
   white-space: nowrap;
 }
 
+.update-prompt {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.update-prompt--error {
+  border-color: #be5046;
+  color: #e06c75;
+}
+
+.update-prompt__message {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-prompt__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.update-prompt__actions button {
+  font-size: 10px;
+  height: 22px;
+  min-width: 0;
+  padding: 0 6px;
+}
+
 .empty-panel {
   color: #7f848e;
   font-size: 12px;

@@ -3,9 +3,15 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { publishGithubRelease, verifyReleaseAssets } from "./publishGithubRelease.mjs";
+import {
+  createUpdaterManifestAsset,
+  publishGithubRelease,
+  verifyReleaseAssets,
+} from "./publishGithubRelease.mjs";
 
 const SHA = "a".repeat(40);
+const VERSION = "0.1.1";
+const PUBLISHED_AT = new Date("2026-10-20T00:00:00.000Z");
 const context = {
   repo: { owner: "zhatongning", repo: "attn" },
   sha: SHA,
@@ -30,16 +36,42 @@ describe("GitHub release publishing", () => {
     expect(assets.every((asset) => asset.data.length > 0)).toBe(true);
   });
 
+  it("builds a complete updater manifest with immutable architecture URLs", async () => {
+    const directory = await createAssets();
+    const assets = await verifyReleaseAssets(directory);
+    const asset = createUpdaterManifestAsset({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      tag: `build-${SHA}`,
+      version: VERSION,
+      assets,
+      publishedAt: PUBLISHED_AT,
+    });
+
+    expect(asset.name).toBe("latest.json");
+    expect(JSON.parse(asset.data.toString("utf8"))).toEqual({
+      version: VERSION,
+      notes: `Attn ${VERSION} (${SHA.slice(0, 7)})`,
+      pub_date: PUBLISHED_AT.toISOString(),
+      platforms: {
+        "darwin-aarch64": {
+          signature: "arm64 app.tar.gz.sig",
+          url: `https://github.com/zhatongning/attn/releases/download/build-${SHA}/Attn-macOS-arm64.app.tar.gz`,
+        },
+        "darwin-x86_64": {
+          signature: "x64 app.tar.gz.sig",
+          url: `https://github.com/zhatongning/attn/releases/download/build-${SHA}/Attn-macOS-x64.app.tar.gz`,
+        },
+      },
+    });
+  });
+
   it("rejects corrupt files before making any GitHub request", async () => {
     const directory = await createAssets();
     await writeFile(path.join(directory, "Attn-macOS-x64.dmg"), "corrupted");
     const service = createGithub();
 
-    await expect(publishGithubRelease({
-      github: service.github,
-      context,
-      assetDirectory: directory,
-    })).rejects.toThrow(/checksum/i);
+    await expect(publish(directory, service)).rejects.toThrow(/checksum/i);
     expect(service.operations).toEqual([]);
   });
 
@@ -48,23 +80,15 @@ describe("GitHub release publishing", () => {
     await writeFile(path.join(directory, "debug.log"), "not a release asset");
     const service = createGithub();
 
-    await expect(publishGithubRelease({
-      github: service.github,
-      context,
-      assetDirectory: directory,
-    })).rejects.toThrow(/exactly both architectures/i);
+    await expect(publish(directory, service)).rejects.toThrow(/exactly both architectures/i);
     expect(service.operations).toEqual([]);
   });
 
-  it("publishes only after all six assets have uploaded", async () => {
+  it("publishes only after all download and updater assets have uploaded", async () => {
     const directory = await createAssets();
     const service = createGithub();
 
-    const result = await publishGithubRelease({
-      github: service.github,
-      context,
-      assetDirectory: directory,
-    });
+    const result = await publish(directory, service);
 
     expect(service.operations.find((operation) => operation.type === "create")?.args)
       .toMatchObject({
@@ -74,7 +98,22 @@ describe("GitHub release publishing", () => {
         prerelease: false,
         make_latest: "false",
       });
-    expect(service.operations.filter((operation) => operation.type === "upload")).toHaveLength(6);
+    expect(service.operations.filter((operation) => operation.type === "upload")).toHaveLength(11);
+    const manifest = service.operations.find((operation) =>
+      operation.type === "upload" && operation.args.name === "latest.json",
+    );
+    expect(manifest?.args.headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(manifest?.args.data.toString("utf8"))).toMatchObject({
+      version: VERSION,
+      platforms: {
+        "darwin-aarch64": {
+          url: expect.stringContaining(`/build-${SHA}/Attn-macOS-arm64.app.tar.gz`),
+        },
+        "darwin-x86_64": {
+          url: expect.stringContaining(`/build-${SHA}/Attn-macOS-x64.app.tar.gz`),
+        },
+      },
+    });
     expect(service.operations.at(-1)).toMatchObject({
       type: "publish",
       args: { draft: false, make_latest: "true" },
@@ -89,7 +128,7 @@ describe("GitHub release publishing", () => {
       comparison: "behind",
     });
 
-    await publishGithubRelease({ github: service.github, context, assetDirectory: directory });
+    await publish(directory, service);
 
     expect(service.operations.at(-1)).toMatchObject({
       type: "publish",
@@ -97,14 +136,59 @@ describe("GitHub release publishing", () => {
     });
   });
 
-  it("advances latest for a newer successful commit", async () => {
+  it("advances a legacy latest release for a newer successful commit", async () => {
     const directory = await createAssets();
     const service = createGithub({
       latest: { tag_name: "build-older" },
       comparison: "ahead",
     });
 
-    await publishGithubRelease({ github: service.github, context, assetDirectory: directory });
+    await publish(directory, service);
+
+    expect(service.operations.at(-1)).toMatchObject({
+      type: "publish",
+      args: { make_latest: "true" },
+    });
+  });
+
+  it("does not replace latest with a different build of the same application version", async () => {
+    const directory = await createAssets();
+    const service = createGithub({
+      latest: { tag_name: "build-same-version", body: releaseVersionMetadata(VERSION) },
+      comparison: "ahead",
+    });
+
+    await publish(directory, service);
+
+    expect(service.operations.at(-1)).toMatchObject({
+      type: "publish",
+      args: { make_latest: "false" },
+    });
+  });
+
+  it("does not displace a newer updater version when the current commit is newer", async () => {
+    const directory = await createAssets();
+    const service = createGithub({
+      latest: { tag_name: "build-newer-version", body: releaseVersionMetadata("0.1.2") },
+      comparison: "ahead",
+    });
+
+    await publish(directory, service);
+
+    expect(service.operations.at(-1)).toMatchObject({
+      type: "publish",
+      args: { make_latest: "false" },
+    });
+  });
+
+  it("advances a higher updater version even if its commit comparison is behind", async () => {
+    const directory = await createAssets();
+    const service = createGithub({
+      latest: { tag_name: "build-older-version", body: releaseVersionMetadata("0.1.0") },
+      comparison: "behind",
+    });
+
+    await publish(directory, service);
 
     expect(service.operations.at(-1)).toMatchObject({
       type: "publish",
@@ -116,11 +200,7 @@ describe("GitHub release publishing", () => {
     const directory = await createAssets();
     const service = createGithub({ failUpload: 3 });
 
-    await expect(publishGithubRelease({
-      github: service.github,
-      context,
-      assetDirectory: directory,
-    })).rejects.toThrow("upload unavailable");
+    await expect(publish(directory, service)).rejects.toThrow("upload unavailable");
     expect(service.operations.some((operation) => operation.type === "publish")).toBe(false);
   });
 
@@ -135,12 +215,12 @@ describe("GitHub release publishing", () => {
       },
     });
 
-    await publishGithubRelease({ github: service.github, context, assetDirectory: directory });
+    await publish(directory, service);
 
     expect(service.operations.filter((operation) => operation.type === "delete")).toEqual([
       { type: "delete", args: { owner: "zhatongning", repo: "attn", asset_id: 7 } },
     ]);
-    expect(service.operations.filter((operation) => operation.type === "upload")).toHaveLength(6);
+    expect(service.operations.filter((operation) => operation.type === "upload")).toHaveLength(11);
     expect(service.operations.find((operation) => operation.type === "updateDraft")?.args.body)
       .toContain("/actions/runs/123");
     expect(service.operations.filter((operation) => operation.type === "create")).toEqual([]);
@@ -159,11 +239,11 @@ describe("GitHub release publishing", () => {
         draft: false,
         immutable: true,
         html_url: `https://github.com/zhatongning/attn/releases/tag/build-${SHA}`,
-        assets: expectedNames().map((name) => ({ name, size: 1 })),
+        assets: expectedPublishedNames().map((name) => ({ name, size: 1 })),
       },
     });
 
-    await publishGithubRelease({ github: service.github, context, assetDirectory: directory });
+    await publish(directory, service);
 
     expect(service.operations.map((operation) => operation.type)).toEqual(["getByTag"]);
   });
@@ -174,11 +254,7 @@ describe("GitHub release publishing", () => {
       existing: { id: 99, draft: false, assets: [] },
     });
 
-    await expect(publishGithubRelease({
-      github: service.github,
-      context,
-      assetDirectory: directory,
-    })).rejects.toThrow(/preserving its existing assets/i);
+    await expect(publish(directory, service)).rejects.toThrow(/preserving its existing assets/i);
     expect(service.operations.map((operation) => operation.type)).toEqual(["getByTag"]);
   });
 
@@ -189,11 +265,7 @@ describe("GitHub release publishing", () => {
       comparisonFiles: [{ filename: ".github/workflows/build.yml" }],
     });
 
-    const result = await publishGithubRelease({
-      github: service.github,
-      context,
-      assetDirectory: directory,
-    });
+    const result = await publish(directory, service);
 
     expect(result.skipped).toBe(true);
     expect(service.operations.find((operation) => operation.type === "compare")?.args.basehead)
@@ -206,11 +278,20 @@ describe("GitHub release publishing", () => {
     const directory = await createAssets();
     const service = createGithub();
 
-    await expect(publishGithubRelease({
-      github: service.github,
+    await expect(publish(directory, service, {
       context: { ...context, ref: "refs/heads/feature/example" },
-      assetDirectory: directory,
     })).rejects.toThrow(/master/i);
+    expect(service.operations).toEqual([]);
+  });
+
+  it("rejects prerelease and build metadata versions before contacting GitHub", async () => {
+    const directory = await createAssets();
+    const service = createGithub();
+
+    await expect(publish(directory, service, { version: "0.1.1-beta.1" }))
+      .rejects.toThrow(/normal SemVer/i);
+    await expect(publish(directory, service, { version: "0.1.1+build.7" }))
+      .rejects.toThrow(/normal SemVer/i);
     expect(service.operations).toEqual([]);
   });
 });
@@ -219,8 +300,14 @@ function expectedNames() {
   return ["arm64", "x64"].flatMap((architecture) => [
     `Attn-macOS-${architecture}.dmg`,
     `Attn-macOS-${architecture}.app.zip`,
+    `Attn-macOS-${architecture}.app.tar.gz`,
+    `Attn-macOS-${architecture}.app.tar.gz.sig`,
     `Attn-macOS-${architecture}.SHA256SUMS.txt`,
   ]).sort();
+}
+
+function expectedPublishedNames() {
+  return [...expectedNames(), "latest.json"].sort();
 }
 
 async function createAssets() {
@@ -228,7 +315,7 @@ async function createAssets() {
   directories.push(directory);
   for (const architecture of ["arm64", "x64"]) {
     const checksums = [];
-    for (const suffix of ["dmg", "app.zip"]) {
+    for (const suffix of ["dmg", "app.zip", "app.tar.gz", "app.tar.gz.sig"]) {
       const name = `Attn-macOS-${architecture}.${suffix}`;
       const data = Buffer.from(`${architecture} ${suffix}`);
       await writeFile(path.join(directory, name), data);
@@ -240,6 +327,21 @@ async function createAssets() {
     );
   }
   return directory;
+}
+
+function publish(directory, service, options = {}) {
+  return publishGithubRelease({
+    github: service.github,
+    context,
+    assetDirectory: directory,
+    version: VERSION,
+    now: () => PUBLISHED_AT,
+    ...options,
+  });
+}
+
+function releaseVersionMetadata(version) {
+  return `<!-- attn-app-version: ${version} -->`;
 }
 
 function createGithub({

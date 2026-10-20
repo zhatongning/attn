@@ -121,9 +121,15 @@ npm run build
 npm run tauri build -- --debug
 ```
 
+## 自动更新
+
+打包后的 Attn `0.1.1` 及以后版本会在面板启动时检查已签名的更新通道。发现更新不会自动下载、安装或重启；面板会提供 **更新** 和 **稍后** 两个操作。选择 **稍后** 只在本次应用会话内不再提示。选择 **更新** 后，Attn 才会下载已签名的归档、原地安装并重启。安装失败会保留在面板中，当前应用继续运行。
+
+Attn `0.1.0` 不含 updater 插件，必须先通过 DMG 或 ZIP 手动升级一次到 `0.1.1`。浏览器预览和 Tauri 开发运行不会访问更新通道。
+
 ## GitHub 构建
 
-每次向 `master` 推送都会自动运行 **Build Attn** GitHub Actions 工作流。两个架构分别通过 `npm ci` 安装依赖、运行前端和 Rust 测试，再使用已提交的锁文件构建 release 版 `.app` 和 `.dmg`。两个架构都成功后，工作流自动发布 GitHub Release。手动运行仅用于重跑；选择 `master` 会发布 Release，选择其他分支则只保留构建产物。
+每次向 `master` 推送都会自动运行 **Build Attn** GitHub Actions 工作流。两个架构分别通过 `npm ci` 安装依赖、运行前端和 Rust 测试，再使用已提交的锁文件构建 release 版 `.app`、`.dmg` 和带签名的 updater 归档。两个架构都成功后，工作流自动发布 GitHub Release。手动运行时，只有选择 `master` 才会读取签名密钥、生成 updater 归档并允许发布 Release；其他分支刻意只构建普通安装产物。
 
 | 版本 | Runner | Rust target |
 | --- | --- | --- |
@@ -132,14 +138,18 @@ npm run tauri build -- --debug
 
 从固定的[最新版下载页](https://github.com/zhatongning/attn/releases/latest)下载，也可直接使用下面的安装包链接。公开 Release 可匿名下载，无需进入 Actions 或登录 GitHub。
 
-| Mac | 安装程序 | 应用压缩包 | 校验文件 |
-| --- | --- | --- | --- |
-| Apple Silicon | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.SHA256SUMS.txt) |
-| Intel | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.SHA256SUMS.txt) |
+| Mac | 安装程序 | 应用压缩包 | Updater 归档 | 校验文件 |
+| --- | --- | --- | --- | --- |
+| Apple Silicon | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.zip) | [Updater](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.tar.gz) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.SHA256SUMS.txt) |
+| Intel | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.zip) | [Updater](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.tar.gz) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.SHA256SUMS.txt) |
 
-每个已发布构建使用独立的 `build-<commit-sha>` 标签。Release 文件不受 Actions 产物 30 天保留期限制，历史构建可从 Releases 页面下载。发布任务校验两个架构的全部文件、上传完成后才公开草稿；较旧构建晚完成时不会覆盖较新的下载版本，重跑也不会改写已发布的文件。
+Updater 归档仅供应用自动消费；手动安装请使用 DMG 或 ZIP。每个已发布构建使用独立的 `build-<commit-sha>` 标签。Release 文件不受 Actions 产物 30 天保留期限制，历史构建可从 Releases 页面下载。发布任务校验两个架构的全部文件、上传完成后才公开草稿；较旧构建晚完成时不会覆盖较新的下载版本，重跑也不会改写已发布的文件。
 
-Actions 同时保留 30 天产物，入口为 **Actions -> Build Attn -> 构建记录 -> Artifacts**。每个架构的产物包含 `.dmg`、保留应用包权限的 `.app.zip` 和校验文件。同一次运行重跑时会替换该架构的产物，因此仅重试失败任务时可以复用另一架构已成功的产物。
+只有当普通 SemVer 严格高于当前最新 Release 时，才会发布自动更新。`package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 必须使用同一个普通 SemVer。版本相同或更低的构建可以作为历史下载保留，但不能替换最新下载页或 updater 的 `latest.json` 清单。
+
+应用将 updater 公钥和 HTTPS 清单地址提交在 `src-tauri/tauri.conf.json`。启用发布 CI 前，必须将匹配的私钥设置为仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`；私钥设置了密码时才额外配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。不得提交任何私钥值。只有 CI 会启用 updater 归档生成，并在发布前用已提交的公钥校验每个 `.app.tar.gz` 签名。
+
+Actions 同时保留 30 天产物，入口为 **Actions -> Build Attn -> 构建记录 -> Artifacts**。`master` 构建中每个架构的产物包含 `.dmg`、保留应用包权限的 `.app.zip`、`.app.tar.gz`、`.app.tar.gz.sig` 和校验文件；其他分支的构建刻意只保留 DMG、ZIP 和对应校验文件。同一次运行重跑时会替换该架构的产物，因此仅重试失败任务时可以复用另一架构已成功的产物。
 
 构建采用 ad-hoc 签名，无需 Apple 开发者凭证。这些产物未经 Apple 公证，首次打开下载的应用时，macOS 可能要求在 **系统设置 -> 隐私与安全性** 中允许打开。面向外部用户进行可信分发时，需要另行配置 Developer ID 签名和 Apple 公证。
 

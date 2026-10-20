@@ -37,6 +37,9 @@ import {
   normalizePanelToggleShortcut,
   normalizePositionCycleShortcut,
 } from "./panelShortcut";
+import { tauriUpdateService } from "../updater/tauriUpdateService";
+import { UpdateRestartError, type AvailableUpdate } from "../updater/updateService";
+import { isPackagedUpdaterRuntime } from "../updater/updateRuntime";
 
 const STATUS_PANEL_CONFIG_STORAGE_KEY = "attn.statusPanelConfig";
 const LEGACY_STATUS_PANEL_CONFIG_STORAGE_KEY = "agent-session-inbox.statusPanelConfig";
@@ -98,6 +101,9 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const [commandMessage, setCommandMessage] = useState<string | null>(null);
   const [jumpNotice, setJumpNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
+  const [updateInstallState, setUpdateInstallState] = useState<"idle" | "installing" | "restarting">("idle");
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const [shortcutRegistrationError, setShortcutRegistrationError] = useState(false);
   const [positionShortcutRegistrationError, setPositionShortcutRegistrationError] = useState(false);
   const [nativeShortcutStatus, setNativeShortcutStatus] = useState<NativeShortcutStatus | null>(null);
@@ -125,6 +131,8 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   const jumpNoticeTimerRef = useRef<number | undefined>(undefined);
   const actionFeedbackSequenceRef = useRef(0);
   const mountedRef = useRef(true);
+  const availableUpdateRef = useRef<AvailableUpdate | null>(null);
+  const updateInstallPendingRef = useRef(false);
   const sessionShortcutRowsRef = useRef<StatusPanelRow[]>([]);
   const jumpToSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   const [legacyPlacement] = useState(loadLegacyPlacement);
@@ -144,8 +152,10 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   sessionShortcutRowsRef.current = sessionShortcutRows;
   const displayedRows = expanded ? [...model.visibleRows, ...model.expandableHiddenRows] : model.visibleRows;
   const hasPendingJump = Object.values(pendingActions).includes("jump");
-  const hasPanelMessage = commandMessage !== null || errorMessage !== null;
-  const panelHeight = panelWindowHeight(displayedRows.length, hasPanelMessage);
+  const actionMessage = errorMessage ?? commandMessage;
+  const updatePromptVisible = availableUpdate !== null || updateError !== null;
+  const panelMessageCount = Number(actionMessage !== null) + Number(updatePromptVisible);
+  const panelHeight = panelWindowHeight(displayedRows.length, panelMessageCount);
   const shouldScrollStatusList = panelHeight >= PANEL_MAX_HEIGHT;
   const shouldKeepPanelOpenForStatus = useMemo(() => {
     return hasPreventAutoCollapseStatus(model, config);
@@ -438,6 +448,37 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
       unlistenMenu?.();
       unlistenSources?.();
       unlistenSessionJump?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPackagedUpdaterRuntime()) return;
+
+    let cancelled = false;
+    void tauriUpdateService.checkForUpdate()
+      .then((update) => {
+        if (!update) return;
+        if (cancelled || !mountedRef.current) {
+          void update.close().catch(() => undefined);
+          return;
+        }
+
+        clearAutoCollapseTimer();
+        availableUpdateRef.current = update;
+        setAvailableUpdate(update);
+        setUpdateError(null);
+        setPanelOpen(true);
+      })
+      // Network and release-channel problems must not interrupt the status panel.
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+      const update = availableUpdateRef.current;
+      availableUpdateRef.current = null;
+      if (update) {
+        void update.close().catch(() => undefined);
+      }
     };
   }, []);
 
@@ -1114,15 +1155,59 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
             {sessionCounters()}
           </footer>
 
-          {(commandMessage || errorMessage) && (
+          {actionMessage ? (
             <div className="panel-message" role="status">
-              {errorMessage ?? commandMessage}
+              {actionMessage}
             </div>
-          )}
+          ) : null}
+          {updatePromptVisible ? (
+            <UpdatePrompt
+              update={availableUpdate}
+              installState={updateInstallState}
+              error={updateError}
+              language={config.language}
+              onInstall={installAvailableUpdate}
+              onDismiss={dismissUpdatePrompt}
+            />
+          ) : null}
         </>
       ) : null}
     </main>
   );
+
+  async function installAvailableUpdate() {
+    const update = availableUpdate;
+    if (!update || updateInstallState !== "idle" || updateInstallPendingRef.current) return;
+
+    availableUpdateRef.current = null;
+    updateInstallPendingRef.current = true;
+    setUpdateError(null);
+    setUpdateInstallState("installing");
+    try {
+      await tauriUpdateService.installAndRelaunch(update);
+      if (mountedRef.current) {
+        setUpdateInstallState("restarting");
+      }
+    } catch (error) {
+      if (!mountedRef.current) return;
+      setAvailableUpdate(null);
+      setUpdateInstallState("idle");
+      setUpdateError(updateInstallFailureMessage(error, configRef.current.language));
+      updateInstallPendingRef.current = false;
+    }
+  }
+
+  function dismissUpdatePrompt() {
+    if (updateInstallState !== "idle" || updateInstallPendingRef.current) return;
+
+    const update = availableUpdate;
+    availableUpdateRef.current = null;
+    setAvailableUpdate(null);
+    setUpdateError(null);
+    if (update) {
+      void update.close().catch(() => undefined);
+    }
+  }
 
   function setPendingAction(sessionId: string, action: "jump" | "dismiss" | "pin" | "unpin") {
     setPendingActions((current) => ({ ...current, [sessionId]: action }));
@@ -1376,6 +1461,75 @@ export function StatusPanelView({ initialRows, sourceHealth: _sourceHealth }: St
   }
 }
 
+interface UpdatePromptProps {
+  update: AvailableUpdate | null;
+  installState: "idle" | "installing" | "restarting";
+  error: string | null;
+  language: StatusPanelConfig["language"];
+  onInstall: () => void;
+  onDismiss: () => void;
+}
+
+function UpdatePrompt({ update, installState, error, language, onInstall, onDismiss }: UpdatePromptProps) {
+  const message = updatePromptMessage(update, installState, error, language);
+  const canConfirm = update !== null && installState === "idle" && error === null;
+  const canDismiss = installState === "idle";
+  const installLabel = language === "zh" ? "更新" : "Update";
+  const dismissLabel = error ? (language === "zh" ? "关闭" : "Dismiss") : (language === "zh" ? "稍后" : "Later");
+  const installAriaLabel = update
+    ? language === "zh" ? `下载 ${update.version} 并重启 Attn` : `Download ${update.version} and restart Attn`
+    : installLabel;
+
+  return (
+    <div className={`panel-message update-prompt${error ? " update-prompt--error" : ""}`} role="status" aria-live="polite">
+      <span className="update-prompt__message" title={message}>{message}</span>
+      <span className="update-prompt__actions">
+        {canConfirm ? (
+          <button type="button" aria-label={installAriaLabel} title={installAriaLabel} onClick={onInstall}>
+            {installLabel}
+          </button>
+        ) : null}
+        {canDismiss ? (
+          <button type="button" aria-label={dismissLabel} onClick={onDismiss}>
+            {dismissLabel}
+          </button>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
+function updatePromptMessage(
+  update: AvailableUpdate | null,
+  installState: UpdatePromptProps["installState"],
+  error: string | null,
+  language: StatusPanelConfig["language"],
+) {
+  if (error) return error;
+  if (!update) return language === "zh" ? "无法检查更新。" : "Unable to check for updates.";
+  if (installState === "installing") {
+    return language === "zh"
+      ? `正在下载并安装 ${update.version}...`
+      : `Downloading and installing ${update.version}...`;
+  }
+  if (installState === "restarting") {
+    return language === "zh" ? "正在重启 Attn..." : "Restarting Attn...";
+  }
+  return language === "zh" ? `发现新版本 ${update.version}` : `Update ${update.version} is ready`;
+}
+
+function updateInstallFailureMessage(error: unknown, language: StatusPanelConfig["language"]) {
+  if (error instanceof UpdateRestartError) {
+    return language === "zh" ? "更新已安装，但 Attn 无法重启。" : error.message;
+  }
+
+  const detail = messageFromUnknownError(
+    error,
+    language === "zh" ? "更新下载或安装失败。" : "Update download or installation failed.",
+  );
+  return language === "zh" ? `无法安装更新：${detail}` : `Unable to install update: ${detail}`;
+}
+
 interface StatusRowProps {
   row: StatusPanelRow;
   pendingAction?: "jump" | "dismiss" | "pin" | "unpin";
@@ -1568,7 +1722,7 @@ function PendingIcon() {
   );
 }
 
-function panelWindowHeight(visibleItemCount: number, hasMessage = false) {
+function panelWindowHeight(visibleItemCount: number, messageCount = 0) {
   const normalizedCount = Math.min(8, Math.max(1, visibleItemCount));
   const baseHeight = Math.max(
     PANEL_MIN_HEIGHT,
@@ -1577,7 +1731,7 @@ function panelWindowHeight(visibleItemCount: number, hasMessage = false) {
 
   return Math.min(
     PANEL_MAX_HEIGHT,
-    baseHeight + (hasMessage ? PANEL_MESSAGE_HEIGHT : 0),
+    baseHeight + Math.max(0, messageCount) * PANEL_MESSAGE_HEIGHT,
   );
 }
 

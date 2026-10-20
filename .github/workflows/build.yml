@@ -44,6 +44,10 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      - name: Validate updater release version
+        if: github.ref == 'refs/heads/master'
+        run: node scripts/releaseVersion.mjs
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
@@ -65,13 +69,32 @@ jobs:
       - name: Test Rust
         run: npm run test:rust -- --locked
 
+      - name: Configure signed updater build
+        if: github.ref == 'refs/heads/master'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error title=Missing updater signing key::Set the TAURI_SIGNING_PRIVATE_KEY repository secret before publishing updates."
+            exit 1
+          fi
+
+      - name: Build signed application and updater
+        if: github.ref == 'refs/heads/master'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --ci --target "$BUILD_TARGET" --bundles app,dmg,updater --config '{"bundle":{"createUpdaterArtifacts":true}}' -- --locked
+
       - name: Build application and installer
+        if: github.ref != 'refs/heads/master'
         run: npm run tauri -- build --ci --target "$BUILD_TARGET" --bundles app,dmg -- --locked
 
-      - name: Prepare download artifacts
+      - name: Prepare application and installer artifacts
         run: |
           bundle_dir="src-tauri/target/$BUILD_TARGET/release/bundle"
           mkdir -p artifacts
+          shopt -s nullglob
           ditto -c -k --sequesterRsrc --keepParent \
             "$bundle_dir/macos/Attn.app" \
             "artifacts/Attn-macOS-$BUILD_ARCH.app.zip"
@@ -81,10 +104,45 @@ jobs:
             exit 1
           fi
           cp "${installers[0]}" "artifacts/Attn-macOS-$BUILD_ARCH.dmg"
+
           (
             cd artifacts
-            shasum -a 256 *.dmg *.zip > "Attn-macOS-$BUILD_ARCH.SHA256SUMS.txt"
+            shasum -a 256 \
+              "Attn-macOS-$BUILD_ARCH.dmg" \
+              "Attn-macOS-$BUILD_ARCH.app.zip" \
+              > "Attn-macOS-$BUILD_ARCH.SHA256SUMS.txt"
           )
+
+      - name: Prepare signed updater artifacts
+        if: github.ref == 'refs/heads/master'
+        run: |
+          bundle_dir="src-tauri/target/$BUILD_TARGET/release/bundle"
+          updater_archives=("$bundle_dir/macos/"*.app.tar.gz)
+          updater_signatures=("$bundle_dir/macos/"*.app.tar.gz.sig)
+          if [[ ${#updater_archives[@]} != 1 || ! -f "${updater_archives[0]}" ]]; then
+            echo "Expected exactly one Tauri updater archive"
+            exit 1
+          fi
+          if [[ ${#updater_signatures[@]} != 1 || ! -f "${updater_signatures[0]}" ]]; then
+            echo "Expected exactly one Tauri updater signature"
+            exit 1
+          fi
+          cp "${updater_archives[0]}" "artifacts/Attn-macOS-$BUILD_ARCH.app.tar.gz"
+          cp "${updater_signatures[0]}" "artifacts/Attn-macOS-$BUILD_ARCH.app.tar.gz.sig"
+          (
+            cd artifacts
+            shasum -a 256 \
+              "Attn-macOS-$BUILD_ARCH.app.tar.gz" \
+              "Attn-macOS-$BUILD_ARCH.app.tar.gz.sig" \
+              >> "Attn-macOS-$BUILD_ARCH.SHA256SUMS.txt"
+          )
+
+      - name: Verify updater signature
+        if: github.ref == 'refs/heads/master'
+        run: |
+          cargo run --manifest-path src-tauri/Cargo.toml --locked --example verify_updater_signature -- \
+            "artifacts/Attn-macOS-$BUILD_ARCH.app.tar.gz" \
+            "artifacts/Attn-macOS-$BUILD_ARCH.app.tar.gz.sig"
 
       - name: Upload application and installer
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -127,10 +185,14 @@ jobs:
             const { publishGithubRelease } = await import(
               `${process.env.GITHUB_WORKSPACE}/scripts/publishGithubRelease.mjs`
             );
+            const { readReleaseVersion } = await import(
+              `${process.env.GITHUB_WORKSPACE}/scripts/releaseVersion.mjs`
+            );
             const result = await publishGithubRelease({
               github,
               context,
               assetDirectory: `${process.env.GITHUB_WORKSPACE}/release-assets`,
+              version: await readReleaseVersion(process.env.GITHUB_WORKSPACE),
             });
             if (result.skipped) core.notice(result.reason);
             const summary = core.summary

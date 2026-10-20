@@ -247,7 +247,9 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .manage(panel_shortcut::PanelShortcutState::default())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build());
 
     let builder = builder
         .menu(|handle| {

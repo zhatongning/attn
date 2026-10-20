@@ -123,9 +123,23 @@ To build a debug macOS app bundle:
 npm run tauri build -- --debug
 ```
 
+## Automatic Updates
+
+Packaged Attn `0.1.1` and later checks the signed update channel when the
+panel starts. Finding an update does not download, install, or restart
+anything. The panel presents an **Update** action and a **Later** action;
+**Later** suppresses that prompt only for the current app session. Choosing
+**Update** downloads the signed archive, installs it in place, and relaunches
+Attn. An installation failure remains visible and the current app keeps
+running.
+
+Attn `0.1.0` does not contain the updater plugin, so it must be upgraded to
+`0.1.1` manually once from the DMG or ZIP download. Browser preview and Tauri
+development runs do not contact the update channel.
+
 ## GitHub Builds
 
-Every push to `master` automatically runs the **Build Attn** GitHub Actions workflow. Each architecture installs dependencies with `npm ci`, runs the frontend and Rust tests, and builds a release `.app` and `.dmg` using the committed lockfiles. After both architectures succeed, the workflow publishes a GitHub Release. Manual runs are optional; choose `master` to publish a release, or another branch for build artifacts only.
+Every push to `master` automatically runs the **Build Attn** GitHub Actions workflow. Each architecture installs dependencies with `npm ci`, runs the frontend and Rust tests, and builds a release `.app`, `.dmg`, and signed updater archive using the committed lockfiles. After both architectures succeed, the workflow publishes a GitHub Release. Manual runs are optional: only a `master` run receives the signing key, creates updater archives, and can publish a release. A run for any other branch deliberately builds ordinary installer artifacts only.
 
 | Version | Runner | Rust target |
 | --- | --- | --- |
@@ -134,14 +148,35 @@ Every push to `master` automatically runs the **Build Attn** GitHub Actions work
 
 Use the fixed [latest download page](https://github.com/zhatongning/attn/releases/latest) or the direct package links below. Public Release downloads do not require visiting Actions or signing into GitHub.
 
-| Mac | Installer | App archive | Checksums |
-| --- | --- | --- | --- |
-| Apple Silicon | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.SHA256SUMS.txt) |
-| Intel | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.zip) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.SHA256SUMS.txt) |
+| Mac | Installer | App archive | Updater archive | Checksums |
+| --- | --- | --- | --- | --- |
+| Apple Silicon | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.zip) | [Updater](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.app.tar.gz) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-arm64.SHA256SUMS.txt) |
+| Intel | [DMG](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.dmg) | [ZIP](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.zip) | [Updater](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.app.tar.gz) | [SHA-256](https://github.com/zhatongning/attn/releases/latest/download/Attn-macOS-x64.SHA256SUMS.txt) |
 
-Each published build has an independent `build-<commit-sha>` tag. Release assets are kept beyond the 30-day Actions artifact retention window, and older builds remain available on the Releases page. The publisher uploads and verifies both architectures before making a draft public. Late older builds do not replace a newer latest download, and reruns preserve already published packages.
+The updater archives are machine-consumed files; use the DMG or ZIP for a
+manual installation. Each published build has an independent
+`build-<commit-sha>` tag. Release assets are kept beyond the 30-day Actions
+artifact retention window, and older builds remain available on the Releases
+page. The publisher uploads and verifies both architectures before making a
+draft public. Late older builds do not replace a newer latest download, and
+reruns preserve already published packages.
 
-Actions also retains packages for 30 days under **Actions -> Build Attn -> run -> Artifacts**. Each architecture's artifact includes its `.dmg`, permission-preserving `.app.zip`, and checksum file. Reruns replace that architecture's artifact for the same run so failed-job retries can reuse the other successful architecture.
+An automatic update is published only when the normal SemVer value is strictly
+higher than the current latest release. Keep `package.json`,
+`src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` on the same normal
+SemVer value. A same-version or lower-version build can remain a historical
+download, but it cannot replace the latest page or `latest.json` updater
+manifest.
+
+The application commits its updater public key and HTTPS manifest endpoint in
+`src-tauri/tauri.conf.json`. Before enabling release CI, set the matching
+private key as the repository secret `TAURI_SIGNING_PRIVATE_KEY`; set
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` only when that key is password protected.
+Never commit either private-key value. CI alone enables updater-artifact
+generation, then verifies each generated `.app.tar.gz` against the committed
+public key before publishing it.
+
+Actions also retains packages for 30 days under **Actions -> Build Attn -> run -> Artifacts**. A `master` run's architecture artifact includes its `.dmg`, permission-preserving `.app.zip`, `.app.tar.gz`, `.app.tar.gz.sig`, and checksum file. Other-branch runs deliberately retain only the DMG, ZIP, and their checksums. Reruns replace that architecture's artifact for the same run so failed-job retries can reuse the other successful architecture.
 
 These builds use ad-hoc signing and do not require Apple developer credentials. They are not notarized; macOS may require approval in **System Settings -> Privacy & Security** when opening a downloaded build. Developer ID signing and Apple notarization are needed for trusted public distribution.
 

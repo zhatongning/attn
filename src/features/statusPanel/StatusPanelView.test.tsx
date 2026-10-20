@@ -10,6 +10,7 @@ import { fakeSourceHealth, initialSessions } from "../inbox/fakeSessions";
 import { StatusPanelView } from "./StatusPanelView";
 import type { PlacementSnapshot } from "../inbox/inboxApi";
 import * as inboxApi from "../inbox/inboxApi";
+import { UpdateRestartError, type AvailableUpdate } from "../updater/updateService";
 
 const tauriWindowMock = vi.hoisted(() => ({
   setSize: vi.fn<(size: { width: number; height: number }) => Promise<void>>(async () => undefined),
@@ -57,6 +58,23 @@ vi.mock("@tauri-apps/api/dpi", () => ({
   },
 }));
 
+const tauriUpdateMock = vi.hoisted(() => ({
+  checkForUpdate: vi.fn<() => Promise<AvailableUpdate | null>>(async () => null),
+  installAndRelaunch: vi.fn<(update: AvailableUpdate) => Promise<void>>(async () => undefined),
+}));
+
+vi.mock("../updater/tauriUpdateService", () => ({
+  tauriUpdateService: tauriUpdateMock,
+}));
+
+const updaterRuntimeMock = vi.hoisted(() => ({
+  isPackagedUpdaterRuntime: vi.fn(() => false),
+}));
+
+vi.mock("../updater/updateRuntime", () => ({
+  isPackagedUpdaterRuntime: updaterRuntimeMock.isPackagedUpdaterRuntime,
+}));
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -75,10 +93,211 @@ afterEach(() => {
   tauriEventMock.listen.mockReset();
   tauriEventMock.listen.mockImplementation(async () => vi.fn<() => void>());
   tauriCoreMock.invoke.mockReset();
+  tauriUpdateMock.checkForUpdate.mockReset();
+  tauriUpdateMock.checkForUpdate.mockResolvedValue(null);
+  tauriUpdateMock.installAndRelaunch.mockReset();
+  tauriUpdateMock.installAndRelaunch.mockResolvedValue(undefined);
+  updaterRuntimeMock.isPackagedUpdaterRuntime.mockReset();
+  updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(false);
   vi.unstubAllGlobals();
 });
 
+function availableUpdate(): AvailableUpdate {
+  return {
+    currentVersion: "0.1.0",
+    version: "0.1.1",
+    downloadAndInstall: vi.fn(async () => undefined),
+    close: vi.fn(async () => undefined),
+  };
+}
+
+function mockPackagedPanelRefresh() {
+  tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+    if (command === "list_sessions") return initialSessions;
+    if (command === "source_health") return fakeSourceHealth;
+    return null;
+  });
+}
+
 describe("StatusPanelView", () => {
+  it("checks for an update after packaged-panel initialization without downloading it", async () => {
+    const update = availableUpdate();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(await screen.findByText("Update 0.1.1 is ready")).toBeTruthy();
+    expect(tauriUpdateMock.checkForUpdate).toHaveBeenCalledOnce();
+    expect(update.downloadAndInstall).not.toHaveBeenCalled();
+    expect(update.close).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Download 0.1.1 and restart Attn" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Later" })).toBeTruthy();
+  });
+
+  it("does not run automatic update checks in the browser preview", () => {
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(tauriUpdateMock.checkForUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not run automatic update checks in a Tauri development runtime", () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(updaterRuntimeMock.isPackagedUpdaterRuntime).toHaveBeenCalledOnce();
+    expect(tauriUpdateMock.checkForUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps an action error visible alongside an available update", async () => {
+    const update = availableUpdate();
+    const resize = mockPanelResize();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+    tauriCoreMock.invoke.mockImplementation(async (command: string) => {
+      if (command === "list_sessions") throw "Native session source is unavailable.";
+      if (command === "resize_panel") return { generation: 0 };
+      return undefined;
+    });
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    expect(await screen.findByText("Native session source is unavailable.")).toBeTruthy();
+    expect(screen.getByText("Update 0.1.1 is ready")).toBeTruthy();
+    await waitFor(() => expect(resize).toHaveBeenCalledWith(241));
+  });
+
+  it("lets the user defer an available update and releases its native resource", async () => {
+    const update = availableUpdate();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Later" }));
+
+    await waitFor(() => expect(screen.queryByText("Update 0.1.1 is ready")).toBeNull());
+    expect(update.close).toHaveBeenCalledOnce();
+    expect(update.downloadAndInstall).not.toHaveBeenCalled();
+  });
+
+  it("releases a late update exactly once after unmounting a pending check", async () => {
+    const update = availableUpdate();
+    let resolveCheck: ((update: AvailableUpdate | null) => void) | undefined;
+    const check = new Promise<AvailableUpdate | null>((resolve) => {
+      resolveCheck = resolve;
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockReturnValue(check);
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await waitFor(() => expect(tauriUpdateMock.checkForUpdate).toHaveBeenCalledOnce());
+    rendered.unmount();
+
+    await act(async () => {
+      resolveCheck?.(update);
+      await Promise.resolve();
+    });
+
+    expect(update.close).toHaveBeenCalledOnce();
+  });
+
+  it("releases a displayed update exactly once when the panel unmounts", async () => {
+    const update = availableUpdate();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+
+    const rendered = render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+    await screen.findByText("Update 0.1.1 is ready");
+    rendered.unmount();
+
+    expect(update.close).toHaveBeenCalledOnce();
+  });
+
+  it("downloads, installs, and restarts only after the update confirmation", async () => {
+    const update = availableUpdate();
+    let completeInstall: (() => void) | undefined;
+    const install = new Promise<void>((resolve) => {
+      completeInstall = resolve;
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+    tauriUpdateMock.installAndRelaunch.mockImplementation(() => install);
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    const installButton = await screen.findByRole("button", { name: "Download 0.1.1 and restart Attn" });
+    fireEvent.click(installButton);
+    fireEvent.click(installButton);
+    expect(tauriUpdateMock.installAndRelaunch).toHaveBeenCalledOnce();
+    expect(tauriUpdateMock.installAndRelaunch).toHaveBeenCalledWith(update);
+    expect(screen.getByText("Downloading and installing 0.1.1...")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Later" })).toBeNull();
+
+    await act(async () => {
+      completeInstall?.();
+      await install;
+    });
+
+    expect(screen.getByText("Restarting Attn...")).toBeTruthy();
+  });
+
+  it("shows an explicit install failure without surfacing background check failures", async () => {
+    const update = availableUpdate();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+    tauriUpdateMock.installAndRelaunch.mockRejectedValue(new Error("network unavailable"));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Download 0.1.1 and restart Attn" }));
+    expect(await screen.findByText("Unable to install update: network unavailable")).toBeTruthy();
+    expect(within(document.querySelector(".update-prompt") as HTMLElement)
+      .getByRole("button", { name: "Dismiss" })).toBeTruthy();
+  });
+
+  it("shows that an installed update could not restart Attn", async () => {
+    const update = availableUpdate();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockResolvedValue(update);
+    tauriUpdateMock.installAndRelaunch.mockRejectedValue(new UpdateRestartError(new Error("restart unavailable")));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Download 0.1.1 and restart Attn" }));
+    expect(await screen.findByText("The update was installed, but Attn could not restart.")).toBeTruthy();
+  });
+
+  it("keeps a failed background update check out of the panel", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    mockPackagedPanelRefresh();
+    updaterRuntimeMock.isPackagedUpdaterRuntime.mockReturnValue(true);
+    tauriUpdateMock.checkForUpdate.mockRejectedValue(new Error("release endpoint unavailable"));
+
+    render(<StatusPanelView initialRows={initialSessions} sourceHealth={fakeSourceHealth} />);
+
+    await waitFor(() => expect(tauriUpdateMock.checkForUpdate).toHaveBeenCalledOnce());
+    expect(screen.queryByText("Unable to check for updates.")).toBeNull();
+    expect(screen.queryByText("release endpoint unavailable")).toBeNull();
+  });
+
   it("keeps quiet-only overflow out of the compact watchlist", () => {
     render(
       <StatusPanelView
